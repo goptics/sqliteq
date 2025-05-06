@@ -67,6 +67,17 @@ func TestSQLiteQueue(t *testing.T) {
 		if q.Len() != 2 {
 			t.Errorf("Expected queue length 2, got %d", q.Len())
 		}
+
+		// Verify the item is completely removed from the database
+		var count int
+		row := q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", q.tableName))
+		error := row.Scan(&count)
+		if error != nil {
+			t.Errorf("Error checking items in database: %v", error)
+		}
+		if count != 0 {
+			t.Errorf("Expected 0 items with completed/processing status, got %d", count)
+		}
 	})
 
 	// Test dequeue with ack ID
@@ -187,10 +198,40 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		// Enqueue an item
 		q.Enqueue("test item")
 
-		// Dequeue with ack ID
+		// Test direct dequeue (no ack ID)
+		_, success := q.Dequeue()
+		if !success {
+			t.Error("Dequeue failed")
+		}
+
+		// Since dequeueInternal with withAckId=false now deletes directly,
+		// the item should be removed from the database immediately
+		var count int
+		row := q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
+		error := row.Scan(&count)
+		if error != nil {
+			t.Errorf("Error checking items in database: %v", error)
+		}
+		if count != 0 {
+			t.Errorf("Expected 0 items in database after Dequeue, got %d", count)
+		}
+
+		// Try with DequeueWithAckId and Acknowledge process
+		q.Enqueue("test item 2")
+
 		_, success, ackID := q.DequeueWithAckId()
 		if !success {
 			t.Error("DequeueWithAckId failed")
+		}
+
+		// Check that the item is still in the database with processing status
+		row = q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", q.tableName))
+		error = row.Scan(&count)
+		if error != nil {
+			t.Errorf("Error checking processing items: %v", error)
+		}
+		if count != 1 {
+			t.Errorf("Expected 1 processing item in database, got %d", count)
 		}
 
 		// Acknowledge the item
@@ -199,15 +240,13 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Since removeOnComplete is true, the item should be removed from the database
-		// Check if there are any items in the database
-		var count int
-		row := q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
-		error := row.Scan(&count)
+		row = q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
+		error = row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking items in database: %v", error)
 		}
 		if count != 0 {
-			t.Errorf("Expected 0 items in database, got %d", count)
+			t.Errorf("Expected 0 items in database after Acknowledge, got %d", count)
 		}
 	})
 }

@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,7 +14,6 @@ import (
 // Queue implements the Queue interface using SQLite as the storage backend
 type Queue struct {
 	client           *sql.DB
-	mutex            sync.Mutex
 	tableName        string
 	removeOnComplete bool
 	closed           atomic.Bool
@@ -133,19 +131,21 @@ func (q *Queue) dequeueInternal(withAckId bool) (item any, success bool, ackID s
 
 	// Update the status to 'processing', with or without ack ID
 	now := time.Now().UTC()
-	var updateQuery string
-	var queryArgs []any
-
 	if withAckId {
 		ackID = cuid.New()
-		updateQuery = fmt.Sprintf("UPDATE %s SET status = 'processing', ack_id = ?, updated_at = ? WHERE id = ?", q.tableName)
-		queryArgs = []any{ackID, now, id}
+
+		_, err = tx.Exec(
+			fmt.Sprintf("UPDATE %s SET status = 'processing', ack_id = ?, updated_at = ? WHERE id = ?", q.tableName),
+			ackID, now, id,
+		)
 	} else {
-		updateQuery = fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id = ?", q.tableName)
-		queryArgs = []any{now, id}
+		// remove the row if there is no ack
+		_, err = tx.Exec(
+			fmt.Sprintf("DELETE FROM %s WHERE id = ?", q.tableName),
+			id,
+		)
 	}
 
-	_, err = tx.Exec(updateQuery, queryArgs...)
 	if err != nil {
 		tx.Rollback()
 		return nil, false, ""
@@ -183,9 +183,6 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 // Acknowledge marks an item as completed
 // Returns true if the item was successfully acknowledged, false otherwise
 func (q *Queue) Acknowledge(ackID string) bool {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
 	tx, err := q.client.Begin()
 	if err != nil {
 		return false
@@ -224,15 +221,11 @@ func (q *Queue) Acknowledge(ackID string) bool {
 		return false
 	}
 
-	err = tx.Commit()
-	return err == nil
+	return tx.Commit() == nil
 }
 
 // Len returns the number of pending items in the queue
 func (q *Queue) Len() int {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
 	var count int
 	row := q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.tableName))
 	err := row.Scan(&count)
@@ -244,9 +237,6 @@ func (q *Queue) Len() int {
 
 // Values returns all pending items in the queue
 func (q *Queue) Values() []any {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
 	rows, err := q.client.Query(fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY created_at ASC", q.tableName))
 	if err != nil {
 		return nil
@@ -272,9 +262,6 @@ func (q *Queue) Values() []any {
 
 // Purge removes all items from the queue
 func (q *Queue) Purge() {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
 	tx, err := q.client.Begin()
 	if err != nil {
 		return

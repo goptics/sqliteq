@@ -64,9 +64,7 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 		return false
 	}
 
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
+	// Serialize item to JSON
 	data, err := json.Marshal(item)
 	if err != nil {
 		return false
@@ -102,9 +100,6 @@ func (pq *PriorityQueue) dequeueInternal(withAckId bool) (any, bool, string) {
 		return nil, false, ""
 	}
 
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
 	tx, err := pq.client.Begin()
 	if err != nil {
 		return nil, false, ""
@@ -132,21 +127,25 @@ func (pq *PriorityQueue) dequeueInternal(withAckId bool) (any, bool, string) {
 		return nil, false, ""
 	}
 
-	// Update the status to 'processing', with or without ack ID
+	// Update the status to 'processing' with ack ID or remove directly if no ack ID
 	now := time.Now().UTC()
-	var updateQuery string
-	var queryArgs []any
+	var ackID string
 
 	if withAckId {
-		ackID := cuid.New()
-		updateQuery = fmt.Sprintf("UPDATE %s SET status = 'processing', ack_id = ?, updated_at = ? WHERE id = ?", pq.tableName)
-		queryArgs = []any{ackID, now, id}
+		ackID = cuid.New()
+
+		_, err = tx.Exec(
+			fmt.Sprintf("UPDATE %s SET status = 'processing', ack_id = ?, updated_at = ? WHERE id = ?", pq.tableName),
+			ackID, now, id,
+		)
 	} else {
-		updateQuery = fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id = ?", pq.tableName)
-		queryArgs = []any{now, id}
+		// remove the row if there is no ack
+		_, err = tx.Exec(
+			fmt.Sprintf("DELETE FROM %s WHERE id = ?", pq.tableName),
+			id,
+		)
 	}
 
-	_, err = tx.Exec(updateQuery, queryArgs...)
 	if err != nil {
 		tx.Rollback()
 		return nil, false, ""
@@ -163,11 +162,6 @@ func (pq *PriorityQueue) dequeueInternal(withAckId bool) (any, bool, string) {
 	err = json.Unmarshal(data, &unmarshaledItem)
 	if err != nil {
 		return nil, false, ""
-	}
-
-	var ackID string
-	if withAckId {
-		ackID = queryArgs[0].(string)
 	}
 
 	return unmarshaledItem, true, ackID

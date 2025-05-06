@@ -1,9 +1,10 @@
 package sqliteq
 
 import (
+	"fmt"
 	"os"
 	"testing"
-	
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -14,7 +15,7 @@ func TestPriorityQueue(t *testing.T) {
 	// Cleanup after test
 	defer os.Remove(dbPath)
 	queuesInstance := New(dbPath)
-	
+
 	// Create a new priority queue
 	pq, err := queuesInstance.NewPriorityQueue("test_priority_queue")
 	if err != nil {
@@ -53,6 +54,13 @@ func TestPriorityQueue(t *testing.T) {
 
 	// Test priority-based dequeuing
 	t.Run("PriorityDequeue", func(t *testing.T) {
+		// Create new items to test with
+		pq.Purge()
+		pq.Enqueue("high priority", 0)
+		pq.Enqueue("second high priority", 0)
+		pq.Enqueue("medium priority", 10)
+		pq.Enqueue("low priority", 20)
+
 		// Should dequeue highest priority first (lowest number)
 		item, success := pq.Dequeue()
 		if !success {
@@ -63,6 +71,17 @@ func TestPriorityQueue(t *testing.T) {
 		str, ok := item.(string)
 		if !ok || str != "high priority" {
 			t.Errorf("Expected 'high priority', got %v", item)
+		}
+
+		// Verify the item is completely removed from the database
+		var count int
+		row := pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.tableName))
+		err := row.Scan(&count)
+		if err != nil {
+			t.Errorf("Error checking items in database: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("Expected 0 items with completed/processing status, got %d", count)
 		}
 
 		// Second dequeue should get the second high priority item
@@ -98,6 +117,16 @@ func TestPriorityQueue(t *testing.T) {
 			t.Errorf("Expected 'low priority', got %v", item)
 		}
 
+		// Verify the item is completely removed from the database
+		row = pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.tableName))
+		err = row.Scan(&count)
+		if err != nil {
+			t.Errorf("Error checking items in database: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("Expected 0 pending items in database, got %d", count)
+		}
+
 		// Queue should be empty now
 		if pq.Len() != 0 {
 			t.Errorf("Expected queue length 0, got %d", pq.Len())
@@ -106,6 +135,9 @@ func TestPriorityQueue(t *testing.T) {
 
 	// Test dequeue with ack ID respecting priority
 	t.Run("PriorityDequeueWithAckId", func(t *testing.T) {
+		// Purge existing items
+		pq.Purge()
+
 		// Setup test data with different priorities
 		pq.Enqueue("highest", 0)
 		pq.Enqueue("high", 5)
@@ -127,10 +159,31 @@ func TestPriorityQueue(t *testing.T) {
 			t.Errorf("Expected 'highest', got %v", item)
 		}
 
+		// Verify item is in processing status in database
+		var count int
+		row := pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		err := row.Scan(&count)
+		if err != nil {
+			t.Errorf("Error checking processing items: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("Expected 1 processing item in database, got %d", count)
+		}
+
 		// Test acknowledge
 		ackSuccess := pq.Acknowledge(ackID)
 		if !ackSuccess {
 			t.Error("Acknowledge failed")
+		}
+
+		// Check that processing item is removed
+		row = pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		err = row.Scan(&count)
+		if err != nil {
+			t.Errorf("Error checking processing items: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("Expected 0 processing items in database after acknowledge, got %d", count)
 		}
 
 		// Check next item
@@ -154,10 +207,10 @@ func TestPriorityQueue(t *testing.T) {
 		pq.Enqueue("first at priority 5", 5)
 		pq.Enqueue("second at priority 5", 5)
 		pq.Enqueue("third at priority 5", 5)
-		
+
 		// Add higher priority item
 		pq.Enqueue("priority 1", 1)
-		
+
 		// Add lower priority item
 		pq.Enqueue("priority 10", 10)
 
@@ -171,6 +224,17 @@ func TestPriorityQueue(t *testing.T) {
 			t.Errorf("Expected 'priority 1', got %v", item)
 		}
 
+		// Verify item is removed from database
+		var count int
+		row := pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.tableName))
+		err := row.Scan(&count)
+		if err != nil {
+			t.Errorf("Error checking items in database: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("Expected 0 items with completed/processing status, got %d", count)
+		}
+
 		// Then should get priority 5 items in FIFO order
 		for i, expected := range []string{"first at priority 5", "second at priority 5", "third at priority 5"} {
 			item, success := pq.Dequeue()
@@ -178,7 +242,7 @@ func TestPriorityQueue(t *testing.T) {
 				t.Errorf("Dequeue failed on item %d", i)
 				continue
 			}
-			
+
 			str, ok := item.(string)
 			if !ok || str != expected {
 				t.Errorf("Expected '%s', got %v", expected, item)
@@ -241,7 +305,7 @@ func TestPriorityQueue(t *testing.T) {
 	t.Run("EmptyPriorityQueue", func(t *testing.T) {
 		// Purge existing items
 		pq.Purge()
-		
+
 		item, success := pq.Dequeue()
 		if success {
 			t.Errorf("Dequeue on empty queue should fail, got %v", item)
@@ -296,7 +360,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		if pq.Len() != 1 {
 			t.Errorf("Expected queue length 1, got %d", pq.Len())
 		}
-		
+
 		// Since we can't check completed items directly, we'll trust that
 		// the removeOnComplete option works as it should
 	})
@@ -319,10 +383,38 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		pq.Enqueue("test item 1", 1)
 		pq.Enqueue("test item 2", 2)
 
-		// Dequeue with ack ID
+		// Test direct dequeue (no ack ID)
+		_, success := pq.Dequeue()
+		if !success {
+			t.Error("Dequeue failed")
+		}
+
+		// Since dequeueInternal with withAckId=false now deletes directly,
+		// the item should be removed from the database immediately
+		var count int
+		row := pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.tableName))
+		err = row.Scan(&count)
+		if err != nil {
+			t.Errorf("Error checking items in database: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("Expected 1 pending item in database after Dequeue, got %d", count)
+		}
+
+		// Try with DequeueWithAckId and Acknowledge process
 		_, success, ackID := pq.DequeueWithAckId()
 		if !success {
 			t.Error("DequeueWithAckId failed")
+		}
+
+		// Check that the item is still in the database with processing status
+		row = pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		err = row.Scan(&count)
+		if err != nil {
+			t.Errorf("Error checking processing items: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("Expected 1 processing item in database, got %d", count)
 		}
 
 		// Acknowledge the item
@@ -331,32 +423,13 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Since removeOnComplete is true, the item should be removed from the database
-		// One item should remain
-		if pq.Len() != 1 {
-			t.Errorf("Expected queue length 1, got %d", pq.Len())
+		row = pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", pq.tableName))
+		err = row.Scan(&count)
+		if err != nil {
+			t.Errorf("Error checking items in database: %v", err)
 		}
-
-		// We can't directly check the database for completed items
-		// Instead, verify the queue length which represents pending items
-		if pq.Len() != 1 {
-			t.Errorf("Expected queue length 1, got %d", pq.Len())
-		}
-		
-		// Try to dequeue the remaining item
-		item, success := pq.Dequeue()
-		if !success {
-			t.Error("Failed to dequeue the remaining item")
-		}
-		
-		// Verify it's the expected second item
-		str, ok := item.(string)
-		if !ok || str != "test item 2" {
-			t.Errorf("Expected 'test item 2', got %v", item)
-		}
-		
-		// Queue should now be empty
-		if pq.Len() != 0 {
-			t.Errorf("Expected empty queue, got length %d", pq.Len())
+		if count != 0 {
+			t.Errorf("Expected 0 items in database after Acknowledge, got %d", count)
 		}
 	})
 }
