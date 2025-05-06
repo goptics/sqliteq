@@ -5,7 +5,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/fahimfaisaal/sqliteq"
+	"github.com/goptics/sqliteq"
 )
 
 func priorityQueueExample() {
@@ -30,19 +30,19 @@ func priorityQueueExample() {
 	}
 
 	fmt.Println("Adding items to priority queue with different priorities:")
-	
+
 	// Add high priority tasks (0 - highest priority)
 	priorityQueue.Enqueue(Task{1, "High priority task 1"}, 0)
 	fmt.Println("- Added: High priority task 1 (priority 0 - highest)")
-	
+
 	// Add medium priority tasks (5)
 	priorityQueue.Enqueue(Task{2, "Medium priority task 1"}, 5)
 	fmt.Println("- Added: Medium priority task 1 (priority 5)")
-	
+
 	// Add more high priority tasks
 	priorityQueue.Enqueue(Task{3, "High priority task 2"}, 0)
 	fmt.Println("- Added: High priority task 2 (priority 0 - highest)")
-	
+
 	// Add low priority tasks (10 - lowest priority)
 	priorityQueue.Enqueue(Task{4, "Low priority task 1"}, 10)
 	fmt.Println("- Added: Low priority task 1 (priority 10 - lowest)")
@@ -58,7 +58,7 @@ func priorityQueueExample() {
 			fmt.Println("- Queue is empty")
 			break
 		}
-		
+
 		// When items are serialized/deserialized through JSON, they come back as map[string]interface{}
 		if taskMap, ok := item.(map[string]interface{}); ok {
 			// Extract ID and description from the map

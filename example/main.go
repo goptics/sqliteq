@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/fahimfaisaal/sqliteq"
+	"github.com/goptics/sqliteq"
 )
 
 // regularQueueExample demonstrates the basic queue functionality

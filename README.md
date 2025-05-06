@@ -1,10 +1,15 @@
-# SQLiteQ: A Thread-Safe SQLite-Based Queue for Go
+# SQLiteQ: A SQLite-Based Persistent Queue for Go
 
-SQLiteQ is a thread-safe, persistent queue implementation in Go using SQLite as the storage backend. It provides efficient enqueue and dequeue operations and maintains persistence across application restarts.
+[![Go Reference](https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go)](https://pkg.go.dev/github.com/goptics/sqliteq)
+[![Go Report Card](https://goreportcard.com/badge/github.com/goptics/sqliteq)](https://goreportcard.com/report/github.com/goptics/sqliteq)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://golang.org/doc/devel/release.html)
+[![CI](https://github.com/goptics/sqliteq/actions/workflows/sqliteq.yml/badge.svg)](https://github.com/goptics/sqliteq/actions/workflows/go.yml)
+[![codecov](https://codecov.io/gh/goptics/sqliteq/branch/main/graph/badge.svg)](https://codecov.io/gh/goptics/sqliteq)
+
+SQLiteQ is a persistent queue implementation in Go using SQLite as the storage backend. It provides efficient enqueue and dequeue operations and maintains persistence across application restarts.
 
 ## Features
 
-- Thread-safe queue operations using mutexes and SQLite transactions
 - Efficient enqueue and dequeue operations
 - Persistence via SQLite storage
 - Support for acknowledgment-based processing

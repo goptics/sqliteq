@@ -1,4 +1,4 @@
-module github.com/fahimfaisaal/sqliteq
+module github.com/goptics/sqliteq
 
 go 1.20
 
