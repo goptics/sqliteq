@@ -1,0 +1,25 @@
+# Changelog
+
+All notable changes to the SQLiteQ project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.0] - 2025-05-06
+
+### Added
+
+- Initial release of SQLiteQ
+- Basic queue functionality with SQLite backend
+- Support for acknowledgment-based processing
+- Priority queue implementation with configurable priority levels
+- Option to retain acknowledged items in the database (`WithRemoveOnComplete`)
+- Comprehensive test suite for both Queue and PriorityQueue implementations
+- Example code demonstrating both regular and priority queue usage
+- WAL mode enabled for better concurrent access
+- Proper indexing on status and timestamp columns for efficient querying
+
+### Implementation Details
+
+- Queue items have simple lifecycle: pending → processing → completed/removed
+- Priority queue dequeuing respects both priority and creation time
