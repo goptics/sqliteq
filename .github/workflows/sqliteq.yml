@@ -18,17 +18,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    services:
-      redis:
-        image: redis:latest
-        ports:
-          - 6375:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v4
 
@@ -44,8 +33,6 @@ jobs:
       - name: Run tests with coverage
         run: |
           go test -race -coverprofile=coverage.txt -covermode=atomic ./...
-        env:
-          REDIS_URL: redis://localhost:6375
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
