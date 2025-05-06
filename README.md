@@ -14,6 +14,7 @@ SQLiteQ is a persistent queue implementation in Go using SQLite as the storage b
 - Persistence via SQLite storage
 - Support for acknowledgment-based processing
 - Simple and clean API following the Queue interface
+- Built as a persistence adapter for [varmq](https://github.com/goptics/varmq)
 
 ## Installation
 
