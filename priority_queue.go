@@ -2,7 +2,6 @@ package sqliteq
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -64,12 +63,6 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 		return false
 	}
 
-	// Serialize item to JSON
-	data, err := json.Marshal(item)
-	if err != nil {
-		return false
-	}
-
 	now := time.Now().UTC()
 	tx, err := pq.client.Begin()
 	if err != nil {
@@ -83,7 +76,7 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 
 	_, err = tx.Exec(
 		fmt.Sprintf("INSERT INTO %s (data, status, created_at, updated_at, priority) VALUES (?, ?, ?, ?, ?)", pq.tableName),
-		data, "pending", now, now, priority,
+		item, "pending", now, now, priority,
 	)
 	if err != nil {
 		tx.Rollback()
@@ -157,14 +150,7 @@ func (pq *PriorityQueue) dequeueInternal(withAckId bool) (any, bool, string) {
 		return nil, false, ""
 	}
 
-	// Unmarshal the item
-	var unmarshaledItem any
-	err = json.Unmarshal(data, &unmarshaledItem)
-	if err != nil {
-		return nil, false, ""
-	}
-
-	return unmarshaledItem, true, ackID
+	return data, true, ackID
 }
 
 // Dequeue overrides the base Dequeue method to use priority-based dequeuing

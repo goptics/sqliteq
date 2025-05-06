@@ -22,17 +22,17 @@ func TestSQLiteQueue(t *testing.T) {
 
 	// Test enqueue
 	t.Run("Enqueue", func(t *testing.T) {
-		success := q.Enqueue("test item 1")
+		success := q.Enqueue([]byte("test item 1"))
 		if !success {
 			t.Error("Enqueue failed")
 		}
 
-		success = q.Enqueue(42)
+		success = q.Enqueue([]byte("42"))
 		if !success {
 			t.Error("Enqueue failed")
 		}
 
-		success = q.Enqueue(map[string]any{"key": "value"})
+		success = q.Enqueue([]byte("some complex data"))
 		if !success {
 			t.Error("Enqueue failed")
 		}
@@ -52,16 +52,19 @@ func TestSQLiteQueue(t *testing.T) {
 
 	// Test dequeue
 	t.Run("Dequeue", func(t *testing.T) {
-		item, success := q.Dequeue()
+		data, success := q.Dequeue()
 		if !success {
 			t.Error("Dequeue failed")
 		}
 
-		// The first item should be "test item 1"
-		// Note: When unmarshaling JSON, strings come back as any
-		str, ok := item.(string)
-		if !ok || str != "test item 1" {
-			t.Errorf("Expected 'test item 1', got %v", item)
+		// The first item should be "test item 1" as bytes
+		byteData, ok := data.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", data)
+		}
+		
+		if string(byteData) != "test item 1" {
+			t.Errorf("Expected 'test item 1', got '%s'", string(byteData))
 		}
 
 		if q.Len() != 2 {
@@ -91,11 +94,14 @@ func TestSQLiteQueue(t *testing.T) {
 			t.Error("Expected non-empty ack ID")
 		}
 
-		// The next item should be the number 42
-		// Note: JSON numbers are unmarshaled as float64
-		num, ok := item.(float64)
-		if !ok || num != 42 {
-			t.Errorf("Expected 42, got %v", item)
+		// The next item should be the string "42" as bytes
+		byteData, ok := item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "42" {
+			t.Errorf("Expected '42', got '%s'", string(byteData))
 		}
 
 		// Test acknowledge
@@ -217,7 +223,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Try with DequeueWithAckId and Acknowledge process
-		q.Enqueue("test item 2")
+		q.Enqueue([]byte("test item 2"))
 
 		_, success, ackID := q.DequeueWithAckId()
 		if !success {
@@ -274,7 +280,8 @@ func TestConcurrentOperations(t *testing.T) {
 	// Producer goroutine
 	go func() {
 		for i := 0; i < numItems; i++ {
-			if !q.Enqueue(i) {
+			itemData := []byte(fmt.Sprintf("item-%d", i))
+			if !q.Enqueue(itemData) {
 				t.Errorf("Failed to enqueue item %d", i)
 			}
 		}

@@ -2,7 +2,6 @@ package sqliteq
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -66,11 +65,6 @@ func (q *Queue) Enqueue(item any) bool {
 		return false
 	}
 
-	data, err := json.Marshal(item)
-	if err != nil {
-		return false
-	}
-
 	now := time.Now().UTC()
 	tx, err := q.client.Begin()
 	if err != nil {
@@ -84,7 +78,7 @@ func (q *Queue) Enqueue(item any) bool {
 
 	_, err = tx.Exec(
 		fmt.Sprintf("INSERT INTO %s (data, status, created_at, updated_at) VALUES (?, ?, ?, ?)", q.tableName),
-		data, "pending", now, now,
+		item, "pending", now, now,
 	)
 	if err != nil {
 		return false
@@ -157,14 +151,7 @@ func (q *Queue) dequeueInternal(withAckId bool) (item any, success bool, ackID s
 		return nil, false, ""
 	}
 
-	// Unmarshal the item
-	var unmarshaledItem any
-	err = json.Unmarshal(data, &unmarshaledItem)
-	if err != nil {
-		return nil, false, ""
-	}
-
-	return unmarshaledItem, true, ackID
+	return data, true, ackID
 }
 
 // Dequeue removes and returns the next item from the queue
@@ -250,11 +237,9 @@ func (q *Queue) Values() []any {
 			continue
 		}
 
-		var item any
-		if err := json.Unmarshal(data, &item); err != nil {
-			continue
-		}
-		items = append(items, item)
+		// Now we just add the byte array directly as we're storing byte arrays
+		// instead of JSON-serialized data
+		items = append(items, data)
 	}
 
 	return items

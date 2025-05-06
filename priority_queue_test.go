@@ -26,23 +26,23 @@ func TestPriorityQueue(t *testing.T) {
 	// Test enqueue with priorities
 	t.Run("EnqueueWithPriority", func(t *testing.T) {
 		// Enqueue items with different priorities
-		success := pq.Enqueue("high priority", 0)
+		success := pq.Enqueue([]byte("high priority"), 0)
 		if !success {
 			t.Error("Enqueue failed for high priority item")
 		}
 
-		success = pq.Enqueue("medium priority", 10)
+		success = pq.Enqueue([]byte("medium priority"), 10)
 		if !success {
 			t.Error("Enqueue failed for medium priority item")
 		}
 
-		success = pq.Enqueue("low priority", 20)
+		success = pq.Enqueue([]byte("low priority"), 20)
 		if !success {
 			t.Error("Enqueue failed for low priority item")
 		}
 
 		// Add another high priority item, but later
-		success = pq.Enqueue("second high priority", 0)
+		success = pq.Enqueue([]byte("second high priority"), 0)
 		if !success {
 			t.Error("Enqueue failed for second high priority item")
 		}
@@ -56,10 +56,10 @@ func TestPriorityQueue(t *testing.T) {
 	t.Run("PriorityDequeue", func(t *testing.T) {
 		// Create new items to test with
 		pq.Purge()
-		pq.Enqueue("high priority", 0)
-		pq.Enqueue("second high priority", 0)
-		pq.Enqueue("medium priority", 10)
-		pq.Enqueue("low priority", 20)
+		pq.Enqueue([]byte("high priority"), 0)
+		pq.Enqueue([]byte("second high priority"), 0)
+		pq.Enqueue([]byte("medium priority"), 10)
+		pq.Enqueue([]byte("low priority"), 20)
 
 		// Should dequeue highest priority first (lowest number)
 		item, success := pq.Dequeue()
@@ -67,10 +67,14 @@ func TestPriorityQueue(t *testing.T) {
 			t.Error("Dequeue failed")
 		}
 
-		// The first item should be "high priority"
-		str, ok := item.(string)
-		if !ok || str != "high priority" {
-			t.Errorf("Expected 'high priority', got %v", item)
+		// The first item should be "high priority" as bytes
+		byteData, ok := item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "high priority" {
+			t.Errorf("Expected 'high priority', got '%s'", string(byteData))
 		}
 
 		// Verify the item is completely removed from the database
@@ -90,9 +94,13 @@ func TestPriorityQueue(t *testing.T) {
 			t.Error("Dequeue failed")
 		}
 
-		str, ok = item.(string)
-		if !ok || str != "second high priority" {
-			t.Errorf("Expected 'second high priority', got %v", item)
+		byteData, ok = item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "second high priority" {
+			t.Errorf("Expected 'second high priority', got '%s'", string(byteData))
 		}
 
 		// Third dequeue should get medium priority
@@ -101,9 +109,13 @@ func TestPriorityQueue(t *testing.T) {
 			t.Error("Dequeue failed")
 		}
 
-		str, ok = item.(string)
-		if !ok || str != "medium priority" {
-			t.Errorf("Expected 'medium priority', got %v", item)
+		byteData, ok = item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "medium priority" {
+			t.Errorf("Expected 'medium priority', got '%s'", string(byteData))
 		}
 
 		// Fourth dequeue should get low priority
@@ -112,9 +124,13 @@ func TestPriorityQueue(t *testing.T) {
 			t.Error("Dequeue failed")
 		}
 
-		str, ok = item.(string)
-		if !ok || str != "low priority" {
-			t.Errorf("Expected 'low priority', got %v", item)
+		byteData, ok = item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "low priority" {
+			t.Errorf("Expected 'low priority', got '%s'", string(byteData))
 		}
 
 		// Verify the item is completely removed from the database
@@ -139,10 +155,10 @@ func TestPriorityQueue(t *testing.T) {
 		pq.Purge()
 
 		// Setup test data with different priorities
-		pq.Enqueue("highest", 0)
-		pq.Enqueue("high", 5)
-		pq.Enqueue("medium", 10)
-		pq.Enqueue("low", 20)
+		pq.Enqueue([]byte("highest"), 0)
+		pq.Enqueue([]byte("high"), 5)
+		pq.Enqueue([]byte("medium"), 10)
+		pq.Enqueue([]byte("low"), 20)
 
 		// Dequeue should respect priority order
 		item, success, ackID := pq.DequeueWithAckId()
@@ -154,9 +170,13 @@ func TestPriorityQueue(t *testing.T) {
 			t.Error("Expected non-empty ack ID")
 		}
 
-		str, ok := item.(string)
-		if !ok || str != "highest" {
-			t.Errorf("Expected 'highest', got %v", item)
+		byteData, ok := item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "highest" {
+			t.Errorf("Expected 'highest', got '%s'", string(byteData))
 		}
 
 		// Verify item is in processing status in database
@@ -192,9 +212,13 @@ func TestPriorityQueue(t *testing.T) {
 			t.Error("DequeueWithAckId failed")
 		}
 
-		str, ok = item.(string)
-		if !ok || str != "high" {
-			t.Errorf("Expected 'high', got %v", item)
+		byteData, ok = item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "high" {
+			t.Errorf("Expected 'high', got '%s'", string(byteData))
 		}
 	})
 
@@ -204,24 +228,28 @@ func TestPriorityQueue(t *testing.T) {
 		pq.Purge()
 
 		// Enqueue multiple items with same priority to test FIFO within same priority
-		pq.Enqueue("first at priority 5", 5)
-		pq.Enqueue("second at priority 5", 5)
-		pq.Enqueue("third at priority 5", 5)
+		pq.Enqueue([]byte("first at priority 5"), 5)
+		pq.Enqueue([]byte("second at priority 5"), 5)
+		pq.Enqueue([]byte("third at priority 5"), 5)
 
 		// Add higher priority item
-		pq.Enqueue("priority 1", 1)
+		pq.Enqueue([]byte("priority 1"), 1)
 
 		// Add lower priority item
-		pq.Enqueue("priority 10", 10)
+		pq.Enqueue([]byte("priority 10"), 10)
 
 		// Should get priority 1 first
 		item, success := pq.Dequeue()
 		if !success {
 			t.Error("Dequeue failed")
 		}
-		str, ok := item.(string)
-		if !ok || str != "priority 1" {
-			t.Errorf("Expected 'priority 1', got %v", item)
+		byteData, ok := item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "priority 1" {
+			t.Errorf("Expected 'priority 1', got '%s'", string(byteData))
 		}
 
 		// Verify item is removed from database
@@ -243,9 +271,14 @@ func TestPriorityQueue(t *testing.T) {
 				continue
 			}
 
-			str, ok := item.(string)
-			if !ok || str != expected {
-				t.Errorf("Expected '%s', got %v", expected, item)
+			byteData, ok := item.([]byte)
+			if !ok {
+				t.Errorf("Expected []byte, got %T", item)
+				continue
+			}
+			
+			if string(byteData) != expected {
+				t.Errorf("Expected '%s', got '%s'", expected, string(byteData))
 			}
 		}
 
@@ -254,9 +287,13 @@ func TestPriorityQueue(t *testing.T) {
 		if !success {
 			t.Error("Dequeue failed")
 		}
-		str, ok = item.(string)
-		if !ok || str != "priority 10" {
-			t.Errorf("Expected 'priority 10', got %v", item)
+		byteData, ok = item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "priority 10" {
+			t.Errorf("Expected 'priority 10', got '%s'", string(byteData))
 		}
 	})
 
@@ -266,18 +303,22 @@ func TestPriorityQueue(t *testing.T) {
 		pq.Purge()
 
 		// Enqueue with negative, zero, and positive priorities
-		pq.Enqueue("negative priority", -10)
-		pq.Enqueue("zero priority", 0)
-		pq.Enqueue("positive priority", 10)
+		pq.Enqueue([]byte("negative priority"), -10)
+		pq.Enqueue([]byte("zero priority"), 0)
+		pq.Enqueue([]byte("positive priority"), 10)
 
 		// Negative should come first (lower number = higher priority)
 		item, success := pq.Dequeue()
 		if !success {
 			t.Error("Dequeue failed")
 		}
-		str, ok := item.(string)
-		if !ok || str != "negative priority" {
-			t.Errorf("Expected 'negative priority', got %v", item)
+		byteData, ok := item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "negative priority" {
+			t.Errorf("Expected 'negative priority', got '%s'", string(byteData))
 		}
 
 		// Then zero
@@ -285,9 +326,13 @@ func TestPriorityQueue(t *testing.T) {
 		if !success {
 			t.Error("Dequeue failed")
 		}
-		str, ok = item.(string)
-		if !ok || str != "zero priority" {
-			t.Errorf("Expected 'zero priority', got %v", item)
+		byteData, ok = item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "zero priority" {
+			t.Errorf("Expected 'zero priority', got '%s'", string(byteData))
 		}
 
 		// Then positive
@@ -295,9 +340,13 @@ func TestPriorityQueue(t *testing.T) {
 		if !success {
 			t.Error("Dequeue failed")
 		}
-		str, ok = item.(string)
-		if !ok || str != "positive priority" {
-			t.Errorf("Expected 'positive priority', got %v", item)
+		byteData, ok = item.([]byte)
+		if !ok {
+			t.Errorf("Expected []byte, got %T", item)
+		}
+		
+		if string(byteData) != "positive priority" {
+			t.Errorf("Expected 'positive priority', got '%s'", string(byteData))
 		}
 	})
 
@@ -460,7 +509,8 @@ func TestPriorityQueueConcurrentOperations(t *testing.T) {
 			// Assign priority based on item index (reverse order)
 			// So earlier added items have lower priority
 			priority := numItems - i
-			if !pq.Enqueue(i, priority) {
+			itemData := []byte(fmt.Sprintf("item-%d", i))
+			if !pq.Enqueue(itemData, priority) {
 				t.Errorf("Failed to enqueue item %d with priority %d", i, priority)
 			}
 		}
