@@ -110,3 +110,9 @@ SQLiteQ uses a SQLite database to store queue items with the following schema:
 - Operations leverage SQLite's indexing for logarithmic time complexity rather than true constant-time
 - SQLite's WAL (Write-Ahead Logging) mode is enabled for better concurrent access
 - Proper indexing is set up on the status and creation time columns for efficient querying
+
+## 👤 Author
+
+- GitHub: [@fahimfaisaal](https://github.com/fahimfaisaal)
+- LinkedIn: [in/fahimfaisaal](https://www.linkedin.com/in/fahimfaisaal/)
+- Twitter: [@FahimFaisaal](https://twitter.com/FahimFaisaal)
