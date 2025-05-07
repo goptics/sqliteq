@@ -35,28 +35,35 @@ import (
 )
 
 func main() {
-    // Create a new SQLite queue
-    // The first parameter is the path to the SQLite database file
-    // The second parameter is the name of the table to use for the queue
-    queue, err := sqliteq.NewSQLiteQueue("queue.db", "my_queue")
+    // Create a new SQLite queues manager
+    // The parameter is the path to the SQLite database file
+    queuesManager := sqliteq.New("queue.db")
+    defer queuesManager.Close()
+
+    // Create a new queue
+    // The parameter is the name of the table to use for the queue
+    queue, err := queuesManager.NewQueue("my_queue")
     if err != nil {
         log.Fatalf("Failed to create queue: %v", err)
     }
-    defer queue.Close()
 
     // You can also create a queue with custom options
     // For example, to keep acknowledged items in the database:
-    queueWithOptions, err := sqliteq.NewSQLiteQueue("queue.db", "my_other_queue",
+    queueWithOptions, err := queuesManager.NewQueue("my_other_queue",
         sqliteq.WithRemoveOnComplete(false)) // Set to false to keep acknowledged items
     if err != nil {
         log.Fatalf("Failed to create queue: %v", err)
     }
-    defer queueWithOptions.Close()
+
+    // Create a priority queue
+    priorityQueue, err := queuesManager.NewPriorityQueue("my_priority_queue")
+    if err != nil {
+        log.Fatalf("Failed to create priority queue: %v", err)
+    }
 
     // Enqueue items
-    queue.Enqueue("item 1")
-    queue.Enqueue(42)
-    queue.Enqueue(map[string]any{"key": "value"})
+    queue.Enqueue([]byte("item 1"))
+    queue.Enqueue([]byte("item 2"))
 
     // Get queue length
     fmt.Printf("Queue length: %d\n", queue.Len())
@@ -68,13 +75,13 @@ func main() {
     // Simple dequeue
     item, success := queue.Dequeue()
     if success {
-        fmt.Printf("Dequeued item: %v\n", item)
+        fmt.Printf("Dequeued item: %v\n", string(item.([]byte)))
     }
 
     // Dequeue with acknowledgment
     item, success, ackID := queue.DequeueWithAckId()
     if success {
-        fmt.Printf("Dequeued item: %v with ack ID: %s\n", item, ackID)
+        fmt.Printf("Dequeued item: %v with ack ID: %s\n", string(item.([]byte)), ackID)
 
         // Process the item...
 
