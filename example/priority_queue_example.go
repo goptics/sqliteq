@@ -24,29 +24,24 @@ func priorityQueueExample() {
 	}
 
 	// Add items with different priorities
-	type Task struct {
-		ID          int
-		Description string
-	}
-
 	fmt.Println("Adding items to priority queue with different priorities:")
 
 	// Add high priority tasks (0 - highest priority)
-	priorityQueue.Enqueue(Task{1, "High priority task 1"}, 0)
+	priorityQueue.Enqueue([]byte("High priority task 1"), 0)
 	fmt.Println("- Added: High priority task 1 (priority 0 - highest)")
 
 	// Add medium priority tasks (5)
-	priorityQueue.Enqueue(Task{2, "Medium priority task 1"}, 5)
+	priorityQueue.Enqueue([]byte("Medium priority task 1"), 5)
 	fmt.Println("- Added: Medium priority task 1 (priority 5)")
 
 	// Add more high priority tasks
-	priorityQueue.Enqueue(Task{3, "High priority task 2"}, 0)
+	priorityQueue.Enqueue([]byte("High priority task 2"), 0)
 	fmt.Println("- Added: High priority task 2 (priority 0 - highest)")
 
 	// Add low priority tasks (10 - lowest priority)
-	priorityQueue.Enqueue(Task{4, "Low priority task 1"}, 10)
+	priorityQueue.Enqueue([]byte("Low priority task 1"), 10)
 	fmt.Println("- Added: Low priority task 1 (priority 10 - lowest)")
-	priorityQueue.Enqueue(Task{5, "Low priority task 2"}, 10)
+	priorityQueue.Enqueue([]byte("Low priority task 2"), 10)
 	fmt.Println("- Added: Low priority task 2 (priority 10 - lowest)")
 
 	// Dequeue items - they should come out in priority order (lower priority numbers first)
@@ -60,11 +55,8 @@ func priorityQueueExample() {
 		}
 
 		// When items are serialized/deserialized through JSON, they come back as map[string]interface{}
-		if taskMap, ok := item.(map[string]interface{}); ok {
-			// Extract ID and description from the map
-			id := int(taskMap["ID"].(float64))
-			desc := taskMap["Description"].(string)
-			fmt.Printf("- Dequeued: ID %d - %s\n", id, desc)
+		if taskMap, ok := item.([]byte); ok {
+			fmt.Printf("- Dequeued: %s\n", string(taskMap))
 		} else {
 			fmt.Printf("- Dequeued item with unexpected type: %T\n", item)
 		}

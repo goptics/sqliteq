@@ -27,13 +27,9 @@ func regularQueueExample() {
 
 	// Add some items to the queue
 	fmt.Println("Adding items to the queue...")
-	queue.Enqueue("Task 1")
-	queue.Enqueue("Task 2")
-	queue.Enqueue(map[string]interface{}{
-		"task":     "Complex Task",
-		"priority": "high",
-		"due":      time.Now().Add(24 * time.Hour),
-	})
+	queue.Enqueue([]byte("Task 1"))
+	queue.Enqueue([]byte("Task 2"))
+	queue.Enqueue([]byte("Task 3"))
 
 	// Print queue length
 	fmt.Printf("Queue length: %d\n", queue.Len())
@@ -41,14 +37,14 @@ func regularQueueExample() {
 	// Print all values
 	fmt.Println("\nAll pending items:")
 	for i, item := range queue.Values() {
-		fmt.Printf("  %d: %v\n", i+1, item)
+		fmt.Printf("  %d: %v\n", i+1, string(item.([]byte)))
 	}
 
 	// Dequeue an item with acknowledgment
 	fmt.Println("\nDequeuing an item with acknowledgment...")
 	item, success, ackID := queue.DequeueWithAckId()
 	if success {
-		fmt.Printf("Dequeued: %v\n", item)
+		fmt.Printf("Dequeued: %v\n", string(item.([]byte)))
 		fmt.Printf("Acknowledgment ID: %s\n", ackID)
 
 		// Simulate processing the item
@@ -67,7 +63,7 @@ func regularQueueExample() {
 	fmt.Println("\nPerforming a simple dequeue...")
 	item, success = queue.Dequeue()
 	if success {
-		fmt.Printf("Dequeued: %v\n", item)
+		fmt.Printf("Dequeued: %v\n", string(item.([]byte)))
 	}
 
 	// Check queue length again
