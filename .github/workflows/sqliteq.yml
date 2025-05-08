@@ -39,6 +39,6 @@ jobs:
 
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          slug: goptics/redisq
+          slug: goptics/sqliteq
           files: ./coverage.txt
           verbose: true
