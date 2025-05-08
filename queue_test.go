@@ -62,7 +62,7 @@ func TestSQLiteQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", data)
 		}
-		
+
 		if string(byteData) != "test item 1" {
 			t.Errorf("Expected 'test item 1', got '%s'", string(byteData))
 		}
@@ -99,7 +99,7 @@ func TestSQLiteQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "42" {
 			t.Errorf("Expected '42', got '%s'", string(byteData))
 		}
@@ -322,5 +322,23 @@ func TestConcurrentOperations(t *testing.T) {
 	// Verify queue is empty
 	if q.Len() != 0 {
 		t.Errorf("Expected empty queue, got length %d", q.Len())
+	}
+}
+
+func TestQuoteIdent(t *testing.T) {
+	tt := []struct{ input, want string }{
+		{"foo", `"foo"`},
+		{"spaces are here", `"spaces are here"`},
+		{`"quoted"`, `"""quoted"""`},
+		{``, `""`}, // belive it or not this is a valid table name
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.input, func(t *testing.T) {
+			got := quoteIdent(tc.input)
+			if got != tc.want {
+				t.Errorf("Unexpected quotes tabled (want %q, got %q)", tc.want, got)
+			}
+		})
 	}
 }
