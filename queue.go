@@ -81,7 +81,7 @@ func (q *Queue) RequeueNoAckRows() {
 		time.Now().UTC(),
 	)
 
-	tx.Commit()
+	err = tx.Commit()
 }
 
 // Enqueue adds an item to the queue
@@ -126,6 +126,7 @@ func (q *Queue) dequeueInternal(withAckId bool) (item any, success bool, ackID s
 	if err != nil {
 		return nil, false, ""
 	}
+
 	defer func() {
 		if err != nil {
 			tx.Rollback()
@@ -147,18 +148,12 @@ func (q *Queue) dequeueInternal(withAckId bool) (item any, success bool, ackID s
 
 	// Scan the row data
 	err = row.Scan(&id, &data, &nullAckID) // ackID may be NULL for pending items
-
 	// Extract the string value if valid
 	if nullAckID.Valid {
 		ackID = nullAckID.String
 	}
 
 	if err != nil {
-		if err == sql.ErrNoRows {
-			tx.Rollback()
-			return nil, false, ""
-		}
-		tx.Rollback()
 		return nil, false, ""
 	}
 
@@ -185,12 +180,11 @@ func (q *Queue) dequeueInternal(withAckId bool) (item any, success bool, ackID s
 	}
 
 	if err != nil {
-		tx.Rollback()
 		return nil, false, ""
 	}
 
-	// Commit transaction
 	err = tx.Commit()
+
 	if err != nil {
 		return nil, false, ""
 	}
@@ -218,8 +212,10 @@ func (q *Queue) Acknowledge(ackID string) bool {
 	if err != nil {
 		return false
 	}
+	var rowsAffected int64
+
 	defer func() {
-		if err != nil {
+		if err != nil || rowsAffected == 0 {
 			tx.Rollback()
 		}
 	}()
@@ -241,18 +237,18 @@ func (q *Queue) Acknowledge(ackID string) bool {
 	}
 
 	if err != nil {
-		tx.Rollback()
 		return false
 	}
 
-	rowsAffected, err := result.RowsAffected()
+	rowsAffected, err = result.RowsAffected()
 
 	if err != nil || rowsAffected == 0 {
-		tx.Rollback()
 		return false
 	}
 
-	return tx.Commit() == nil
+	err = tx.Commit()
+
+	return err == nil
 }
 
 // Len returns the number of pending items in the queue
@@ -303,7 +299,6 @@ func (q *Queue) Purge() {
 
 	_, err = tx.Exec(fmt.Sprintf("DELETE FROM %s", quoteIdent(q.tableName)))
 	if err != nil {
-		tx.Rollback()
 		return
 	}
 

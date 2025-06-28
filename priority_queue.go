@@ -65,9 +65,11 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 
 	now := time.Now().UTC()
 	tx, err := pq.client.Begin()
+
 	if err != nil {
 		return false
 	}
+
 	defer func() {
 		if err != nil {
 			tx.Rollback()
@@ -78,12 +80,13 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 		fmt.Sprintf("INSERT INTO %s (data, status, created_at, updated_at, priority) VALUES (?, ?, ?, ?, ?)", quoteIdent(pq.tableName)),
 		item, "pending", now, now, priority,
 	)
+
 	if err != nil {
-		tx.Rollback()
 		return false
 	}
 
 	err = tx.Commit()
+
 	return err == nil
 }
 
@@ -94,9 +97,11 @@ func (pq *PriorityQueue) dequeueInternal(withAckId bool) (any, bool, string) {
 	}
 
 	tx, err := pq.client.Begin()
+
 	if err != nil {
 		return nil, false, ""
 	}
+
 	defer func() {
 		if err != nil {
 			tx.Rollback()
@@ -112,11 +117,6 @@ func (pq *PriorityQueue) dequeueInternal(withAckId bool) (any, bool, string) {
 	))
 	err = row.Scan(&id, &data)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			tx.Rollback()
-			return nil, false, ""
-		}
-		tx.Rollback()
 		return nil, false, ""
 	}
 
@@ -140,12 +140,12 @@ func (pq *PriorityQueue) dequeueInternal(withAckId bool) (any, bool, string) {
 	}
 
 	if err != nil {
-		tx.Rollback()
 		return nil, false, ""
 	}
 
 	// Commit transaction
 	err = tx.Commit()
+
 	if err != nil {
 		return nil, false, ""
 	}
