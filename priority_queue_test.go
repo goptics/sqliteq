@@ -3,10 +3,29 @@ package sqliteq
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+func TestPriorityQueueReopenExistingDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_priority_reopen.db")
+
+	first := New(dbPath)
+	if _, err := first.NewPriorityQueue("pq"); err != nil {
+		t.Fatalf("first NewPriorityQueue failed: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+
+	second := New(dbPath)
+	defer second.Close()
+	if _, err := second.NewPriorityQueue("pq"); err != nil {
+		t.Fatalf("second NewPriorityQueue failed: %v", err)
+	}
+}
 
 func TestPriorityQueue(t *testing.T) {
 	// Create a temporary database file
@@ -72,7 +91,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "high priority" {
 			t.Errorf("Expected 'high priority', got '%s'", string(byteData))
 		}
@@ -98,7 +117,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "second high priority" {
 			t.Errorf("Expected 'second high priority', got '%s'", string(byteData))
 		}
@@ -113,7 +132,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "medium priority" {
 			t.Errorf("Expected 'medium priority', got '%s'", string(byteData))
 		}
@@ -128,7 +147,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "low priority" {
 			t.Errorf("Expected 'low priority', got '%s'", string(byteData))
 		}
@@ -174,7 +193,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "highest" {
 			t.Errorf("Expected 'highest', got '%s'", string(byteData))
 		}
@@ -216,7 +235,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "high" {
 			t.Errorf("Expected 'high', got '%s'", string(byteData))
 		}
@@ -247,7 +266,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "priority 1" {
 			t.Errorf("Expected 'priority 1', got '%s'", string(byteData))
 		}
@@ -276,7 +295,7 @@ func TestPriorityQueue(t *testing.T) {
 				t.Errorf("Expected []byte, got %T", item)
 				continue
 			}
-			
+
 			if string(byteData) != expected {
 				t.Errorf("Expected '%s', got '%s'", expected, string(byteData))
 			}
@@ -291,7 +310,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "priority 10" {
 			t.Errorf("Expected 'priority 10', got '%s'", string(byteData))
 		}
@@ -316,7 +335,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "negative priority" {
 			t.Errorf("Expected 'negative priority', got '%s'", string(byteData))
 		}
@@ -330,7 +349,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "zero priority" {
 			t.Errorf("Expected 'zero priority', got '%s'", string(byteData))
 		}
@@ -344,7 +363,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "positive priority" {
 			t.Errorf("Expected 'positive priority', got '%s'", string(byteData))
 		}
