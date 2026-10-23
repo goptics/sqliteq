@@ -34,22 +34,23 @@ func newPriorityQueue(db *sql.DB, tableName string, opts ...Option) (*PriorityQu
 
 // initPriorityColumn adds the priority column to the table if it doesn't exist
 func (pq *PriorityQueue) initPriorityColumn() error {
-	// Check if priority column exists
-	var name string
-	err := pq.client.QueryRow(fmt.Sprintf("PRAGMA table_info(%s)", quoteIdent(pq.tableName))).Scan(nil, &name, nil, nil, nil, nil)
+	exists, err := hasColumn(pq.client, pq.tableName, "priority")
+	if err != nil {
+		return err
+	}
 
-	if err != nil || name != "priority" {
+	if !exists {
 		// Add priority column with default value 0
 		_, err := pq.client.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN priority INTEGER NOT NULL DEFAULT 0", quoteIdent(pq.tableName)))
 		if err != nil {
 			return err
 		}
+	}
 
-		// Create index on priority (ASC for lower numbers = higher priority)
-		_, err = pq.client.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (priority ASC, created_at ASC)", quoteIdent(pq.tableName+"_priority_idx"), quoteIdent(pq.tableName)))
-		if err != nil {
-			return err
-		}
+	// Create index on priority (ASC for lower numbers = higher priority)
+	_, err = pq.client.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (priority ASC, created_at ASC)", quoteIdent(pq.tableName+"_priority_idx"), quoteIdent(pq.tableName)))
+	if err != nil {
+		return err
 	}
 
 	return nil

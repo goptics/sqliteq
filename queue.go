@@ -32,11 +32,13 @@ func newQueue(db *sql.DB, tableName string, opts ...Option) (*Queue, error) {
 	}
 
 	if err := q.initTable(); err != nil {
-		db.Close()
+		// The db is shared by every queue of the Queues, so it is not closed here
 		return nil, fmt.Errorf("failed to initialize table: %w", err)
 	}
 
-	q.RequeueNoAckRows()
+	if err := q.requeueNoAck(); err != nil {
+		return nil, fmt.Errorf("failed to requeue unacknowledged rows: %w", err)
+	}
 
 	return q, nil
 }
@@ -66,22 +68,52 @@ func (q *Queue) initTable() error {
 	return err
 }
 
-func (q *Queue) RequeueNoAckRows() {
+// requeueNoAck puts rows left in processing without an ack back to pending
+func (q *Queue) requeueNoAck() error {
 	tx, err := q.client.Begin()
-
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
+	if err != nil {
+		return err
+	}
 
 	_, err = tx.Exec(
 		fmt.Sprintf("UPDATE %s SET status = 'pending', updated_at = ? WHERE  status = 'processing' AND ack = 0",
 			quoteIdent(q.tableName)),
 		time.Now().UTC(),
 	)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
 
-	err = tx.Commit()
+	return tx.Commit()
+}
+
+// hasColumn reports whether the table has a column with the given name
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", quoteIdent(table)))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+
+	return false, rows.Err()
 }
 
 // Enqueue adds an item to the queue

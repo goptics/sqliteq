@@ -3,6 +3,7 @@ package sqliteq
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -551,5 +552,37 @@ func TestPriorityQueueConcurrentOperations(t *testing.T) {
 	// Verify queue is empty
 	if pq.Len() != 0 {
 		t.Errorf("Expected empty queue, got length %d", pq.Len())
+	}
+}
+
+func TestPriorityQueueReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "reopen.db")
+
+	qs := New(dbPath)
+	pq, err := qs.NewPriorityQueue("jobs")
+	if err != nil {
+		t.Fatalf("Failed to create priority queue: %v", err)
+	}
+	pq.Enqueue([]byte("a"), 1)
+	pq.Enqueue([]byte("b"), 0)
+	if err := qs.Close(); err != nil {
+		t.Fatalf("Failed to close: %v", err)
+	}
+
+	qs = New(dbPath)
+	defer qs.Close()
+	pq, err = qs.NewPriorityQueue("jobs")
+	if err != nil {
+		t.Fatalf("Failed to reopen priority queue: %v", err)
+	}
+
+	if pq.Len() != 2 {
+		t.Fatalf("Expected queue length 2, got %d", pq.Len())
+	}
+	for _, want := range []string{"b", "a"} {
+		item, ok := pq.Dequeue()
+		if !ok || string(item.([]byte)) != want {
+			t.Fatalf("Expected %q, got %q (ok=%v)", want, item, ok)
+		}
 	}
 }

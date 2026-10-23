@@ -1,8 +1,10 @@
 package sqliteq
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -340,5 +342,40 @@ func TestQuoteIdent(t *testing.T) {
 				t.Errorf("Unexpected quotes tabled (want %q, got %q)", tc.want, got)
 			}
 		})
+	}
+}
+
+func TestTableInitErrorKeepsPool(t *testing.T) {
+	qs := New(filepath.Join(t.TempDir(), "pool.db"))
+	defer qs.Close()
+
+	ok, err := qs.NewQueue("ok")
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	// A view named like the queue makes CREATE INDEX fail during table init
+	if _, err := qs.(*queues).client.Exec(`CREATE VIEW "bad" AS SELECT 1 AS x`); err != nil {
+		t.Fatalf("Failed to create view: %v", err)
+	}
+	if _, err := qs.NewQueue("bad"); err == nil {
+		t.Fatal("Expected table init to fail for the second queue")
+	}
+
+	if !ok.Enqueue([]byte("still works")) {
+		t.Error("Enqueue on the first queue failed after the second queue's init error")
+	}
+}
+
+func TestRecoveryError(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "recovery.db"))
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	q := &Queue{client: db, tableName: "recovery"}
+	db.Close()
+
+	if err := q.requeueNoAck(); err == nil {
+		t.Error("Expected an error from requeueNoAck on a closed database")
 	}
 }
