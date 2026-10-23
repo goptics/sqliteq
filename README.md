@@ -177,10 +177,10 @@ sqliteq does not import varmq. Batch pops and `EnqueueOnce` are being added for 
 
 SQLiteQ uses a SQLite database to store queue items with the following schema:
 
-- `id`: Unique identifier for each item (autoincrement primary key)
+- `id`: Unique identifier for each item (autoincrement primary key). Items come out in `id` order, and a priority queue's in `priority`, then `id` order. The ack id `DequeueWithAckId` returns is this id in decimal
 - `data`: The serialized item data (stored as a JSON blob)
 - `status`: The status of the item ("pending", "processing", or "completed")
-- `ack_id`: A unique ID for acknowledging processed items
+- `ack_id`: Kept from v0.2 so old tables need no rebuild; no longer used
 - `created_at`: When the item was added to the queue
 - `updated_at`: When the item was last updated
 
@@ -191,7 +191,7 @@ SQLiteQ uses a SQLite database to store queue items with the following schema:
 - The queue is optimized for efficient enqueue and dequeue operations that scale well with queue size
 - Operations leverage SQLite's indexing for logarithmic time complexity rather than true constant-time
 - SQLite's WAL (Write-Ahead Logging) mode is enabled for better concurrent access
-- Proper indexing is set up on the status and creation time columns for efficient querying
+- One partial index covers the pending items in queue order; opening a v0.2 table replaces its old indexes with it
 
 ## 👤 Author
 
