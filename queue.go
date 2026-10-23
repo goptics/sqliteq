@@ -98,6 +98,10 @@ func (q *Queue) initTable() error {
 	return err
 }
 
+// pendingIndexSuffix names a queue's partial pending index. Tables and
+// indexes share one namespace, so the suffix is one no queue name would take.
+const pendingIndexSuffix = "__sqliteq_pending"
+
 // migrate drops the v0.2 indexes and makes sure the one partial index on
 // pending rows matches the queue order. On a migrated table it changes nothing.
 func (q *Queue) migrate() error {
@@ -107,7 +111,7 @@ func (q *Queue) migrate() error {
 		}
 	}
 
-	index := q.name + "_pending"
+	index := q.name + pendingIndexSuffix
 	cols, err := indexColumns(q.f.db, index)
 	if err != nil {
 		return err

@@ -125,7 +125,7 @@ func TestMigrateV02File(t *testing.T) {
 					dequeue, length, db = q.Dequeue, q.Len, q.f.db
 				}
 
-				want := []string{name + "_pending", "sqlite_autoindex_" + name + "_1"}
+				want := []string{name + pendingIndexSuffix, "sqlite_autoindex_" + name + "_1"}
 				if got := indexNames(t, db, name); fmt.Sprint(got) != fmt.Sprint(want) {
 					t.Errorf("Round %d: indexes = %v, want %v", round, got, want)
 				}
@@ -180,7 +180,7 @@ func TestPendingIndexFollowsKind(t *testing.T) {
 			db = q.f.db
 		}
 
-		rows, err := db.Query(`SELECT name FROM pragma_index_info('jobs_pending') ORDER BY seqno`)
+		rows, err := db.Query("SELECT name FROM pragma_index_info(?) ORDER BY seqno", "jobs"+pendingIndexSuffix)
 		if err != nil {
 			t.Fatalf("Failed to read index columns: %v", err)
 		}
@@ -199,10 +199,44 @@ func TestPendingIndexFollowsKind(t *testing.T) {
 			want = "[priority id]"
 		}
 		if fmt.Sprint(cols) != want {
-			t.Errorf("priority=%v: jobs_pending columns = %v, want %s", priority, cols, want)
+			t.Errorf("priority=%v: pending index columns = %v, want %s", priority, cols, want)
 		}
 		if err := qs.Close(); err != nil {
 			t.Fatalf("Failed to close: %v", err)
 		}
+	}
+}
+
+// Tables and indexes share one namespace in SQLite, so the pending index
+// must not take a name a queue could have: a file with queues "orders" and
+// "orders_pending" opens in either order, and again on reopen.
+func TestPendingIndexNameFreeForQueues(t *testing.T) {
+	for _, names := range [][]string{{"orders", "orders_pending"}, {"orders_pending", "orders"}} {
+		t.Run(names[0]+"_first", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "shared.db")
+			for round := 1; round <= 2; round++ {
+				qs := mustNew(t, path, WithSingleFile())
+				for _, name := range names {
+					q, err := qs.NewQueue(name)
+					if err != nil {
+						t.Fatalf("Round %d: failed to open queue %q: %v", round, name, err)
+					}
+					want := fmt.Sprintf("%s-%d", name, round)
+					if !q.Enqueue(want) {
+						t.Fatalf("Round %d: enqueue to %q failed", round, name)
+					}
+					item, ok := q.Dequeue()
+					if !ok {
+						t.Fatalf("Round %d: dequeue from %q failed", round, name)
+					}
+					if got := string(item.([]byte)); got != want {
+						t.Errorf("Round %d: %q dequeued %q, want %q", round, name, got, want)
+					}
+				}
+				if err := qs.Close(); err != nil {
+					t.Fatalf("Round %d: failed to close: %v", round, err)
+				}
+			}
+		})
 	}
 }
