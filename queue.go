@@ -3,6 +3,7 @@ package sqliteq
 import (
 	"cmp"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"slices"
 	"strconv"
@@ -262,26 +263,37 @@ func parseAckID(s string) (int64, bool) {
 // Enqueue adds an item to the queue
 // Returns true if the operation was successful
 func (q *Queue) Enqueue(item any) bool {
-	return q.enqueue(item, 0)
+	return q.enqueue(item, 0, "")
 }
 
-// enqueue inserts one pending row; priority is stored on priority queues only
-func (q *Queue) enqueue(item any, priority int) bool {
+// enqueue inserts one pending row in the file's next group commit round;
+// priority is stored on priority queues only. id is unused for now.
+func (q *Queue) enqueue(item any, priority int, id string) bool {
 	if q.closed.Load() {
 		return false
 	}
 
-	now := time.Now().UTC()
-	q.f.mu.Lock()
-	defer q.f.mu.Unlock()
-
-	var err error
-	if q.priority {
-		_, err = q.insert.Exec(item, now, now, priority)
-	} else {
-		_, err = q.insert.Exec(item, now, now)
+	// Convert here, as database/sql would inside Exec, so the item's own code
+	// (a driver.Valuer) runs in its caller and never in a round's leader
+	data, err := driver.DefaultParameterConverter.ConvertValue(item)
+	if err != nil {
+		return false
 	}
-	return err == nil
+
+	now := time.Now().UTC()
+	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
+		insert := q.insert
+		if tx != nil {
+			insert = tx.Stmt(insert)
+		}
+		var err error
+		if q.priority {
+			_, err = insert.Exec(data, now, now, priority)
+		} else {
+			_, err = insert.Exec(data, now, now)
+		}
+		return err == nil, err
+	})
 }
 
 // claimN moves up to n pending rows to processing in one statement and
@@ -406,7 +418,7 @@ func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaini
 }
 
 // Acknowledge marks a processing item as completed, deleting it unless
-// WithRemoveOnComplete(false) is set
+// WithRemoveOnComplete(false) is set, in the file's next group commit round
 // Returns true only if exactly one processing row had this ack ID
 func (q *Queue) Acknowledge(ackID string) bool {
 	id, ok := parseAckID(ackID)
@@ -414,24 +426,29 @@ func (q *Queue) Acknowledge(ackID string) bool {
 		return false
 	}
 
-	q.f.mu.Lock()
-	defer q.f.mu.Unlock()
+	now := time.Now().UTC()
+	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
+		var (
+			result sql.Result
+			err    error
+		)
+		ack := q.ack
+		if tx != nil {
+			ack = tx.Stmt(ack)
+		}
+		if q.removeOnComplete {
+			result, err = ack.Exec(id)
+		} else {
+			result, err = ack.Exec(now, id)
+		}
+		if err != nil {
+			return false, err
+		}
 
-	var (
-		result sql.Result
-		err    error
-	)
-	if q.removeOnComplete {
-		result, err = q.ack.Exec(id)
-	} else {
-		result, err = q.ack.Exec(time.Now().UTC(), id)
-	}
-	if err != nil {
-		return false
-	}
-
-	n, err := result.RowsAffected()
-	return err == nil && n == 1
+		// No row is an outcome, not an error: it must not fail the round
+		n, err := result.RowsAffected()
+		return err == nil && n == 1, err
+	})
 }
 
 // Len returns the number of pending items in the queue

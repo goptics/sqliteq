@@ -20,5 +20,5 @@ func newPriorityQueue(f *file, name string, opts ...Option) (*PriorityQueue, err
 // Lower priority numbers will be dequeued first (0 is highest priority)
 // Returns true if the operation was successful
 func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
-	return pq.enqueue(item, priority)
+	return pq.enqueue(item, priority, "")
 }
