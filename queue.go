@@ -274,11 +274,15 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 
 	now := time.Now().UTC()
 	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
+		insert := q.insert
+		if tx != nil {
+			insert = tx.Stmt(insert)
+		}
 		var err error
 		if q.priority {
-			_, err = tx.Stmt(q.insert).Exec(item, now, now, priority)
+			_, err = insert.Exec(item, now, now, priority)
 		} else {
-			_, err = tx.Stmt(q.insert).Exec(item, now, now)
+			_, err = insert.Exec(item, now, now)
 		}
 		return err == nil, err
 	})
@@ -420,10 +424,14 @@ func (q *Queue) Acknowledge(ackID string) bool {
 			result sql.Result
 			err    error
 		)
+		ack := q.ack
+		if tx != nil {
+			ack = tx.Stmt(ack)
+		}
 		if q.removeOnComplete {
-			result, err = tx.Stmt(q.ack).Exec(id)
+			result, err = ack.Exec(id)
 		} else {
-			result, err = tx.Stmt(q.ack).Exec(now, id)
+			result, err = ack.Exec(now, id)
 		}
 		if err != nil {
 			return false, err

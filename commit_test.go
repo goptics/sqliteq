@@ -263,6 +263,33 @@ func TestCommitRoundFallsBackPerOp(t *testing.T) {
 	}
 }
 
+// TestCommitRoundOneOpAutocommits checks that a round of one op runs without
+// a transaction, and a round of more shares one.
+func TestCommitRoundOneOpAutocommits(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	var txs []*sql.Tx
+	record := func(tx *sql.Tx) (bool, error) {
+		txs = append(txs, tx)
+		return true, nil
+	}
+	newOp := func() *op { return &op{run: record, done: make(chan result, 1)} }
+
+	q.f.commitRound([]*op{newOp()})
+	q.f.commitRound([]*op{newOp(), newOp()})
+
+	if len(txs) != 3 {
+		t.Fatalf("Expected 3 runs, got %d", len(txs))
+	}
+	if txs[0] != nil {
+		t.Error("A round of one op ran in a transaction")
+	}
+	if txs[1] == nil || txs[1] != txs[2] {
+		t.Error("A round of two ops did not share one transaction")
+	}
+}
+
 // TestGroupCommitBatches checks that concurrent writers share rounds.
 func TestGroupCommitBatches(t *testing.T) {
 	q, qs := openQueue(t)

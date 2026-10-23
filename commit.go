@@ -7,7 +7,7 @@ import (
 
 // op is one caller's write waiting for a round of the group commit
 type op struct {
-	run  func(tx *sql.Tx) (bool, error) // one caller's statement(s)
+	run  func(tx *sql.Tx) (bool, error) // one caller's statement(s); a nil tx means autocommit
 	done chan result                    // buffered 1
 }
 
@@ -73,15 +73,23 @@ func (b *batcher) lead() {
 
 // commitRound runs a round's ops in one transaction under the write mutex.
 // If any step fails, nothing of it is kept and each op runs again in a
-// transaction of its own, so one bad call fails alone.
+// transaction of its own, so one bad call fails alone. A round of one op runs
+// with a nil tx, as one autocommit statement: a database/sql Tx costs a
+// context and a goroutine, which a round with nothing to share does not repay.
 func (f *file) commitRound(ops []*op) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rounds.Add(1)
 
+	if len(ops) == 1 {
+		ok, err := ops[0].run(nil)
+		ops[0].done <- result{ok: err == nil && ok}
+		return
+	}
+
 	oks := make([]bool, len(ops))
 	err := f.runTx(ops, oks)
-	if err == nil || len(ops) == 1 {
+	if err == nil {
 		for i, o := range ops {
 			o.done <- result{ok: err == nil && oks[i]}
 		}
