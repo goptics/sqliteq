@@ -572,3 +572,68 @@ func TestConcurrentOpen(t *testing.T) {
 		t.Error("Enqueue failed after the other stores closed")
 	}
 }
+
+func TestSymlinkedFileOneEntry(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.db")
+	if err := os.WriteFile(real, nil, 0o600); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+	link := filepath.Join(dir, "app.db")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("Cannot create a symlink: %v", err)
+	}
+	folder := t.TempDir()
+	if err := os.Symlink(real, filepath.Join(folder, "jobs.db")); err != nil {
+		t.Skipf("Cannot create a symlink: %v", err)
+	}
+
+	var got []*Queue
+	for _, store := range []struct {
+		path string
+		opts []StoreOption
+	}{{real, []StoreOption{WithSingleFile()}}, {link, []StoreOption{WithSingleFile()}}, {folder, nil}} {
+		qs := mustNew(t, store.path, store.opts...)
+		defer qs.Close()
+		q, err := qs.NewQueue("jobs")
+		if err != nil {
+			t.Fatalf("Failed to create queue through %s: %v", store.path, err)
+		}
+		got = append(got, q)
+	}
+
+	for i, q := range got[1:] {
+		if q.f != got[0].f {
+			t.Errorf("Path %d reached a different file entry", i+1)
+		}
+	}
+}
+
+func TestReopenAfterCloseNoRecovery(t *testing.T) {
+	qs := mustNew(t, t.TempDir())
+	defer qs.Close()
+
+	q, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+	q.Enqueue([]byte("job"))
+	_, ok, ackID := q.DequeueWithAckId()
+	if !ok {
+		t.Fatal("DequeueWithAckId failed")
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("Failed to close queue: %v", err)
+	}
+
+	fresh, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatalf("Failed to reopen queue: %v", err)
+	}
+	if fresh.Len() != 0 {
+		t.Errorf("Expected the claimed job to stay claimed, got length %d", fresh.Len())
+	}
+	if !q.Acknowledge(ackID) {
+		t.Error("Acknowledge on the closed handle failed after the reopen")
+	}
+}

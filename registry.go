@@ -189,12 +189,15 @@ func (h *handle) kind() string {
 }
 
 // resolve returns the registry key for a database path: the absolute path
-// with symlinks in its folder evaluated, so every spelling of one file meets
-// one entry. The folder must exist.
+// with symlinks evaluated (the file's own too, once it exists), so every
+// spelling of one file meets one entry. The folder must exist.
 func resolve(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("sqliteq: %w", err)
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return checkDSN(real)
 	}
 	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
 	if err != nil {
