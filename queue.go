@@ -58,17 +58,28 @@ func newQueue(f *file, name string, priority bool, opts ...Option) (*Queue, erro
 	}
 
 	// The db is shared by every queue of the file, so it is not closed on errors
-	if err := q.initTable(); err != nil {
-		return nil, fmt.Errorf("failed to initialize table: %w", err)
-	}
-	if err := q.migrate(); err != nil {
-		return nil, fmt.Errorf("failed to migrate indexes: %w", err)
+	if err := q.initSchema(); err != nil {
+		return nil, err
 	}
 	if err := q.prepare(); err != nil {
 		return nil, fmt.Errorf("failed to prepare statements: %w", err)
 	}
 
 	return q, nil
+}
+
+// initSchema creates or migrates the table and its index under the write mutex
+func (q *Queue) initSchema() error {
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
+
+	if err := q.initTable(); err != nil {
+		return fmt.Errorf("failed to initialize table: %w", err)
+	}
+	if err := q.migrate(); err != nil {
+		return fmt.Errorf("failed to migrate indexes: %w", err)
+	}
+	return nil
 }
 
 // initTable creates the table as v0.2 defines it, so old tables need no
@@ -200,6 +211,9 @@ func (q *Queue) closeStmts() {
 
 // requeueNoAck puts rows left in processing without an ack back to pending
 func (q *Queue) requeueNoAck() error {
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
+
 	_, err := q.f.db.Exec(
 		fmt.Sprintf("UPDATE %s SET status = 'pending', updated_at = ? WHERE status = 'processing' AND ack = 0", q.table),
 		time.Now().UTC(),
@@ -258,6 +272,9 @@ func (q *Queue) enqueue(item any, priority int) bool {
 	}
 
 	now := time.Now().UTC()
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
+
 	var err error
 	if q.priority {
 		_, err = q.insert.Exec(item, now, now, priority)
@@ -270,6 +287,26 @@ func (q *Queue) enqueue(item any, priority int) bool {
 // claimN moves up to n pending rows to processing in one statement and
 // returns them in queue order
 func (q *Queue) claimN(n int) ([]claimed, error) {
+	q.f.mu.Lock()
+	out, err := q.claimRows(n)
+	q.f.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	// RETURNING order is unspecified
+	slices.SortFunc(out, func(a, b claimed) int {
+		if c := cmp.Compare(a.priority, b.priority); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.id, b.id)
+	})
+	return out, nil
+}
+
+// claimRows runs the claim statement and reads every row it returns; the
+// caller holds the write mutex
+func (q *Queue) claimRows(n int) ([]claimed, error) {
 	rows, err := q.claim.Query(time.Now().UTC(), n)
 	if err != nil {
 		return nil, err
@@ -290,18 +327,7 @@ func (q *Queue) claimN(n int) ([]claimed, error) {
 		out = append(out, c)
 	}
 	// Reading to the end runs the statement to completion, which commits it
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// RETURNING order is unspecified
-	slices.SortFunc(out, func(a, b claimed) int {
-		if c := cmp.Compare(a.priority, b.priority); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.id, b.id)
-	})
-	return out, nil
+	return out, rows.Err()
 }
 
 // Dequeue removes and returns the next item from the queue
@@ -311,6 +337,10 @@ func (q *Queue) Dequeue() (any, bool) {
 		return nil, false
 	}
 
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
+
+	// Deferred last, so the rows close (and the statement ends) before unlocking
 	rows, err := q.pop.Query()
 	if err != nil {
 		return nil, false
@@ -345,6 +375,36 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 	return c[0].data, true, strconv.FormatInt(c[0].id, 10)
 }
 
+// DequeueBatchWithAckIds implements varmq.IBatchAcknowledgeable: it moves up
+// to min(len(items), len(ackIDs)) items to processing in one statement, in
+// queue order, each under its row id as ack id. remaining is the pending
+// count after the move, capped at remainingCap. n is 0 with a nil error when
+// the queue is empty or closed.
+func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaining int, err error) {
+	want := min(len(items), len(ackIDs))
+	if q.closed.Load() || want == 0 {
+		return 0, 0, nil
+	}
+
+	c, err := q.claimN(want)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(c) == 0 {
+		return 0, 0, nil
+	}
+	for i, row := range c {
+		items[i], ackIDs[i] = row.data, strconv.FormatInt(row.id, 10)
+	}
+
+	// The rows are claimed already: an error here would make varmq drop them,
+	// so a failed count reports items left and the next pop finds out
+	if err := q.countCapped.QueryRow().Scan(&remaining); err != nil {
+		return len(c), 1, nil
+	}
+	return len(c), remaining, nil
+}
+
 // Acknowledge marks a processing item as completed, deleting it unless
 // WithRemoveOnComplete(false) is set
 // Returns true only if exactly one processing row had this ack ID
@@ -353,6 +413,9 @@ func (q *Queue) Acknowledge(ackID string) bool {
 	if !ok {
 		return false
 	}
+
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
 
 	var (
 		result sql.Result
@@ -405,6 +468,9 @@ func (q *Queue) Values() []any {
 
 // Purge removes all items from the queue
 func (q *Queue) Purge() {
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
+
 	q.f.db.Exec(fmt.Sprintf("DELETE FROM %s", q.table))
 }
 
