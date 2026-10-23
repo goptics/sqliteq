@@ -156,18 +156,18 @@ On case-insensitive filesystems (macOS, Windows), spell a path the same way ever
 
 ## Checkpoints
 
-SQLite appends writes to a write-ahead log (WAL) and folds them back into the database file in a checkpoint. `WithCheckpointPages(n)` sets how many pages the WAL may reach before SQLite checkpoints on its own. The default is 1000 pages, SQLite's own setting, which keeps the WAL near 4 MB per file. With it, about 1 in 100 `Enqueue` calls waits roughly 20 ms for a checkpoint.
+SQLite appends writes to a write-ahead log (WAL) and folds them back into the database file in a checkpoint. `WithCheckpointPages(n)` sets how many pages the WAL may reach before SQLite checkpoints on its own. The default is 1000 pages, SQLite's own setting, which keeps the WAL near 4 MB per file. With it, an `Enqueue` occasionally waits for a checkpoint's disk sync.
 
 ```go
 queuesManager, err := sqliteq.New("data", sqliteq.WithCheckpointPages(10000))
 ```
 
-Raising it cuts `Enqueue` tail latency and raises throughput, at the price of a larger WAL on disk. For example:
+Raising it makes those waits rarer, which cuts `Enqueue` tail latency and raises throughput, at the price of a larger WAL on disk. For example:
 
-- 4000 pages: the WAL peaks near 16 MB per file and `Enqueue` p99 is about 1.9 ms.
-- 10000 pages: the WAL peaks near 41 MB per file and `Enqueue` p99 is about 1.7 ms.
+- 4000 pages: the WAL peaks near 16 MB per file.
+- 10000 pages: the WAL peaks near 41 MB per file.
 
-The WAL is a log, not extra stored data: the database holds the same items either way. `n` must be at least 1, because `New` returns an error otherwise. All `New` calls that reach one file must use the same value; a second one that differs returns an error naming the value the file is already open with.
+The WAL is a log, not extra stored data: the database holds the same items either way. `n` must be at least 1, because `New` returns an error otherwise. Everything that reaches one file must use the same value: a `NewQueue` or `NewPriorityQueue` that reaches a file already open with a different value returns an error naming the value the file is open with. `New` itself does not open files, so it does not detect this.
 
 ## Compatibility
 
