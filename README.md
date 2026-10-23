@@ -9,7 +9,6 @@
     <a href="https://pkg.go.dev/github.com/goptics/sqliteq"><img src="https://img.shields.io/badge/go-pkg-00ADD8.svg?logo=go" alt="Go Reference" /></a>
     <a href="https://github.com/goptics/sqliteq/actions/workflows/sqliteq.yml"><img src="https://github.com/goptics/sqliteq/actions/workflows/sqliteq.yml/badge.svg" alt="CI" /></a>
     <a href="https://codecov.io/gh/goptics/sqliteq"><img src="https://codecov.io/gh/goptics/sqliteq/branch/main/graph/badge.svg" alt="Codecov" /></a>
-    <a href="https://goreportcard.com/report/github.com/goptics/sqliteq"><img src="https://goreportcard.com/badge/github.com/goptics/sqliteq" alt="Go Report Card" /></a>
     <a href="https://golang.org/doc/devel/release.html"><img src="https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go" alt="Go Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License" /></a>
   </p>
