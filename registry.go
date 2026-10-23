@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -18,6 +19,8 @@ type file struct {
 	pages     int                // checkpoint pages it was opened with
 	refs      int                // Queues values holding it; under registry.mu
 	mu        sync.Mutex         // write mutex: every write on the file holds it, reads do not
+	b         *batcher           // group commit for enqueues and acks
+	rounds    atomic.Int64       // rounds committed by b; read by tests
 	handles   map[string]*handle // lower-cased queue name -> handle; under registry.mu
 	recovered map[string]bool    // lower-cased table -> recovery done; under registry.mu
 }
@@ -64,7 +67,8 @@ func dsn(path string) string {
 }
 
 // registry holds every open file in the process, keyed by resolved path.
-// Lock order is queues.mu, then registry.mu, then file.mu.
+// Lock order is queues.mu, then registry.mu, then file.mu. A file's
+// batcher.mu is never held across a commit, so never together with file.mu.
 var registry = struct {
 	mu    sync.Mutex
 	files map[string]*file
@@ -101,6 +105,7 @@ func acquire(path string, pages int) (*file, error) {
 		handles:   map[string]*handle{},
 		recovered: map[string]bool{},
 	}
+	f.b = &batcher{commit: f.commitRound}
 	registry.files[path] = f
 	return f, nil
 }

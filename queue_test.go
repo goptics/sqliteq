@@ -741,6 +741,14 @@ func TestConcurrentWritersOneFile(t *testing.T) {
 	q, qs := openQueue(t)
 	defer qs.Close()
 
+	concurrentWriters(t, q)
+}
+
+// concurrentWriters runs 8 producers and 16 ackers against one batch popper
+// and checks every job is delivered once and acked. It returns the number of
+// writes that go through the group commit: every Enqueue and Acknowledge.
+func concurrentWriters(t *testing.T, q *Queue) int {
+	t.Helper()
 	const producers, perProducer, ackers, batch = 8, 500, 16, 16
 	const total = producers * perProducer
 
@@ -768,7 +776,13 @@ func TestConcurrentWritersOneFile(t *testing.T) {
 		defer close(drained)
 		defer close(jobs)
 		items, ackIDs := make([]any, batch), make([]string, batch)
+		// A failed add leaves fewer than total jobs, so the drain is bounded
+		deadline := time.Now().Add(time.Minute)
 		for got := 0; got < total; {
+			if time.Now().After(deadline) {
+				t.Errorf("Drained %d of %d jobs before the deadline", got, total)
+				return
+			}
 			n, _, err := q.DequeueBatchWithAckIds(items, ackIDs)
 			if err != nil {
 				t.Errorf("Batch pop failed: %v", err)
@@ -812,6 +826,7 @@ func TestConcurrentWritersOneFile(t *testing.T) {
 	if n := countRows(t, q.f.db, "1"); n != 0 {
 		t.Errorf("Expected no rows left, got %d", n)
 	}
+	return 2 * total
 }
 
 // TestWritesTakeFileMutex holds the file's write mutex and checks that every
