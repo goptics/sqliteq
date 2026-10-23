@@ -3,6 +3,7 @@ package sqliteq
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -127,6 +128,66 @@ func TestNewBadPath(t *testing.T) {
 	if _, err := qs.NewQueue("q"); err == nil {
 		t.Fatal("Expected an error from New or NewQueue for a path under a regular file")
 	}
+}
+
+// A nil option is an error from New, NewQueue and NewPriorityQueue, not a
+// panic, and a rejected call leaves no folder, file or table behind
+func TestNilOption(t *testing.T) {
+	t.Run("New", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "data")
+		for _, opts := range [][]StoreOption{{nil}, {WithSingleFile(), nil}} {
+			qs, err := New(dir, opts...)
+			if err == nil {
+				qs.Close()
+				t.Fatalf("Expected an error for a nil StoreOption in %d options", len(opts))
+			}
+			if !errors.Is(err, errNilOption) {
+				t.Errorf("Got %v, want the nil option error", err)
+			}
+		}
+		if _, err := os.Stat(dir); err == nil {
+			t.Error("New created the folder before it rejected the option")
+		}
+	})
+
+	t.Run("NewQueue", func(t *testing.T) {
+		dir := t.TempDir()
+		qs := mustNew(t, dir)
+		defer qs.Close()
+
+		if _, err := qs.NewQueue("q", nil); !errors.Is(err, errNilOption) {
+			t.Errorf("NewQueue with a nil option: got %v, want the nil option error", err)
+		}
+		if _, err := qs.NewPriorityQueue("p", nil); !errors.Is(err, errNilOption) {
+			t.Errorf("NewPriorityQueue with a nil option: got %v, want the nil option error", err)
+		}
+		if got := dbFiles(t, dir); len(got) != 0 {
+			t.Errorf("Expected no database file after the rejected calls, got %v", got)
+		}
+
+		// The names are still free
+		if _, err := qs.NewQueue("q"); err != nil {
+			t.Errorf("Failed to create queue after the rejected call: %v", err)
+		}
+		if _, err := qs.NewPriorityQueue("p"); err != nil {
+			t.Errorf("Failed to create priority queue after the rejected call: %v", err)
+		}
+	})
+
+	// The registry rejects it before newQueue runs; newQueue's own check
+	// is the second line, and it must stop before it creates the table
+	t.Run("newQueue", func(t *testing.T) {
+		q, qs := openQueue(t)
+		defer qs.Close()
+
+		if _, err := newQueue(q.f, "other", false, nil); !errors.Is(err, errNilOption) {
+			t.Errorf("newQueue with a nil option: got %v, want the nil option error", err)
+		}
+		var n int
+		if err := q.f.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'other'`).Scan(&n); err != nil || n != 0 {
+			t.Errorf("Expected no table \"other\", got count %d, err %v", n, err)
+		}
+	})
 }
 
 // dbFiles lists the database files in dir, leaving out SQLite's -wal and -shm files.

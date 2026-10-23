@@ -125,7 +125,7 @@ func TestMigrateV02File(t *testing.T) {
 					dequeue, length, db = q.Dequeue, q.Len, q.f.db
 				}
 
-				want := []string{name + pendingIndexSuffix, "sqlite_autoindex_" + name + "_1"}
+				want := []string{name + jobIDIndexSuffix, name + pendingIndexSuffix, "sqlite_autoindex_" + name + "_1"}
 				if got := indexNames(t, db, name); fmt.Sprint(got) != fmt.Sprint(want) {
 					t.Errorf("Round %d: indexes = %v, want %v", round, got, want)
 				}
@@ -207,11 +207,12 @@ func TestPendingIndexFollowsKind(t *testing.T) {
 	}
 }
 
-// Tables and indexes share one namespace in SQLite, so the pending index
-// must not take a name a queue could have: a file with queues "orders" and
-// "orders_pending" opens in either order, and again on reopen.
+// Tables and indexes share one namespace in SQLite, so the pending and
+// job_id indexes must not take a name a queue could have: a file with queues
+// "orders", "orders_pending" and "orders_job_id" opens in either order, and
+// again on reopen.
 func TestPendingIndexNameFreeForQueues(t *testing.T) {
-	for _, names := range [][]string{{"orders", "orders_pending"}, {"orders_pending", "orders"}} {
+	for _, names := range [][]string{{"orders", "orders_pending", "orders_job_id"}, {"orders_job_id", "orders_pending", "orders"}} {
 		t.Run(names[0]+"_first", func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "shared.db")
 			for round := 1; round <= 2; round++ {
