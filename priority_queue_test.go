@@ -2,6 +2,7 @@ package sqliteq
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -76,7 +77,7 @@ func TestPriorityQueue(t *testing.T) {
 
 		// Verify the item is completely removed from the database
 		var count int
-		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.tableName))
+		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.table))
 		err := row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -131,7 +132,7 @@ func TestPriorityQueue(t *testing.T) {
 		}
 
 		// Verify the item is completely removed from the database
-		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.tableName))
+		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.table))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -178,7 +179,7 @@ func TestPriorityQueue(t *testing.T) {
 
 		// Verify item is in processing status in database
 		var count int
-		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.table))
 		err := row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking processing items: %v", err)
@@ -194,7 +195,7 @@ func TestPriorityQueue(t *testing.T) {
 		}
 
 		// Check that processing item is removed
-		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.table))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking processing items: %v", err)
@@ -251,7 +252,7 @@ func TestPriorityQueue(t *testing.T) {
 
 		// Verify item is removed from database
 		var count int
-		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.tableName))
+		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.table))
 		err := row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -436,7 +437,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		// Since dequeueInternal with withAckId=false now deletes directly,
 		// the item should be removed from the database immediately
 		var count int
-		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.tableName))
+		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.table))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -452,7 +453,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Check that the item is still in the database with processing status
-		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.table))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking processing items: %v", err)
@@ -467,7 +468,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Since removeOnComplete is true, the item should be removed from the database
-		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", pq.tableName))
+		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", pq.table))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -574,6 +575,51 @@ func TestPriorityQueueReopen(t *testing.T) {
 		item, ok := pq.Dequeue()
 		if !ok || string(item.([]byte)) != want {
 			t.Fatalf("Expected %q, got %q (ok=%v)", want, item, ok)
+		}
+	}
+}
+
+func TestPriorityOrderByID(t *testing.T) {
+	qs := mustNew(t, t.TempDir())
+	defer qs.Close()
+	pq, err := qs.NewPriorityQueue("q")
+	if err != nil {
+		t.Fatalf("Failed to create priority queue: %v", err)
+	}
+
+	// Job i has priority i%3; ties come out in insert order
+	const n = 300
+	for i := 0; i < n; i++ {
+		if !pq.Enqueue([]byte(strconv.Itoa(i)), i%3) {
+			t.Fatalf("Enqueue %d failed", i)
+		}
+	}
+	if _, err := pq.f.db.Exec(`UPDATE "q" SET created_at = datetime('2025-01-01', '-' || id || ' seconds')`); err != nil {
+		t.Fatalf("Failed to rewrite created_at: %v", err)
+	}
+
+	var want []string
+	for p := 0; p < 3; p++ {
+		for i := p; i < n; i += 3 {
+			want = append(want, strconv.Itoa(i))
+		}
+	}
+
+	for i, v := range pq.Values() {
+		if got := string(v.([]byte)); got != want[i] {
+			t.Fatalf("Values()[%d] = %q, want %q", i, got, want[i])
+		}
+	}
+	for i := range want {
+		item, ok, ackID := pq.DequeueWithAckId()
+		if !ok {
+			t.Fatalf("DequeueWithAckId %d failed", i)
+		}
+		if got := string(item.([]byte)); got != want[i] {
+			t.Fatalf("DequeueWithAckId %d = %q, want %q", i, got, want[i])
+		}
+		if !pq.Acknowledge(ackID) {
+			t.Fatalf("Acknowledge %d failed", i)
 		}
 	}
 }

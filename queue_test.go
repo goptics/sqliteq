@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -72,7 +75,7 @@ func TestSQLiteQueue(t *testing.T) {
 
 		// Verify the item is completely removed from the database
 		var count int
-		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", q.tableName))
+		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", q.table))
 		error := row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking items in database: %v", error)
@@ -175,7 +178,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 
 		// Verify the item is still in the database by checking directly
 		var count int
-		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed'", q.tableName))
+		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed'", q.table))
 		error := row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking completed items: %v", error)
@@ -210,7 +213,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		// Since dequeueInternal with withAckId=false now deletes directly,
 		// the item should be removed from the database immediately
 		var count int
-		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
+		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.table))
 		error := row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking items in database: %v", error)
@@ -228,7 +231,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Check that the item is still in the database with processing status
-		row = q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", q.tableName))
+		row = q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", q.table))
 		error = row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking processing items: %v", error)
@@ -243,7 +246,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Since removeOnComplete is true, the item should be removed from the database
-		row = q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
+		row = q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.table))
 		error = row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking items in database: %v", error)
@@ -364,10 +367,230 @@ func TestRecoveryError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
-	q := &Queue{f: &file{db: db}, tableName: "recovery"}
+	q := &Queue{f: &file{db: db}, name: "recovery", table: quoteIdent("recovery")}
 	db.Close()
 
 	if err := q.requeueNoAck(); err == nil {
 		t.Error("Expected an error from requeueNoAck on a closed database")
+	}
+}
+
+// openQueue opens queue "q" in a fresh folder store.
+func openQueue(t *testing.T, opts ...Option) (*Queue, Queues) {
+	t.Helper()
+	qs := mustNew(t, t.TempDir())
+	q, err := qs.NewQueue("q", opts...)
+	if err != nil {
+		qs.Close()
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+	return q, qs
+}
+
+// countRows counts the rows of table "q" matching where.
+func countRows(t *testing.T, db *sql.DB, where string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM "q" WHERE ` + where).Scan(&n); err != nil {
+		t.Fatalf("Failed to count rows: %v", err)
+	}
+	return n
+}
+
+func TestAckIDIsRowID(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	q.Enqueue([]byte("a"))
+	q.Enqueue([]byte("b"))
+	q.Dequeue()
+	_, ok, ackID := q.DequeueWithAckId()
+	if !ok {
+		t.Fatal("DequeueWithAckId failed")
+	}
+
+	got, err := strconv.ParseInt(ackID, 10, 64)
+	if err != nil {
+		t.Fatalf("Ack id %q is not a decimal integer: %v", ackID, err)
+	}
+	var id int64
+	if err := q.f.db.QueryRow(`SELECT id FROM "q" WHERE status = 'processing'`).Scan(&id); err != nil {
+		t.Fatalf("Failed to read the claimed row: %v", err)
+	}
+	if got != id || id != 2 {
+		t.Errorf("Ack id %d, claimed row id %d, want both 2", got, id)
+	}
+}
+
+func TestAckGarbage(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	q.Enqueue([]byte("claimed"))
+	q.Enqueue([]byte("pending"))
+	_, ok, ackID := q.DequeueWithAckId()
+	if !ok {
+		t.Fatal("DequeueWithAckId failed")
+	}
+
+	// Garbage, a v0.2 cuid, non-canonical spellings of the claimed id, and
+	// the id of a row that is still pending
+	garbage := []string{"", "abc", "-1", "0", "99999999999999999999", "cjld2cjxh0000qzrmn831i7rn",
+		" " + ackID, "+" + ackID, "0" + ackID, ackID + ".0", "2"}
+	if ackID == "2" {
+		t.Fatalf("Expected the claimed row to be id 1, got ack id %q", ackID)
+	}
+	for _, id := range garbage {
+		if q.Acknowledge(id) {
+			t.Errorf("Acknowledge(%q) = true, want false", id)
+		}
+	}
+
+	if n := countRows(t, q.f.db, "1"); n != 2 {
+		t.Errorf("Expected 2 rows untouched, got %d", n)
+	}
+	if n := countRows(t, q.f.db, "status = 'processing'"); n != 1 {
+		t.Errorf("Expected the claimed row still processing, got %d processing rows", n)
+	}
+	if !q.Acknowledge(ackID) {
+		t.Error("Acknowledge of the real id failed after the garbage")
+	}
+}
+
+func TestAckTwice(t *testing.T) {
+	for _, remove := range []bool{true, false} {
+		t.Run(fmt.Sprintf("remove=%v", remove), func(t *testing.T) {
+			q, qs := openQueue(t, WithRemoveOnComplete(remove))
+			defer qs.Close()
+
+			q.Enqueue([]byte("a"))
+			_, ok, ackID := q.DequeueWithAckId()
+			if !ok {
+				t.Fatal("DequeueWithAckId failed")
+			}
+			if !q.Acknowledge(ackID) {
+				t.Fatal("First Acknowledge failed")
+			}
+			if q.Acknowledge(ackID) {
+				t.Error("Second Acknowledge of the same id returned true")
+			}
+		})
+	}
+}
+
+func TestKeepCompleted(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+
+	q.Enqueue([]byte("done"))
+	q.Enqueue([]byte("waiting"))
+	_, ok, ackID := q.DequeueWithAckId()
+	if !ok {
+		t.Fatal("DequeueWithAckId failed")
+	}
+	if !q.Acknowledge(ackID) {
+		t.Fatal("Acknowledge failed")
+	}
+
+	if n := countRows(t, q.f.db, "status = 'completed' AND ack = 1"); n != 1 {
+		t.Errorf("Expected 1 completed row with ack = 1, got %d", n)
+	}
+	if n := q.Len(); n != 1 {
+		t.Errorf("Expected Len 1 (the completed row excluded), got %d", n)
+	}
+}
+
+func TestOrderByID(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	const n = 1000
+	for i := 0; i < n; i++ {
+		if !q.Enqueue([]byte(strconv.Itoa(i))) {
+			t.Fatalf("Enqueue %d failed", i)
+		}
+	}
+	// Enqueues inside one millisecond, or a clock stepping back, leave
+	// created_at out of insert order; here it runs backwards outright
+	if _, err := q.f.db.Exec(`UPDATE "q" SET created_at = datetime('2025-01-01', '-' || id || ' seconds')`); err != nil {
+		t.Fatalf("Failed to rewrite created_at: %v", err)
+	}
+
+	values := q.Values()
+	if len(values) != n {
+		t.Fatalf("Expected %d values, got %d", n, len(values))
+	}
+	for i, v := range values {
+		if got := string(v.([]byte)); got != strconv.Itoa(i) {
+			t.Fatalf("Values()[%d] = %q, want %q", i, got, strconv.Itoa(i))
+		}
+	}
+	for i := 0; i < n; i++ {
+		item, ok := q.Dequeue()
+		if !ok {
+			t.Fatalf("Dequeue %d failed", i)
+		}
+		if got := string(item.([]byte)); got != strconv.Itoa(i) {
+			t.Fatalf("Dequeue %d = %q, want %q", i, got, strconv.Itoa(i))
+		}
+	}
+}
+
+func TestConcurrentClaimsNoDuplicates(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	const producers, perProducer, consumers = 8, 100, 8
+	var wg sync.WaitGroup
+	for p := 0; p < producers; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			for i := 0; i < perProducer; i++ {
+				if !q.Enqueue([]byte(fmt.Sprintf("%d-%d", p, i))) {
+					t.Errorf("Enqueue %d-%d failed", p, i)
+				}
+			}
+		}(p)
+	}
+
+	var (
+		mu   sync.Mutex
+		seen = map[string]int{}
+		done atomic.Int64
+	)
+	var cw sync.WaitGroup
+	for c := 0; c < consumers; c++ {
+		cw.Add(1)
+		go func() {
+			defer cw.Done()
+			for done.Load() < producers*perProducer {
+				item, ok, ackID := q.DequeueWithAckId()
+				if !ok {
+					continue
+				}
+				mu.Lock()
+				seen[string(item.([]byte))]++
+				mu.Unlock()
+				if !q.Acknowledge(ackID) {
+					t.Errorf("Acknowledge(%s) failed", ackID)
+				}
+				done.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	cw.Wait()
+
+	if len(seen) != producers*perProducer {
+		t.Errorf("Expected %d distinct jobs, got %d", producers*perProducer, len(seen))
+	}
+	for job, n := range seen {
+		if n != 1 {
+			t.Errorf("Job %s delivered %d times", job, n)
+		}
+	}
+	if n := countRows(t, q.f.db, "1"); n != 0 {
+		t.Errorf("Expected no rows left, got %d", n)
 	}
 }

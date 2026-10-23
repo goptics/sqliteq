@@ -89,6 +89,9 @@ func acquire(path string, pages int) (*file, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqliteq: failed to open database: %w", err)
 	}
+	// Idle connections are kept, so none reopens, reruns the hook and re-prepares
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
 
 	f := &file{
 		key:       path,
@@ -144,7 +147,7 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 			return h, nil
 		}
 		// A closed handle is replaced on the same table, as first named
-		name = q.tableName
+		name = q.name
 	}
 
 	h := &handle{}
@@ -155,7 +158,7 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 		}
 		h.pq = pq
 	} else {
-		q, err := newQueue(f, name, opts...)
+		q, err := newQueue(f, name, false, opts...)
 		if err != nil {
 			return nil, err
 		}
