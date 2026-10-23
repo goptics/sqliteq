@@ -39,6 +39,6 @@ Choose an example (default is 1):
 
 ## What to Expect
 
-- Both examples create temporary SQLite database files that are automatically removed after the example completes
+- Both examples create a temporary folder (one SQLite file per queue) that is automatically removed after the example completes
 - The regular queue example demonstrates the core queue operations
 - The priority queue example shows how items with lower priority numbers are processed first

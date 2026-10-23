@@ -9,12 +9,15 @@ import (
 )
 
 func priorityQueueExample() {
-	// Create a temporary database
-	dbPath := "./priority_queue_example.db"
-	defer os.Remove(dbPath)
+	// Create a temporary folder for the queue's database file
+	dir, err := os.MkdirTemp("", "sqliteq-priority-*")
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create temp folder: %v", err))
+	}
+	defer os.RemoveAll(dir)
 
 	// Initialize queue manager
-	queueManager, err := sqliteq.New(dbPath, sqliteq.WithSingleFile())
+	queueManager, err := sqliteq.New(dir)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to open queues: %v", err))
 	}
