@@ -623,3 +623,33 @@ func TestPriorityOrderByID(t *testing.T) {
 		}
 	}
 }
+
+func TestBatchPriorityOrder(t *testing.T) {
+	qs := mustNew(t, t.TempDir())
+	defer qs.Close()
+	pq, err := qs.NewPriorityQueue("q")
+	if err != nil {
+		t.Fatalf("Failed to create priority queue: %v", err)
+	}
+
+	// Job names are "<priority>/<insert index>"
+	for i, p := range []int{3, 1, 1, 0, 2} {
+		if !pq.Enqueue([]byte(fmt.Sprintf("%d/%d", p, i)), p) {
+			t.Fatalf("Enqueue %d failed", i)
+		}
+	}
+
+	items, ackIDs := make([]any, 5), make([]string, 5)
+	n, remaining, err := pq.DequeueBatchWithAckIds(items, ackIDs)
+	if err != nil || n != 5 || remaining != 0 {
+		t.Fatalf("n=%d remaining=%d err=%v, want 5, 0, nil", n, remaining, err)
+	}
+	for i, want := range []string{"0/3", "1/1", "1/2", "2/4", "3/0"} {
+		if got := string(items[i].([]byte)); got != want {
+			t.Errorf("items[%d] = %q, want %q", i, got, want)
+		}
+		if !pq.Acknowledge(ackIDs[i]) {
+			t.Errorf("Acknowledge(%s) failed", ackIDs[i])
+		}
+	}
+}

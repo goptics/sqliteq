@@ -156,22 +156,21 @@ On case-insensitive filesystems (macOS, Windows), spell a path the same way ever
 
 ## Checkpoints
 
-SQLite appends writes to a write-ahead log (WAL) and folds them back into the database file in a checkpoint. `WithCheckpointPages(n)` sets how many pages the WAL may reach before SQLite checkpoints on its own. The default is 1000 pages, SQLite's own setting, which keeps the WAL near 4 MB per file. With it, an `Enqueue` occasionally waits for a checkpoint's disk sync.
+SQLite appends writes to a write-ahead log (WAL) and folds them back into the database file in a checkpoint. `WithCheckpointPages(n)` sets how many pages the WAL may reach before SQLite checkpoints on its own. The default is 1000 pages, SQLite's own setting. A page is 4 KB, so a checkpoint starts once the WAL reaches about 4 MB. That size is where a checkpoint is triggered, not a hard limit on the file. A checkpoint runs inside the commit of the write that crosses that size, while that write holds the file's write lock. So with the default, any write on that file (an `Enqueue`, a claim, an ack or a purge) occasionally waits for a checkpoint's disk sync.
 
 ```go
 queuesManager, err := sqliteq.New("data", sqliteq.WithCheckpointPages(10000))
 ```
 
-Raising it makes those waits rarer, which cuts `Enqueue` tail latency and raises throughput, at the price of a larger WAL on disk. For example:
+Raising it makes those waits rarer, which cuts `Enqueue` tail latency and raises throughput, at the price of a larger WAL on disk: 10000 pages triggers a checkpoint at about 41 MB.
 
-- 4000 pages: the WAL peaks near 16 MB per file.
-- 10000 pages: the WAL peaks near 41 MB per file.
+In the `Mixed1Q` and `Drain1Q` rows of the [varmq-benchmarks `sqlite` benchmark](https://github.com/goptics/varmq-benchmarks/tree/main/sqlite) (one queue in one file, 20,000 jobs), its `walMB` metric, the largest size the WAL file reached, was 4.1 MB with 1000 pages and 41 MB with 10000 pages, measured on one machine.
 
 The WAL is a log, not extra stored data: the database holds the same items either way. `n` must be at least 1, because `New` returns an error otherwise. Everything that reaches one file must use the same value: a `NewQueue` or `NewPriorityQueue` that reaches a file already open with a different value returns an error naming the value the file is open with. `New` itself does not open files, so it does not detect this.
 
 ## Compatibility
 
-sqliteq does not import varmq. Batch pops and `EnqueueOnce` are being added for v0.3 and need varmq ≥ v1.10.0.
+sqliteq does not import varmq. Queues and priority queues implement `DequeueBatchWithAckIds`, so with varmq ≥ v1.10.0 a worker claims several jobs in one statement. An older varmq never calls it and claims one job per call, which still works. `EnqueueOnce` comes in a later release.
 
 ## How It Works
 
@@ -192,6 +191,8 @@ SQLiteQ uses a SQLite database to store queue items with the following schema:
 - Operations leverage SQLite's indexing for logarithmic time complexity rather than true constant-time
 - SQLite's WAL (Write-Ahead Logging) mode is enabled for better concurrent access
 - One partial index covers the pending items in queue order; opening a v0.2 table replaces its old indexes with it
+- Writes to one file (adds, claims, acks, purges) take one lock in the process, so they wait for each other in Go rather than in SQLite's busy handler. `Len` and `Values` do not take it
+- A batch pop reports the items left after it, counting at most 256; `Len` gives the exact count
 
 ## 👤 Author
 

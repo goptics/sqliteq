@@ -17,7 +17,7 @@ type file struct {
 	db        *sql.DB
 	pages     int                // checkpoint pages it was opened with
 	refs      int                // Queues values holding it; under registry.mu
-	mu        sync.Mutex         // write mutex (used from Task 6)
+	mu        sync.Mutex         // write mutex: every write on the file holds it, reads do not
 	handles   map[string]*handle // lower-cased queue name -> handle; under registry.mu
 	recovered map[string]bool    // lower-cased table -> recovery done; under registry.mu
 }

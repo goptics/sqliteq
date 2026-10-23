@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestSQLiteQueue(t *testing.T) {
@@ -592,5 +593,291 @@ func TestConcurrentClaimsNoDuplicates(t *testing.T) {
 	}
 	if n := countRows(t, q.f.db, "1"); n != 0 {
 		t.Errorf("Expected no rows left, got %d", n)
+	}
+}
+
+func TestImplementsBatch(t *testing.T) {
+	type batcher interface {
+		DequeueBatchWithAckIds([]any, []string) (int, int, error)
+	}
+	var _ batcher = (*Queue)(nil)
+	var _ batcher = (*PriorityQueue)(nil)
+}
+
+// enqueueN adds jobs "0".."n-1" to q.
+func enqueueN(t *testing.T, q *Queue, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if !q.Enqueue([]byte(strconv.Itoa(i))) {
+			t.Fatalf("Enqueue %d failed", i)
+		}
+	}
+}
+
+func TestBatchPop(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	enqueueN(t, q, 10)
+
+	items, ackIDs := make([]any, 4), make([]string, 4)
+	n, remaining, err := q.DequeueBatchWithAckIds(items, ackIDs)
+	if err != nil || n != 4 || remaining != 6 {
+		t.Fatalf("Batch of 4: n=%d remaining=%d err=%v, want 4, 6, nil", n, remaining, err)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < n; i++ {
+		if got := string(items[i].([]byte)); got != strconv.Itoa(i) {
+			t.Errorf("items[%d] = %q, want %q", i, got, strconv.Itoa(i))
+		}
+		if _, ok := parseAckID(ackIDs[i]); !ok {
+			t.Errorf("ackIDs[%d] = %q is not a row id", i, ackIDs[i])
+		}
+		if seen[ackIDs[i]] {
+			t.Errorf("ackIDs[%d] = %q repeats", i, ackIDs[i])
+		}
+		seen[ackIDs[i]] = true
+	}
+
+	items, ackIDs = make([]any, 10), make([]string, 10)
+	n, remaining, err = q.DequeueBatchWithAckIds(items, ackIDs)
+	if err != nil || n != 6 || remaining != 0 {
+		t.Fatalf("Batch of 10: n=%d remaining=%d err=%v, want 6, 0, nil", n, remaining, err)
+	}
+	for i := 0; i < n; i++ {
+		if got := string(items[i].([]byte)); got != strconv.Itoa(i+4) {
+			t.Errorf("items[%d] = %q, want %q", i, got, strconv.Itoa(i+4))
+		}
+	}
+
+	n, remaining, err = q.DequeueBatchWithAckIds(items, ackIDs)
+	if err != nil || n != 0 || remaining != 0 {
+		t.Fatalf("Empty batch: n=%d remaining=%d err=%v, want 0, 0, nil", n, remaining, err)
+	}
+	if got := countRows(t, q.f.db, "status = 'processing'"); got != 10 {
+		t.Errorf("Expected 10 processing rows, got %d", got)
+	}
+}
+
+func TestBatchMinLen(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	enqueueN(t, q, 10)
+
+	n, remaining, err := q.DequeueBatchWithAckIds(make([]any, 5), make([]string, 2))
+	if err != nil || n > 2 || remaining != 10-n {
+		t.Fatalf("n=%d remaining=%d err=%v, want n <= 2, 10-n, nil", n, remaining, err)
+	}
+	if got := countRows(t, q.f.db, "status = 'processing'"); got != n {
+		t.Errorf("Expected %d processing rows, got %d", n, got)
+	}
+}
+
+func TestBatchRemainingCap(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	enqueueN(t, q, 300)
+
+	n, remaining, err := q.DequeueBatchWithAckIds(make([]any, 1), make([]string, 1))
+	if err != nil || n != 1 || remaining != remainingCap {
+		t.Fatalf("n=%d remaining=%d err=%v, want 1, %d, nil", n, remaining, err, remainingCap)
+	}
+	if got := q.Len(); got != 299 {
+		t.Errorf("Len() = %d, want 299", got)
+	}
+}
+
+func TestBatchClosed(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	enqueueN(t, q, 3)
+	q.Close()
+
+	n, _, err := q.DequeueBatchWithAckIds(make([]any, 3), make([]string, 3))
+	if n != 0 || err != nil {
+		t.Fatalf("n=%d err=%v after Close, want 0, nil", n, err)
+	}
+	if got := countRows(t, q.f.db, "status = 'pending'"); got != 3 {
+		t.Errorf("Expected 3 pending rows, got %d", got)
+	}
+}
+
+func TestCrashAfterBatch(t *testing.T) {
+	dir := t.TempDir()
+	qs := mustNew(t, dir)
+	q, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+	enqueueN(t, q, 5)
+	if n, _, err := q.DequeueBatchWithAckIds(make([]any, 3), make([]string, 3)); n != 3 || err != nil {
+		t.Fatalf("Batch of 3: n=%d err=%v", n, err)
+	}
+	// The process "dies": the file closes with 3 rows claimed and no ack
+	if err := qs.Close(); err != nil {
+		t.Fatalf("Failed to close: %v", err)
+	}
+
+	qs = mustNew(t, dir)
+	defer qs.Close()
+	q, err = qs.NewQueue("q")
+	if err != nil {
+		t.Fatalf("Failed to reopen queue: %v", err)
+	}
+	if got := q.Len(); got != 5 {
+		t.Fatalf("Len() = %d after reopen, want 5", got)
+	}
+	for i := 0; i < 5; i++ {
+		item, ok := q.Dequeue()
+		if !ok {
+			t.Fatalf("Dequeue %d failed", i)
+		}
+		if got := string(item.([]byte)); got != strconv.Itoa(i) {
+			t.Fatalf("Dequeue %d = %q, want %q", i, got, strconv.Itoa(i))
+		}
+	}
+}
+
+func TestConcurrentWritersOneFile(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	const producers, perProducer, ackers, batch = 8, 500, 16, 16
+	const total = producers * perProducer
+
+	var pw sync.WaitGroup
+	for p := 0; p < producers; p++ {
+		pw.Add(1)
+		go func(p int) {
+			defer pw.Done()
+			for i := 0; i < perProducer; i++ {
+				if !q.Enqueue([]byte(fmt.Sprintf("%d-%d", p, i))) {
+					t.Errorf("Enqueue %d-%d failed", p, i)
+				}
+			}
+		}(p)
+	}
+
+	type job struct{ data, ackID string }
+	jobs := make(chan job, total)
+	var (
+		mu   sync.Mutex
+		seen = map[string]int{}
+	)
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		defer close(jobs)
+		items, ackIDs := make([]any, batch), make([]string, batch)
+		for got := 0; got < total; {
+			n, _, err := q.DequeueBatchWithAckIds(items, ackIDs)
+			if err != nil {
+				t.Errorf("Batch pop failed: %v", err)
+				return
+			}
+			for i := 0; i < n; i++ {
+				jobs <- job{string(items[i].([]byte)), ackIDs[i]}
+			}
+			got += n
+		}
+	}()
+
+	var aw sync.WaitGroup
+	for a := 0; a < ackers; a++ {
+		aw.Add(1)
+		go func() {
+			defer aw.Done()
+			for j := range jobs {
+				mu.Lock()
+				seen[j.data]++
+				mu.Unlock()
+				if !q.Acknowledge(j.ackID) {
+					t.Errorf("Acknowledge(%s) of %s failed", j.ackID, j.data)
+				}
+			}
+		}()
+	}
+
+	pw.Wait()
+	<-drained
+	aw.Wait()
+
+	if len(seen) != total {
+		t.Errorf("Expected %d distinct jobs, got %d", total, len(seen))
+	}
+	for data, n := range seen {
+		if n != 1 {
+			t.Errorf("Job %s delivered %d times", data, n)
+		}
+	}
+	if n := countRows(t, q.f.db, "1"); n != 0 {
+		t.Errorf("Expected no rows left, got %d", n)
+	}
+}
+
+// TestWritesTakeFileMutex holds the file's write mutex and checks that every
+// write waits for it and no read does.
+func TestWritesTakeFileMutex(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	enqueueN(t, q, 10)
+	_, _, ack1 := q.DequeueWithAckId()
+
+	writes := []struct {
+		name string
+		op   func()
+	}{
+		{"Enqueue", func() { q.Enqueue([]byte("x")) }},
+		{"Dequeue", func() { q.Dequeue() }},
+		{"DequeueWithAckId", func() { q.DequeueWithAckId() }},
+		{"DequeueBatchWithAckIds", func() { q.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2)) }},
+		{"Acknowledge", func() { q.Acknowledge(ack1) }},
+		{"requeueNoAck", func() { q.requeueNoAck() }},
+		{"Purge", func() { q.Purge() }},
+	}
+	for _, w := range writes {
+		t.Run(w.name, func(t *testing.T) {
+			q.f.mu.Lock()
+			done := make(chan struct{})
+			go func() {
+				w.op()
+				close(done)
+			}()
+			select {
+			case <-done:
+				q.f.mu.Unlock()
+				t.Fatalf("%s ran while the write mutex was held", w.name)
+			case <-time.After(100 * time.Millisecond):
+			}
+			q.f.mu.Unlock()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s did not finish after the mutex was released", w.name)
+			}
+		})
+	}
+
+	reads := []struct {
+		name string
+		op   func()
+	}{
+		{"Len", func() { q.Len() }},
+		{"Values", func() { q.Values() }},
+	}
+	for _, r := range reads {
+		t.Run(r.name, func(t *testing.T) {
+			q.f.mu.Lock()
+			defer q.f.mu.Unlock()
+			done := make(chan struct{})
+			go func() {
+				r.op()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s waited for the write mutex", r.name)
+			}
+		})
 	}
 }
