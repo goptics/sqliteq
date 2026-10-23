@@ -15,7 +15,10 @@ func regularQueueExample() {
 	dbPath := "./regular_queue_example.db"
 	defer os.Remove(dbPath)
 
-	queues := sqliteq.New(dbPath)
+	queues, err := sqliteq.New(dbPath, sqliteq.WithSingleFile())
+	if err != nil {
+		log.Fatalf("Failed to open queues: %v", err)
+	}
 	queue, err := queues.NewQueue("tasks")
 	if err != nil {
 		log.Fatalf("Failed to create queue: %v", err)

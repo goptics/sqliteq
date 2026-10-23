@@ -14,7 +14,10 @@ func priorityQueueExample() {
 	defer os.Remove(dbPath)
 
 	// Initialize queue manager
-	queueManager := sqliteq.New(dbPath)
+	queueManager, err := sqliteq.New(dbPath, sqliteq.WithSingleFile())
+	if err != nil {
+		panic(fmt.Sprintf("Failed to open queues: %v", err))
+	}
 	defer queueManager.Close()
 
 	// Create a priority queue

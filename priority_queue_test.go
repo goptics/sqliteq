@@ -15,7 +15,7 @@ func TestPriorityQueue(t *testing.T) {
 
 	// Cleanup after test
 	defer os.Remove(dbPath)
-	queuesInstance := New(dbPath)
+	queuesInstance := mustNew(t, dbPath)
 
 	// Create a new priority queue
 	pq, err := queuesInstance.NewPriorityQueue("test_priority_queue")
@@ -377,7 +377,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		defer os.Remove(dbPath)
 
 		// Create a queue with removeOnComplete = false
-		queuesInstance := New(dbPath)
+		queuesInstance := mustNew(t, dbPath)
 		pq, err := queuesInstance.NewPriorityQueue("test_priority_queue", WithRemoveOnComplete(false))
 		if err != nil {
 			t.Fatalf("Failed to create priority queue: %v", err)
@@ -421,7 +421,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		dbPath := "test_priority_remove_completed.db"
 		defer os.Remove(dbPath)
 
-		queuesInstance := New(dbPath)
+		queuesInstance := mustNew(t, dbPath)
 		// Create a queue with default removeOnComplete = true
 		pq, err := queuesInstance.NewPriorityQueue("test_priority_queue")
 		if err != nil {
@@ -493,7 +493,7 @@ func TestPriorityQueueConcurrentOperations(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	// Create a new priority queue
-	queuesInstance := New(dbPath)
+	queuesInstance := mustNew(t, dbPath)
 	pq, err := queuesInstance.NewPriorityQueue("test_priority_queue")
 	if err != nil {
 		t.Fatalf("Failed to create priority queue: %v", err)
@@ -558,7 +558,7 @@ func TestPriorityQueueConcurrentOperations(t *testing.T) {
 func TestPriorityQueueReopen(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "reopen.db")
 
-	qs := New(dbPath)
+	qs := mustNew(t, dbPath)
 	pq, err := qs.NewPriorityQueue("jobs")
 	if err != nil {
 		t.Fatalf("Failed to create priority queue: %v", err)
@@ -569,7 +569,7 @@ func TestPriorityQueueReopen(t *testing.T) {
 		t.Fatalf("Failed to close: %v", err)
 	}
 
-	qs = New(dbPath)
+	qs = mustNew(t, dbPath)
 	defer qs.Close()
 	pq, err = qs.NewPriorityQueue("jobs")
 	if err != nil {

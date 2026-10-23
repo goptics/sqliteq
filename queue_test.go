@@ -14,7 +14,7 @@ func TestSQLiteQueue(t *testing.T) {
 
 	// Cleanup after test
 	defer os.Remove(dbPath)
-	queues := New(dbPath)
+	queues := mustNew(t, dbPath)
 	// Create a new queue with default settings (removeOnComplete = true)
 	q, err := queues.NewQueue("test_queue")
 	if err != nil {
@@ -150,7 +150,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		defer os.Remove(dbPath)
 
 		// Create a queue with removeOnComplete = false
-		queues := New(dbPath)
+		queues := mustNew(t, dbPath)
 		q, err := queues.NewQueue("test_queue", WithRemoveOnComplete(false))
 		if err != nil {
 			t.Fatalf("Failed to create queue: %v", err)
@@ -195,7 +195,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		dbPath := "test_remove_completed.db"
 		defer os.Remove(dbPath)
 
-		queues := New(dbPath)
+		queues := mustNew(t, dbPath)
 		// Create a queue with default removeOnComplete = true
 		q, err := queues.NewQueue("test_queue")
 		if err != nil {
@@ -268,7 +268,7 @@ func TestConcurrentOperations(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	// Create a new queue
-	queues := New(dbPath)
+	queues := mustNew(t, dbPath)
 	q, err := queues.NewQueue("test_queue")
 	if err != nil {
 		t.Fatalf("Failed to create queue: %v", err)
@@ -346,7 +346,7 @@ func TestQuoteIdent(t *testing.T) {
 }
 
 func TestTableInitErrorKeepsPool(t *testing.T) {
-	qs := New(filepath.Join(t.TempDir(), "pool.db"))
+	qs := mustNew(t, filepath.Join(t.TempDir(), "pool.db"))
 	defer qs.Close()
 
 	ok, err := qs.NewQueue("ok")

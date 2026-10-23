@@ -37,7 +37,10 @@ import (
 func main() {
     // Create a new SQLite queues manager
     // The parameter is the path to the SQLite database file
-    queuesManager := sqliteq.New("queue.db")
+    queuesManager, err := sqliteq.New("queue.db", sqliteq.WithSingleFile())
+    if err != nil {
+        log.Fatalf("Failed to open queues: %v", err)
+    }
     defer queuesManager.Close()
 
     // Create a new queue

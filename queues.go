@@ -15,21 +15,27 @@ type Queues interface {
 	Close() error
 }
 
-func New(dbPath string) Queues {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		panic(fmt.Sprintf("failed to open database: %v", err))
+// New creates a queue manager for the database at path. Invalid options are
+// rejected before anything is opened; the file itself is opened lazily, so a
+// bad path surfaces from NewQueue / NewPriorityQueue.
+func New(path string, opts ...StoreOption) (Queues, error) {
+	cfg := defaultStoreConfig()
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
-	// Enable WAL mode for better concurrency
-	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-		db.Close()
-		panic(fmt.Sprintf("failed to enable WAL mode: %v", err))
+	if cfg.checkpointPages < 1 {
+		return nil, fmt.Errorf("sqliteq: checkpoint pages must be at least 1, got %d", cfg.checkpointPages)
+	}
+
+	db, err := sql.Open(driverName(cfg.checkpointPages), dsn(path))
+	if err != nil {
+		return nil, fmt.Errorf("sqliteq: failed to open database: %w", err)
 	}
 
 	return &queues{
 		client: db,
-	}
+	}, nil
 }
 
 func (q *queues) NewQueue(queueKey string, opts ...Option) (*Queue, error) {
