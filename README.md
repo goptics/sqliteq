@@ -168,9 +168,20 @@ In the `Mixed1Q` and `Drain1Q` rows of the [varmq-benchmarks `sqlite` benchmark]
 
 The WAL is a log, not extra stored data: the database holds the same items either way. `n` must be at least 1, because `New` returns an error otherwise. Everything that reaches one file must use the same value: a `NewQueue` or `NewPriorityQueue` that reaches a file already open with a different value returns an error naming the value the file is open with. `New` itself does not open files, so it does not detect this.
 
+## EnqueueOnce
+
+`EnqueueOnce(item, id)` on a queue, and `EnqueueOnce(item, priority, id)` on a priority queue, add an item under an id unless a row with that id is already stored. A repeat stores nothing and returns true, so an add that is retried with the same id is stored once.
+
+```go
+queue.EnqueueOnce([]byte("send invoice 42"), "invoice-42") // stored
+queue.EnqueueOnce([]byte("send invoice 42"), "invoice-42") // true, nothing stored
+```
+
+The id is remembered while its row exists: pending, processing, or completed with `WithRemoveOnComplete(false)`. `Dequeue` deletes the row, and so does the ack with the default remove-on-complete; after that the id can be added again. `Purge` forgets every id. An empty id behaves like `Enqueue`.
+
 ## Compatibility
 
-sqliteq does not import varmq. Queues and priority queues implement `DequeueBatchWithAckIds`, so with varmq ≥ v1.10.0 a worker claims several jobs in one statement. An older varmq never calls it and claims one job per call, which still works. `EnqueueOnce` comes in a later release.
+sqliteq does not import varmq. Batch pops and `EnqueueOnce` need varmq ≥ v1.10.0. From that release, a worker claims several jobs in one statement through `DequeueBatchWithAckIds`, and a job added with an id (`WithJobId`, or one from `WithJobIdGenerator`) goes through `EnqueueOnce`. An older varmq calls neither: it claims one job per call and adds every job with `Enqueue`, which still works.
 
 ## How It Works
 
@@ -180,6 +191,7 @@ SQLiteQ uses a SQLite database to store queue items with the following schema:
 - `data`: The serialized item data (stored as a JSON blob)
 - `status`: The status of the item ("pending", "processing", or "completed")
 - `ack_id`: Kept from v0.2 so old tables need no rebuild; no longer used
+- `job_id`: The id an item was added with through `EnqueueOnce`, unique among the rows that have one; NULL for `Enqueue`. Opening an older table adds it
 - `created_at`: When the item was added to the queue
 - `updated_at`: When the item was last updated
 
