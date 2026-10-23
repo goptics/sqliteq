@@ -136,6 +136,9 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 
 	want := Queue{removeOnComplete: true}
 	for _, opt := range opts {
+		if opt == nil {
+			return nil, errNilOption
+		}
 		opt(&want)
 	}
 

@@ -103,9 +103,9 @@ func main() {
 }
 ```
 
-`New` returns an error instead of panicking: for a path it cannot use, an invalid option, or a path that is an existing file when `WithSingleFile()` is not given.
+`New` returns an error instead of panicking: for a path it cannot use, an invalid option (`WithCheckpointPages` below 1, or a nil option), or a path that is an existing file when `WithSingleFile()` is not given. `NewQueue` and `NewPriorityQueue` return an error for a nil option too.
 
-The same name always returns the same queue handle, in any letter case. Asking for `NewQueue("x")` after `NewPriorityQueue("x")` (or the reverse) is an error, and so is reaching a live queue again with different options. `Queue.Close` stops further `Enqueue` and `Dequeue` calls on that handle but still accepts `Acknowledge`, so jobs that are still running can finish. The file stays open until `Queues.Close`.
+While a handle is open, the same name returns the same queue handle, in any letter case. Asking for `NewQueue("x")` after `NewPriorityQueue("x")` (or the reverse) is an error, and so is reaching a live queue again with different options. `Queue.Close` stops further `Enqueue` and `Dequeue` calls on that handle but still accepts `Acknowledge`, so jobs that are still running can finish. The file stays open until `Queues.Close`.
 
 ## Layout on disk
 
@@ -138,11 +138,13 @@ if err != nil {
 defer queuesManager.Close()
 ```
 
+The file is created if it is missing, but its folder must already exist: `New` returns an error otherwise, unlike the folder layout, which creates its folder.
+
 If you upgrade from v0.2, add `WithSingleFile()` to keep reading your existing file, or start with the folder layout for new data.
 
 ### Queue names
 
-In the folder layout the queue name becomes a file name, so it may only contain `A-Z a-z 0-9 . _ -`, must not be empty, and must not start with `sqlite_` (SQLite reserves that prefix). Anything else is an error from `NewQueue` / `NewPriorityQueue`. With `WithSingleFile()` any name works, since it is only a table name.
+In the folder layout the queue name becomes a file name, so it may only contain `A-Z a-z 0-9 . _ -`, must not be empty, and must not start with `sqlite_` (SQLite reserves that prefix). Anything else is an error from `NewQueue` / `NewPriorityQueue`. On Windows the folder layout also cannot use a reserved device name as a queue name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, in any letter case), because the name would become a file name such as `con.db`. sqliteq does not check for these. With `WithSingleFile()` the name is only a table name, so any name SQLite accepts as a table name works; SQLite reserves names that start with `sqlite_`.
 
 Names are case-insensitive in both layouts: `Jobs` and `jobs` are the same queue, stored in `jobs.db` in the folder layout.
 
@@ -168,6 +170,10 @@ In the `Mixed1Q` and `Drain1Q` rows of the [varmq-benchmarks `sqlite` benchmark]
 
 The WAL is a log, not extra stored data: the database holds the same items either way. `n` must be at least 1, because `New` returns an error otherwise. Everything that reaches one file must use the same value: a `NewQueue` or `NewPriorityQueue` that reaches a file already open with a different value returns an error naming the value the file is open with. `New` itself does not open files, so it does not detect this.
 
+## Durability
+
+sqliteq runs SQLite in WAL mode with `synchronous=NORMAL`, unchanged from v0.2. A job whose `Enqueue` returned true survives a crash of the process. After a power loss or an operating system crash, the last commits before the failure may be lost, because SQLite rolls back what the WAL had not yet synced; the database itself stays consistent.
+
 ## EnqueueOnce
 
 `EnqueueOnce(item, id)` on a queue, and `EnqueueOnce(item, priority, id)` on a priority queue, add an item under an id unless a row with that id is already stored. A repeat stores nothing and returns true, so an add that is retried with the same id is stored once.
@@ -181,7 +187,7 @@ The id is remembered while its row exists: pending, processing, or completed wit
 
 ## Compatibility
 
-sqliteq does not import varmq. Batch pops and `EnqueueOnce` need varmq ≥ v1.10.0. From that release, a worker claims several jobs in one statement through `DequeueBatchWithAckIds`, and a job added with an id (`WithJobId`, or one from `WithJobIdGenerator`) goes through `EnqueueOnce`. An older varmq calls neither: it claims one job per call and adds every job with `Enqueue`, which still works.
+sqliteq does not import varmq. Batch pops and `EnqueueOnce` need varmq ≥ v1.10.0. From that release, a worker whose only source is the sqliteq queue claims several jobs in one statement through `DequeueBatchWithAckIds` (a worker bound to several queues claims one job per call), and a job added with an id (`WithJobId`, or one from `WithJobIdGenerator`) goes through `EnqueueOnce`. An older varmq calls neither: it claims one job per call and adds every job with `Enqueue`, which still works.
 
 ## How It Works
 

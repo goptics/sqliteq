@@ -55,6 +55,9 @@ func newQueue(f *file, name string, priority bool, opts ...Option) (*Queue, erro
 
 	// Apply any provided options
 	for _, opt := range opts {
+		if opt == nil {
+			return nil, errNilOption
+		}
 		opt(q)
 	}
 

@@ -29,6 +29,9 @@ type Queues interface {
 func New(path string, opts ...StoreOption) (Queues, error) {
 	cfg := defaultStoreConfig()
 	for _, opt := range opts {
+		if opt == nil {
+			return nil, errNilOption
+		}
 		opt(&cfg)
 	}
 

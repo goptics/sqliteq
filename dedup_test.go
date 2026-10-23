@@ -21,7 +21,13 @@ type once func(item any, id string) bool
 // and returns its Queue with its EnqueueOnce. countRows reads table "q".
 func openOnce(t *testing.T, priority bool, opts ...Option) (*Queue, once, Queues) {
 	t.Helper()
-	qs := mustNew(t, t.TempDir())
+	return openOnceAt(t, t.TempDir(), priority, opts...)
+}
+
+// openOnceAt is openOnce in the folder store at dir, so a test can reopen it
+func openOnceAt(t *testing.T, dir string, priority bool, opts ...Option) (*Queue, once, Queues) {
+	t.Helper()
+	qs := mustNew(t, dir)
 	if priority {
 		pq, err := qs.NewPriorityQueue("q", opts...)
 		if err != nil {
@@ -146,10 +152,82 @@ func testOnceAfterAck(t *testing.T, priority bool) {
 	}
 }
 
+// A job claimed and never acked is requeued on the next open, and its id
+// still blocks a repeat: the job is stored once and runs once.
+func TestEnqueueOnceAcrossRecovery(t *testing.T) { testOnceAcrossRecovery(t, false) }
+
+func testOnceAcrossRecovery(t *testing.T, priority bool) {
+	dir := t.TempDir()
+	q, add, qs := openOnceAt(t, dir, priority)
+	if !add([]byte("a"), "j1") {
+		qs.Close()
+		t.Fatal("EnqueueOnce failed")
+	}
+	if _, ok, _ := q.DequeueWithAckId(); !ok {
+		qs.Close()
+		t.Fatal("DequeueWithAckId failed")
+	}
+	// The process "dies": the file closes with the row processing and no ack
+	if err := qs.Close(); err != nil {
+		t.Fatalf("Failed to close: %v", err)
+	}
+
+	q, add, qs = openOnceAt(t, dir, priority)
+	defer qs.Close()
+	if n := q.Len(); n != 1 {
+		t.Fatalf("Len() = %d after reopen, want the claimed job back (1)", n)
+	}
+
+	if !add([]byte("b"), "j1") {
+		t.Error("A repeat of the recovered job returned false, want true")
+	}
+	if n := countRows(t, q.f.db, "1"); n != 1 {
+		t.Errorf("Expected 1 row, got %d", n)
+	}
+	if n := countRows(t, q.f.db, "job_id = 'j1'"); n != 1 {
+		t.Errorf("Expected 1 row for j1, got %d", n)
+	}
+	if got := dequeueAll(t, q); fmt.Sprint(got) != "[a]" {
+		t.Errorf("Dequeued %v, want [a] once", got)
+	}
+}
+
+// Purge deletes the rows, so it frees their ids, pending and processing alike
+func TestEnqueueOnceAfterPurge(t *testing.T) { testOnceAfterPurge(t, false) }
+
+func testOnceAfterPurge(t *testing.T, priority bool) {
+	q, add, qs := openOnce(t, priority)
+	defer qs.Close()
+
+	if !add([]byte("a"), "j1") || !add([]byte("b"), "j2") {
+		t.Fatal("EnqueueOnce failed")
+	}
+	if _, ok, _ := q.DequeueWithAckId(); !ok { // j1 is processing, j2 pending
+		t.Fatal("DequeueWithAckId failed")
+	}
+
+	q.Purge()
+	if n := countRows(t, q.f.db, "1"); n != 0 {
+		t.Fatalf("Expected no rows after Purge, got %d", n)
+	}
+
+	if !add([]byte("c"), "j1") || !add([]byte("d"), "j2") {
+		t.Error("EnqueueOnce of a purged id returned false, want true")
+	}
+	if n := countRows(t, q.f.db, "1"); n != 2 {
+		t.Errorf("Expected 2 new rows, got %d", n)
+	}
+	if got := dequeueAll(t, q); fmt.Sprint(got) != "[c d]" {
+		t.Errorf("Dequeued %v, want [c d]", got)
+	}
+}
+
 func TestEnqueueOncePriority(t *testing.T) {
 	t.Run("Repeat", func(t *testing.T) { testOnceRepeat(t, true) })
 	t.Run("WhileProcessing", func(t *testing.T) { testOnceWhileProcessing(t, true) })
 	t.Run("AfterAck", func(t *testing.T) { testOnceAfterAck(t, true) })
+	t.Run("AcrossRecovery", func(t *testing.T) { testOnceAcrossRecovery(t, true) })
+	t.Run("AfterPurge", func(t *testing.T) { testOnceAfterPurge(t, true) })
 
 	t.Run("Order", func(t *testing.T) {
 		qs := mustNew(t, t.TempDir())

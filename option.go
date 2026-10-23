@@ -1,5 +1,11 @@
 package sqliteq
 
+import "errors"
+
+// errNilOption is returned by New, NewQueue and NewPriorityQueue for a nil
+// option, which they would otherwise call
+var errNilOption = errors.New("sqliteq: option must not be nil")
+
 // Option is a function type that can be used to configure a Queue
 type Option func(*Queue)
 
