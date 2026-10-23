@@ -41,7 +41,6 @@
 - **Group commit**: concurrent `Enqueue` and `Acknowledge` calls on one file share one transaction.
 - **Deduplicated enqueue**: `EnqueueOnce` stores a job once per id while its row exists.
 - **Automatic WAL checkpoints**, tunable with `WithCheckpointPages`.
-- **Opens v0.2 files** and migrates their schema in place.
 - **Thread-safe**: share one queue object across goroutines.
 - **Persistence adapter for [varmq](https://github.com/goptics/varmq)**.
 
