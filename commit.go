@@ -5,7 +5,10 @@ import (
 	"sync"
 )
 
-// op is one caller's write waiting for a round of the group commit
+// op is one caller's write waiting for a round of the group commit. run
+// executes in whichever goroutine leads the round, so it must not call user
+// code (such as a driver.Valuer): a panic there would strand the round and
+// leave its transaction open. Convert user values before building it.
 type op struct {
 	run  func(tx *sql.Tx) (bool, error) // one caller's statement(s); a nil tx means autocommit
 	done chan result                    // buffered 2: one lead wake-up and the outcome

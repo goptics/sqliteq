@@ -3,6 +3,7 @@ package sqliteq
 import (
 	"bytes"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"runtime"
 	"strconv"
@@ -324,6 +325,89 @@ func TestCommitRoundFallsBackPerOp(t *testing.T) {
 	}
 }
 
+// TestCommitRoundGroupedResults runs a round that commits: each op gets its
+// own outcome, from one shared transaction.
+func TestCommitRoundGroupedResults(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	want := []bool{true, false, true, true}
+	txs := make([]*sql.Tx, len(want))
+	ops := make([]*op, len(want))
+	for i, ok := range want {
+		ops[i] = &op{
+			run: func(tx *sql.Tx) (bool, error) {
+				txs[i] = tx
+				return ok, nil
+			},
+			done: make(chan result, 2),
+		}
+	}
+	q.f.commitRound(ops)
+
+	for i, w := range want {
+		if n := len(ops[i].done); n != 1 {
+			t.Errorf("op %d got %d results, want 1", i, n)
+			continue
+		}
+		if r := <-ops[i].done; r.ok != w || r.lead {
+			t.Errorf("op %d: got %+v, want ok=%t", i, r, w)
+		}
+	}
+	for i, tx := range txs {
+		if tx == nil || tx != txs[0] {
+			t.Errorf("op %d did not run in the round's one transaction", i)
+		}
+	}
+}
+
+// panicValuer is an item whose conversion for the driver panics.
+type panicValuer struct{}
+
+func (panicValuer) Value() (driver.Value, error) { panic("panicValuer") }
+
+// TestEnqueuePanickingItem checks that an item panicking in its conversion
+// panics in its own caller and leaves the file's group commit working.
+func TestEnqueuePanickingItem(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("Enqueue of a panicking item did not panic")
+			}
+		}()
+		q.Enqueue(panicValuer{})
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		if !q.Enqueue([]byte("x")) {
+			done <- errors.New("Enqueue failed")
+			return
+		}
+		_, ok, ackID := q.DequeueWithAckId()
+		if !ok {
+			done <- errors.New("DequeueWithAckId failed")
+			return
+		}
+		if !q.Acknowledge(ackID) {
+			done <- errors.New("Acknowledge failed")
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Writes after the panic did not return")
+	}
+}
+
 // TestCommitRoundOneOpAutocommits checks that a round of one op runs without
 // a transaction, and a round of more shares one.
 func TestCommitRoundOneOpAutocommits(t *testing.T) {
@@ -351,17 +435,38 @@ func TestCommitRoundOneOpAutocommits(t *testing.T) {
 	}
 }
 
-// TestGroupCommitBatches checks that concurrent writers share rounds.
+// TestGroupCommitBatches checks that writes queued behind a running round,
+// adds and acks alike, all commit in the one round after it.
 func TestGroupCommitBatches(t *testing.T) {
 	q, qs := openQueue(t)
 	defer qs.Close()
+	enqueueN(t, q, 16)
 
-	before := q.f.rounds.Load()
-	ops := concurrentWriters(t, q)
-	rounds := q.f.rounds.Load() - before
-	t.Logf("%d writes in %d rounds", ops, rounds)
-	if rounds >= int64(ops) {
-		t.Errorf("Expected fewer rounds than %d writes, got %d", ops, rounds)
+	items, ackIDs := make([]any, 16), make([]string, 16)
+	if n, _, err := q.DequeueBatchWithAckIds(items, ackIDs); err != nil || n != 16 {
+		t.Fatalf("Claimed %d, %v; want 16", n, err)
+	}
+
+	add := func() bool { return q.Enqueue([]byte("x")) }
+	rest := []func() bool{}
+	for i := 0; i < 15; i++ {
+		rest = append(rest, add)
+	}
+	for _, id := range ackIDs {
+		rest = append(rest, func() bool { return q.Acknowledge(id) })
+	}
+
+	// oneRound fails the test unless exactly 2 rounds ran
+	for i, ok := range oneRound(t, q.f, add, rest) {
+		if !ok {
+			t.Errorf("Call %d failed", i)
+		}
+	}
+	if n := countRows(t, q.f.db, "1"); n != 16 {
+		t.Errorf("Expected 16 rows (the adds), got %d", n)
+	}
+	if n := q.Len(); n != 16 {
+		t.Errorf("Expected 16 pending items, got %d", n)
 	}
 }
 

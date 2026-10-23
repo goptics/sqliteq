@@ -745,9 +745,8 @@ func TestConcurrentWritersOneFile(t *testing.T) {
 }
 
 // concurrentWriters runs 8 producers and 16 ackers against one batch popper
-// and checks every job is delivered once and acked. It returns the number of
-// writes that go through the group commit: every Enqueue and Acknowledge.
-func concurrentWriters(t *testing.T, q *Queue) int {
+// and checks every job is delivered once and acked.
+func concurrentWriters(t *testing.T, q *Queue) {
 	t.Helper()
 	const producers, perProducer, ackers, batch = 8, 500, 16, 16
 	const total = producers * perProducer
@@ -826,7 +825,6 @@ func concurrentWriters(t *testing.T, q *Queue) int {
 	if n := countRows(t, q.f.db, "1"); n != 0 {
 		t.Errorf("Expected no rows left, got %d", n)
 	}
-	return 2 * total
 }
 
 // TestWritesTakeFileMutex holds the file's write mutex and checks that every

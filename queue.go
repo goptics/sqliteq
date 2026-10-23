@@ -3,6 +3,7 @@ package sqliteq
 import (
 	"cmp"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"slices"
 	"strconv"
@@ -272,6 +273,13 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 		return false
 	}
 
+	// Convert here, as database/sql would inside Exec, so the item's own code
+	// (a driver.Valuer) runs in its caller and never in a round's leader
+	data, err := driver.DefaultParameterConverter.ConvertValue(item)
+	if err != nil {
+		return false
+	}
+
 	now := time.Now().UTC()
 	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
 		insert := q.insert
@@ -280,9 +288,9 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 		}
 		var err error
 		if q.priority {
-			_, err = insert.Exec(item, now, now, priority)
+			_, err = insert.Exec(data, now, now, priority)
 		} else {
-			_, err = insert.Exec(item, now, now)
+			_, err = insert.Exec(data, now, now)
 		}
 		return err == nil, err
 	})
