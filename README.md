@@ -156,7 +156,7 @@ On case-insensitive filesystems (macOS, Windows), spell a path the same way ever
 
 ## Checkpoints
 
-SQLite appends writes to a write-ahead log (WAL) and folds them back into the database file in a checkpoint. `WithCheckpointPages(n)` sets how many pages the WAL may reach before SQLite checkpoints on its own. The default is 1000 pages, SQLite's own setting. A page is 4 KB, so a checkpoint starts once the WAL reaches about 4 MB. That size is where a checkpoint is triggered, not a hard limit on the file. With the default, an `Enqueue` occasionally waits for a checkpoint's disk sync.
+SQLite appends writes to a write-ahead log (WAL) and folds them back into the database file in a checkpoint. `WithCheckpointPages(n)` sets how many pages the WAL may reach before SQLite checkpoints on its own. The default is 1000 pages, SQLite's own setting. A page is 4 KB, so a checkpoint starts once the WAL reaches about 4 MB. That size is where a checkpoint is triggered, not a hard limit on the file. A checkpoint runs inside the commit of the write that crosses that size, while that write holds the file's write lock. So with the default, any write on that file (an `Enqueue`, a claim, an ack or a purge) occasionally waits for a checkpoint's disk sync.
 
 ```go
 queuesManager, err := sqliteq.New("data", sqliteq.WithCheckpointPages(10000))
@@ -164,7 +164,7 @@ queuesManager, err := sqliteq.New("data", sqliteq.WithCheckpointPages(10000))
 
 Raising it makes those waits rarer, which cuts `Enqueue` tail latency and raises throughput, at the price of a larger WAL on disk: 10000 pages triggers a checkpoint at about 41 MB.
 
-Measured on one machine, in a 10-minute soak of one queue in one file (4 producers adding 20,000 jobs per round, 16 workers, 1.9 to 4 million jobs in all), the WAL peaked at 4.2 MB with 1000 pages and at 41 MB with 10000 pages.
+In the `Mixed1Q` and `Drain1Q` rows of the [varmq-benchmarks `sqlite` benchmark](https://github.com/goptics/varmq-benchmarks/tree/main/sqlite) (one queue in one file, 20,000 jobs), its `walMB` metric, the largest size the WAL file reached, was 4.1 MB with 1000 pages and 41 MB with 10000 pages, measured on one machine.
 
 The WAL is a log, not extra stored data: the database holds the same items either way. `n` must be at least 1, because `New` returns an error otherwise. Everything that reaches one file must use the same value: a `NewQueue` or `NewPriorityQueue` that reaches a file already open with a different value returns an error naming the value the file is open with. `New` itself does not open files, so it does not detect this.
 
