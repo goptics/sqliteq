@@ -296,7 +296,7 @@ func TestCommitRoundFallsBackPerOp(t *testing.T) {
 	defer qs.Close()
 
 	add := func(tx *sql.Tx) (bool, error) {
-		_, err := tx.Stmt(q.insert).Exec([]byte("x"), time.Now(), time.Now())
+		_, err := tx.Stmt(q.insert).Exec([]byte("x"), time.Now(), time.Now(), nil)
 		return err == nil, err
 	}
 	bad := func(*sql.Tx) (bool, error) { return false, errors.New("bad op") }

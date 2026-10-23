@@ -22,3 +22,9 @@ func newPriorityQueue(f *file, name string, opts ...Option) (*PriorityQueue, err
 func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 	return pq.enqueue(item, priority, "")
 }
+
+// EnqueueOnce implements varmq.IDedupPriorityQueue: Queue.EnqueueOnce with a
+// priority. A repeat leaves the stored item and its priority as they are.
+func (pq *PriorityQueue) EnqueueOnce(item any, priority int, id string) bool {
+	return pq.enqueue(item, priority, id)
+}

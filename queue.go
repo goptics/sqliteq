@@ -80,6 +80,9 @@ func (q *Queue) initSchema() error {
 	if err := q.migrate(); err != nil {
 		return fmt.Errorf("failed to migrate indexes: %w", err)
 	}
+	if err := q.addJobID(); err != nil {
+		return fmt.Errorf("failed to add job_id: %w", err)
+	}
 	return nil
 }
 
@@ -110,9 +113,13 @@ func (q *Queue) initTable() error {
 	return err
 }
 
-// pendingIndexSuffix names a queue's partial pending index. Tables and
-// indexes share one namespace, so the suffix is one no queue name would take.
-const pendingIndexSuffix = "__sqliteq_pending"
+// pendingIndexSuffix and jobIDIndexSuffix name a queue's partial indexes.
+// Tables and indexes share one namespace, so the suffixes are ones no queue
+// name would take.
+const (
+	pendingIndexSuffix = "__sqliteq_pending"
+	jobIDIndexSuffix   = "__sqliteq_job_id"
+)
 
 // migrate drops the v0.2 indexes and makes sure the one partial index on
 // pending rows matches the queue order. On a migrated table it changes nothing.
@@ -139,6 +146,24 @@ func (q *Queue) migrate() error {
 		}
 	}
 	_, err = q.f.db.Exec(fmt.Sprintf("CREATE INDEX %s ON %s (%s) WHERE status = 'pending'", quoteIdent(index), q.table, q.order))
+	return err
+}
+
+// addJobID adds the job_id column EnqueueOnce fills, when it is missing, and
+// its unique index over the rows that have one. Rows without an id, old ones
+// and those of Enqueue, are NULL and outside the index.
+func (q *Queue) addJobID() error {
+	exists, err := hasColumn(q.f.db, q.name, "job_id")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := q.f.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN job_id TEXT", q.table)); err != nil {
+			return err
+		}
+	}
+	_, err = q.f.db.Exec(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s (job_id) WHERE job_id IS NOT NULL",
+		quoteIdent(q.name+jobIDIndexSuffix), q.table))
 	return err
 }
 
@@ -170,7 +195,7 @@ func (q *Queue) prepare() (err error) {
 		}
 	}()
 
-	cols, vals, returning := "data, status, ack, created_at, updated_at", "?, 'pending', 0, ?, ?", "id, data"
+	cols, vals, returning := "data, status, ack, created_at, updated_at, job_id", "?, 'pending', 0, ?, ?, ?", "id, data"
 	if q.priority {
 		cols, vals, returning = cols+", priority", vals+", ?", "id, priority, data"
 	}
@@ -185,7 +210,9 @@ func (q *Queue) prepare() (err error) {
 		stmt  **sql.Stmt
 		query string
 	}{
-		{&q.insert, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", q.table, cols, vals)},
+		// The conflict target is the job_id index alone, so a NOT NULL or any
+		// other failure still errors; it must repeat the index's WHERE
+		{&q.insert, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
 		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data", q.table, pending)},
 		{&q.ack, ack},
@@ -266,8 +293,17 @@ func (q *Queue) Enqueue(item any) bool {
 	return q.enqueue(item, 0, "")
 }
 
+// EnqueueOnce implements varmq.IDedupQueue: it adds item under id unless a
+// row with that id exists, pending, processing, or completed with
+// WithRemoveOnComplete(false). A repeat stores nothing and returns true. An
+// empty id behaves like Enqueue.
+func (q *Queue) EnqueueOnce(item any, id string) bool {
+	return q.enqueue(item, 0, id)
+}
+
 // enqueue inserts one pending row in the file's next group commit round;
-// priority is stored on priority queues only. id is unused for now.
+// priority is stored on priority queues only. A row with a non-empty id is
+// skipped, still with true, when a row with that id exists.
 func (q *Queue) enqueue(item any, priority int, id string) bool {
 	if q.closed.Load() {
 		return false
@@ -280,18 +316,26 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 		return false
 	}
 
+	// No id is NULL, which the job_id index leaves out; "" would be one id
+	var jobID any
+	if id != "" {
+		jobID = id
+	}
+
 	now := time.Now().UTC()
 	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
 		insert := q.insert
 		if tx != nil {
 			insert = tx.Stmt(insert)
 		}
+		// One statement, so a round of one, run without a transaction, is atomic
 		var err error
 		if q.priority {
-			_, err = insert.Exec(data, now, now, priority)
+			_, err = insert.Exec(data, now, now, jobID, priority)
 		} else {
-			_, err = insert.Exec(data, now, now)
+			_, err = insert.Exec(data, now, now, jobID)
 		}
+		// A repeat id changes no row and is no error: it succeeds
 		return err == nil, err
 	})
 }
