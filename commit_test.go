@@ -115,6 +115,67 @@ func TestBatcherLeaderHandsOff(t *testing.T) {
 	}
 }
 
+// TestBatcherHandOffDoesNotWait checks that once a leader has ended its turn,
+// the next round does not wait for the waiting op it woke: a caller arriving
+// first takes the lead and commits that op with its own.
+func TestBatcherHandOffDoesNotWait(t *testing.T) {
+	gate := make(chan struct{})
+	rounds := 0 // touched by the leader only
+	b := &batcher{}
+	b.commit = func(ops []*op) {
+		if rounds < 2 {
+			<-gate
+		}
+		rounds++
+		runOps(ops)
+	}
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+			b.mu.Lock()
+			ok := cond()
+			b.mu.Unlock()
+			if ok {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("Timed out waiting for %s", what)
+			}
+		}
+	}
+	ok := func(*sql.Tx) (bool, error) { return true, nil }
+
+	go b.do(ok) // leads round 1, held at the gate
+	waitFor("round 1", func() bool { return b.leading && len(b.pending) == 0 })
+	go b.do(ok) // waits, then commits in round 2
+	waitFor("a waiter", func() bool { return len(b.pending) == 1 })
+	gate <- struct{}{}
+	waitFor("round 2", func() bool { return len(b.pending) == 0 })
+
+	// An op whose caller is slow to wake: nothing reads its done
+	slow := &op{run: ok, done: make(chan result, 2)}
+	b.mu.Lock()
+	b.pending = append(b.pending, slow)
+	b.mu.Unlock()
+	gate <- struct{}{} // the leader ends its turn with slow waiting
+	waitFor("the turn to end", func() bool { return len(slow.done) == 1 })
+
+	// A caller arriving before slow wakes up
+	got := make(chan bool, 1)
+	go func() { got <- b.do(ok) }()
+	select {
+	case r := <-got:
+		if !r {
+			t.Error("The new caller's write failed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("The new caller waited for the woken op to take the lead")
+	}
+	if r := slow.outcome(); !r {
+		t.Error("The slow op's write failed")
+	}
+}
+
 // oneRound runs first and, once it leads a round blocked on the file mutex,
 // starts rest, so that every call of rest commits in the one round after
 // first's. It returns each call's result, first's at index 0.

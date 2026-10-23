@@ -8,7 +8,7 @@ import (
 // op is one caller's write waiting for a round of the group commit
 type op struct {
 	run  func(tx *sql.Tx) (bool, error) // one caller's statement(s); a nil tx means autocommit
-	done chan result                    // buffered 1
+	done chan result                    // buffered 2: one lead wake-up and the outcome
 }
 
 // result is what an op's caller receives: its own outcome, or with lead set,
@@ -17,8 +17,10 @@ type result struct{ ok, lead bool }
 
 // batcher groups concurrent writes on one file into shared transactions. The
 // first caller with no round running leads: it commits what has queued up, at
-// most its own round plus one more, then hands the lead to the oldest waiting
-// caller, so no caller commits for others for long under steady load.
+// most its own round plus one more, then gives up the lead, so no caller
+// commits for others for long under steady load. Whoever comes first takes
+// the lead next: a new caller, or the oldest waiting one, which is woken for
+// it. The next round never waits on that wake-up while a caller is running.
 type batcher struct {
 	mu      sync.Mutex
 	pending []*op
@@ -28,29 +30,45 @@ type batcher struct {
 
 // do runs one write in the next round and returns its own outcome
 func (b *batcher) do(run func(*sql.Tx) (bool, error)) bool {
-	o := &op{run: run, done: make(chan result, 1)}
+	o := &op{run: run, done: make(chan result, 2)}
 
 	b.mu.Lock()
 	b.pending = append(b.pending, o)
-	if b.leading {
+	for b.leading {
 		b.mu.Unlock()
 		r := <-o.done
 		if !r.lead {
 			return r.ok
 		}
-		// Handed the lead: o is still pending, first in the next round
+		// Woken for the lead: take it if nobody has and o is still first,
+		// else o is in someone's round and its outcome follows
 		b.mu.Lock()
-	} else {
-		b.leading = true
+		if !b.leading && len(b.pending) > 0 && b.pending[0] == o {
+			break
+		}
+		if !b.leading {
+			b.mu.Unlock()
+			return o.outcome()
+		}
 	}
+	b.leading = true
 	b.lead()
 
-	return (<-o.done).ok
+	return o.outcome()
 }
 
-// lead commits up to two rounds, then hands off to the oldest waiting op or
-// ends the lead. b.mu is held on entry and released on return; it is never
-// held across a commit.
+// outcome waits for the op's result, skipping a wake-up that came too late
+func (o *op) outcome() bool {
+	for {
+		if r := <-o.done; !r.lead {
+			return r.ok
+		}
+	}
+}
+
+// lead commits up to two rounds, then gives up the lead and wakes the oldest
+// waiting op, if any, to take it. b.mu is held on entry and released on
+// return; it is never held across a commit.
 func (b *batcher) lead() {
 	for range 2 {
 		round := b.pending
@@ -63,10 +81,10 @@ func (b *batcher) lead() {
 		b.mu.Lock()
 	}
 
-	if len(b.pending) > 0 {
+	b.leading = false
+	// A pending op holds no outcome, so an empty buffer means no wake-up is unread
+	if len(b.pending) > 0 && len(b.pending[0].done) == 0 {
 		b.pending[0].done <- result{lead: true}
-	} else {
-		b.leading = false
 	}
 	b.mu.Unlock()
 }
