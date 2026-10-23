@@ -1,7 +1,6 @@
 package sqliteq
 
 import (
-	"database/sql"
 	"fmt"
 	"time"
 
@@ -14,8 +13,8 @@ type PriorityQueue struct {
 }
 
 // newPriorityQueue creates a new SQLite-based priority queue
-func newPriorityQueue(db *sql.DB, tableName string, opts ...Option) (*PriorityQueue, error) {
-	baseQueue, err := newQueue(db, tableName, opts...)
+func newPriorityQueue(f *file, tableName string, opts ...Option) (*PriorityQueue, error) {
+	baseQueue, err := newQueue(f, tableName, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -34,21 +33,21 @@ func newPriorityQueue(db *sql.DB, tableName string, opts ...Option) (*PriorityQu
 
 // initPriorityColumn adds the priority column to the table if it doesn't exist
 func (pq *PriorityQueue) initPriorityColumn() error {
-	exists, err := hasColumn(pq.client, pq.tableName, "priority")
+	exists, err := hasColumn(pq.f.db, pq.tableName, "priority")
 	if err != nil {
 		return err
 	}
 
 	if !exists {
 		// Add priority column with default value 0
-		_, err := pq.client.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN priority INTEGER NOT NULL DEFAULT 0", quoteIdent(pq.tableName)))
+		_, err := pq.f.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN priority INTEGER NOT NULL DEFAULT 0", quoteIdent(pq.tableName)))
 		if err != nil {
 			return err
 		}
 	}
 
 	// Create index on priority (ASC for lower numbers = higher priority)
-	_, err = pq.client.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (priority ASC, created_at ASC)", quoteIdent(pq.tableName+"_priority_idx"), quoteIdent(pq.tableName)))
+	_, err = pq.f.db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (priority ASC, created_at ASC)", quoteIdent(pq.tableName+"_priority_idx"), quoteIdent(pq.tableName)))
 	if err != nil {
 		return err
 	}
@@ -65,7 +64,7 @@ func (pq *PriorityQueue) Enqueue(item any, priority int) bool {
 	}
 
 	now := time.Now().UTC()
-	tx, err := pq.client.Begin()
+	tx, err := pq.f.db.Begin()
 
 	if err != nil {
 		return false
@@ -97,7 +96,7 @@ func (pq *PriorityQueue) dequeueInternal(withAckId bool) (any, bool, string) {
 		return nil, false, ""
 	}
 
-	tx, err := pq.client.Begin()
+	tx, err := pq.f.db.Begin()
 
 	if err != nil {
 		return nil, false, ""

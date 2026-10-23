@@ -3,17 +3,14 @@ package sqliteq
 import (
 	"database/sql"
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 )
 
 func TestSQLiteQueue(t *testing.T) {
-	// Create a temporary database file
-	dbPath := "test_queue.db"
+	// Create a temporary store folder
+	dbPath := t.TempDir()
 
-	// Cleanup after test
-	defer os.Remove(dbPath)
 	queues := mustNew(t, dbPath)
 	// Create a new queue with default settings (removeOnComplete = true)
 	q, err := queues.NewQueue("test_queue")
@@ -75,7 +72,7 @@ func TestSQLiteQueue(t *testing.T) {
 
 		// Verify the item is completely removed from the database
 		var count int
-		row := q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", q.tableName))
+		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", q.tableName))
 		error := row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking items in database: %v", error)
@@ -145,9 +142,8 @@ func TestSQLiteQueue(t *testing.T) {
 func TestRemoveOnCompleteOption(t *testing.T) {
 	// Test with removeOnComplete = false
 	t.Run("KeepCompletedItems", func(t *testing.T) {
-		// Create a temporary database file
-		dbPath := "test_keep_completed.db"
-		defer os.Remove(dbPath)
+		// Create a temporary store folder
+		dbPath := t.TempDir()
 
 		// Create a queue with removeOnComplete = false
 		queues := mustNew(t, dbPath)
@@ -179,7 +175,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 
 		// Verify the item is still in the database by checking directly
 		var count int
-		row := q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed'", q.tableName))
+		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed'", q.tableName))
 		error := row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking completed items: %v", error)
@@ -191,9 +187,8 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 
 	// Test with removeOnComplete = true (default)
 	t.Run("RemoveCompletedItems", func(t *testing.T) {
-		// Create a temporary database file
-		dbPath := "test_remove_completed.db"
-		defer os.Remove(dbPath)
+		// Create a temporary store folder
+		dbPath := t.TempDir()
 
 		queues := mustNew(t, dbPath)
 		// Create a queue with default removeOnComplete = true
@@ -215,7 +210,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		// Since dequeueInternal with withAckId=false now deletes directly,
 		// the item should be removed from the database immediately
 		var count int
-		row := q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
+		row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
 		error := row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking items in database: %v", error)
@@ -233,7 +228,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Check that the item is still in the database with processing status
-		row = q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", q.tableName))
+		row = q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", q.tableName))
 		error = row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking processing items: %v", error)
@@ -248,7 +243,7 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Since removeOnComplete is true, the item should be removed from the database
-		row = q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
+		row = q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", q.tableName))
 		error = row.Scan(&count)
 		if error != nil {
 			t.Errorf("Error checking items in database: %v", error)
@@ -261,11 +256,8 @@ func TestRemoveOnCompleteOption(t *testing.T) {
 
 // Test concurrent operations
 func TestConcurrentOperations(t *testing.T) {
-	// Create a temporary database file
-	dbPath := "test_concurrent.db"
-
-	// Cleanup after test
-	defer os.Remove(dbPath)
+	// Create a temporary store folder
+	dbPath := t.TempDir()
 
 	// Create a new queue
 	queues := mustNew(t, dbPath)
@@ -346,7 +338,7 @@ func TestQuoteIdent(t *testing.T) {
 }
 
 func TestTableInitErrorKeepsPool(t *testing.T) {
-	qs := mustNew(t, filepath.Join(t.TempDir(), "pool.db"))
+	qs := mustNew(t, filepath.Join(t.TempDir(), "pool.db"), WithSingleFile())
 	defer qs.Close()
 
 	ok, err := qs.NewQueue("ok")
@@ -355,7 +347,7 @@ func TestTableInitErrorKeepsPool(t *testing.T) {
 	}
 
 	// A view named like the queue makes CREATE INDEX fail during table init
-	if _, err := qs.(*queues).client.Exec(`CREATE VIEW "bad" AS SELECT 1 AS x`); err != nil {
+	if _, err := ok.f.db.Exec(`CREATE VIEW "bad" AS SELECT 1 AS x`); err != nil {
 		t.Fatalf("Failed to create view: %v", err)
 	}
 	if _, err := qs.NewQueue("bad"); err == nil {
@@ -372,7 +364,7 @@ func TestRecoveryError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
-	q := &Queue{client: db, tableName: "recovery"}
+	q := &Queue{f: &file{db: db}, tableName: "recovery"}
 	db.Close()
 
 	if err := q.requeueNoAck(); err == nil {

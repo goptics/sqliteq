@@ -2,19 +2,15 @@ package sqliteq
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestPriorityQueue(t *testing.T) {
-	// Create a temporary database file
-	dbPath := "test_priority_queue.db"
+	// Create a temporary store folder
+	dbPath := t.TempDir()
 
-	// Cleanup after test
-	defer os.Remove(dbPath)
 	queuesInstance := mustNew(t, dbPath)
 
 	// Create a new priority queue
@@ -73,14 +69,14 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "high priority" {
 			t.Errorf("Expected 'high priority', got '%s'", string(byteData))
 		}
 
 		// Verify the item is completely removed from the database
 		var count int
-		row := pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.tableName))
+		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.tableName))
 		err := row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -99,7 +95,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "second high priority" {
 			t.Errorf("Expected 'second high priority', got '%s'", string(byteData))
 		}
@@ -114,7 +110,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "medium priority" {
 			t.Errorf("Expected 'medium priority', got '%s'", string(byteData))
 		}
@@ -129,13 +125,13 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "low priority" {
 			t.Errorf("Expected 'low priority', got '%s'", string(byteData))
 		}
 
 		// Verify the item is completely removed from the database
-		row = pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.tableName))
+		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.tableName))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -175,14 +171,14 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "highest" {
 			t.Errorf("Expected 'highest', got '%s'", string(byteData))
 		}
 
 		// Verify item is in processing status in database
 		var count int
-		row := pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
 		err := row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking processing items: %v", err)
@@ -198,7 +194,7 @@ func TestPriorityQueue(t *testing.T) {
 		}
 
 		// Check that processing item is removed
-		row = pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking processing items: %v", err)
@@ -217,7 +213,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "high" {
 			t.Errorf("Expected 'high', got '%s'", string(byteData))
 		}
@@ -248,14 +244,14 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "priority 1" {
 			t.Errorf("Expected 'priority 1', got '%s'", string(byteData))
 		}
 
 		// Verify item is removed from database
 		var count int
-		row := pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.tableName))
+		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'completed' OR status = 'processing'", pq.tableName))
 		err := row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -277,7 +273,7 @@ func TestPriorityQueue(t *testing.T) {
 				t.Errorf("Expected []byte, got %T", item)
 				continue
 			}
-			
+
 			if string(byteData) != expected {
 				t.Errorf("Expected '%s', got '%s'", expected, string(byteData))
 			}
@@ -292,7 +288,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "priority 10" {
 			t.Errorf("Expected 'priority 10', got '%s'", string(byteData))
 		}
@@ -317,7 +313,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "negative priority" {
 			t.Errorf("Expected 'negative priority', got '%s'", string(byteData))
 		}
@@ -331,7 +327,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "zero priority" {
 			t.Errorf("Expected 'zero priority', got '%s'", string(byteData))
 		}
@@ -345,7 +341,7 @@ func TestPriorityQueue(t *testing.T) {
 		if !ok {
 			t.Errorf("Expected []byte, got %T", item)
 		}
-		
+
 		if string(byteData) != "positive priority" {
 			t.Errorf("Expected 'positive priority', got '%s'", string(byteData))
 		}
@@ -372,9 +368,8 @@ func TestPriorityQueue(t *testing.T) {
 func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 	// Test with removeOnComplete = false
 	t.Run("KeepCompletedItems", func(t *testing.T) {
-		// Create a temporary database file
-		dbPath := "test_priority_keep_completed.db"
-		defer os.Remove(dbPath)
+		// Create a temporary store folder
+		dbPath := t.TempDir()
 
 		// Create a queue with removeOnComplete = false
 		queuesInstance := mustNew(t, dbPath)
@@ -417,9 +412,8 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 
 	// Test with removeOnComplete = true (default)
 	t.Run("RemoveCompletedItems", func(t *testing.T) {
-		// Create a temporary database file
-		dbPath := "test_priority_remove_completed.db"
-		defer os.Remove(dbPath)
+		// Create a temporary store folder
+		dbPath := t.TempDir()
 
 		queuesInstance := mustNew(t, dbPath)
 		// Create a queue with default removeOnComplete = true
@@ -442,7 +436,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		// Since dequeueInternal with withAckId=false now deletes directly,
 		// the item should be removed from the database immediately
 		var count int
-		row := pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.tableName))
+		row := pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", pq.tableName))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -458,7 +452,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Check that the item is still in the database with processing status
-		row = pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
+		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'processing'", pq.tableName))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking processing items: %v", err)
@@ -473,7 +467,7 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 		}
 
 		// Since removeOnComplete is true, the item should be removed from the database
-		row = pq.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", pq.tableName))
+		row = pq.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", pq.tableName))
 		err = row.Scan(&count)
 		if err != nil {
 			t.Errorf("Error checking items in database: %v", err)
@@ -486,11 +480,8 @@ func TestPriorityQueueRemoveOnCompleteOption(t *testing.T) {
 
 // Test concurrent operations with priority queue
 func TestPriorityQueueConcurrentOperations(t *testing.T) {
-	// Create a temporary database file
-	dbPath := "test_priority_concurrent.db"
-
-	// Cleanup after test
-	defer os.Remove(dbPath)
+	// Create a temporary store folder
+	dbPath := t.TempDir()
 
 	// Create a new priority queue
 	queuesInstance := mustNew(t, dbPath)
@@ -556,7 +547,7 @@ func TestPriorityQueueConcurrentOperations(t *testing.T) {
 }
 
 func TestPriorityQueueReopen(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "reopen.db")
+	dbPath := t.TempDir()
 
 	qs := mustNew(t, dbPath)
 	pq, err := qs.NewPriorityQueue("jobs")

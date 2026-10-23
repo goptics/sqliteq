@@ -12,16 +12,17 @@ import (
 
 // Queue implements the Queue interface using SQLite as the storage backend
 type Queue struct {
-	client           *sql.DB
+	f                *file
 	tableName        string
 	removeOnComplete bool
 	closed           atomic.Bool
 }
 
-// newQueue creates a new SQLite-based queue
-func newQueue(db *sql.DB, tableName string, opts ...Option) (*Queue, error) {
+// newQueue creates a new SQLite-based queue and its table. Recovery runs
+// from file.open, once per table per file.
+func newQueue(f *file, tableName string, opts ...Option) (*Queue, error) {
 	q := &Queue{
-		client:           db,
+		f:                f,
 		tableName:        tableName,
 		removeOnComplete: true, // Default to removing completed items
 	}
@@ -32,12 +33,8 @@ func newQueue(db *sql.DB, tableName string, opts ...Option) (*Queue, error) {
 	}
 
 	if err := q.initTable(); err != nil {
-		// The db is shared by every queue of the Queues, so it is not closed here
+		// The db is shared by every queue of the file, so it is not closed here
 		return nil, fmt.Errorf("failed to initialize table: %w", err)
-	}
-
-	if err := q.requeueNoAck(); err != nil {
-		return nil, fmt.Errorf("failed to requeue unacknowledged rows: %w", err)
 	}
 
 	return q, nil
@@ -64,13 +61,13 @@ func (q *Queue) initTable() error {
 		quoteIdent(q.tableName+"_status_ack_idx"),
 		quoteIdent(q.tableName+"_ack_id_idx"))
 
-	_, err := q.client.Exec(createTableSQL)
+	_, err := q.f.db.Exec(createTableSQL)
 	return err
 }
 
 // requeueNoAck puts rows left in processing without an ack back to pending
 func (q *Queue) requeueNoAck() error {
-	tx, err := q.client.Begin()
+	tx, err := q.f.db.Begin()
 	if err != nil {
 		return err
 	}
@@ -125,7 +122,7 @@ func (q *Queue) Enqueue(item any) bool {
 	}
 
 	now := time.Now().UTC()
-	tx, err := q.client.Begin()
+	tx, err := q.f.db.Begin()
 	if err != nil {
 		return false
 	}
@@ -154,7 +151,7 @@ func (q *Queue) dequeueInternal(withAckId bool) (item any, success bool, ackID s
 		return nil, false, ""
 	}
 
-	tx, err := q.client.Begin()
+	tx, err := q.f.db.Begin()
 	if err != nil {
 		return nil, false, ""
 	}
@@ -240,7 +237,7 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 // Acknowledge marks an item as completed
 // Returns true if the item was successfully acknowledged, false otherwise
 func (q *Queue) Acknowledge(ackID string) bool {
-	tx, err := q.client.Begin()
+	tx, err := q.f.db.Begin()
 	if err != nil {
 		return false
 	}
@@ -286,7 +283,7 @@ func (q *Queue) Acknowledge(ackID string) bool {
 // Len returns the number of pending items in the queue
 func (q *Queue) Len() int {
 	var count int
-	row := q.client.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", quoteIdent(q.tableName)))
+	row := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", quoteIdent(q.tableName)))
 	err := row.Scan(&count)
 	if err != nil {
 		return 0
@@ -296,7 +293,7 @@ func (q *Queue) Len() int {
 
 // Values returns all pending items in the queue
 func (q *Queue) Values() []any {
-	rows, err := q.client.Query(fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY created_at ASC", quoteIdent(q.tableName)))
+	rows, err := q.f.db.Query(fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY created_at ASC", quoteIdent(q.tableName)))
 	if err != nil {
 		return nil
 	}
@@ -319,7 +316,7 @@ func (q *Queue) Values() []any {
 
 // Purge removes all items from the queue
 func (q *Queue) Purge() {
-	tx, err := q.client.Begin()
+	tx, err := q.f.db.Begin()
 	if err != nil {
 		return
 	}
