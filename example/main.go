@@ -11,16 +11,23 @@ import (
 
 // regularQueueExample demonstrates the basic queue functionality
 func regularQueueExample() {
-	// Create a new SQLite queue
-	dbPath := "./regular_queue_example.db"
-	defer os.Remove(dbPath)
+	// Each queue gets its own database file in a temporary folder
+	dir, err := os.MkdirTemp("", "sqliteq-regular-*")
+	if err != nil {
+		log.Fatalf("Failed to create temp folder: %v", err)
+	}
+	defer os.RemoveAll(dir)
 
-	queues := sqliteq.New(dbPath)
+	queues, err := sqliteq.New(dir)
+	if err != nil {
+		log.Fatalf("Failed to open queues: %v", err)
+	}
+	defer queues.Close()
+
 	queue, err := queues.NewQueue("tasks")
 	if err != nil {
 		log.Fatalf("Failed to create queue: %v", err)
 	}
-	defer queues.Close()
 
 	fmt.Println("SQLiteQ Example")
 	fmt.Println("---------------")
