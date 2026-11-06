@@ -5,6 +5,12 @@ All notable changes to the SQLiteQ project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Reject(ackID, reason)` on `Queue` and `PriorityQueue`, required by varmq's `IAcknowledgeable` since varmq#173: finishes an item that failed for good, never requeued. Deleted like an ack, or with `WithRemoveOnComplete(false)` kept with `status` `failed`. Same group commit as `Acknowledge`. The reason is not stored.
+
 ## [0.3.0] - 2026-10-23
 
 ### Breaking

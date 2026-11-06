@@ -27,7 +27,7 @@ type Queue struct {
 	closed           atomic.Bool
 
 	// Prepared once per handle; they close with the file's pool
-	insert, claim, pop, ack, count, countCapped, values *sql.Stmt
+	insert, claim, pop, ack, reject, count, countCapped, values *sql.Stmt
 }
 
 // claimed is one row a claim moved to processing
@@ -205,8 +205,11 @@ func (q *Queue) prepare() (err error) {
 	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)
 
 	ack := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing'", q.table)
+	reject := ack
 	if !q.removeOnComplete {
-		ack = fmt.Sprintf("UPDATE %s SET status = 'completed', ack = 1, updated_at = ? WHERE id = ? AND status = 'processing'", q.table)
+		finish := "UPDATE %s SET status = '%s', ack = 1, updated_at = ? WHERE id = ? AND status = 'processing'"
+		ack = fmt.Sprintf(finish, q.table, "completed")
+		reject = fmt.Sprintf(finish, q.table, "failed")
 	}
 
 	for _, s := range []struct {
@@ -219,6 +222,7 @@ func (q *Queue) prepare() (err error) {
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
 		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data", q.table, pending)},
 		{&q.ack, ack},
+		{&q.reject, reject},
 		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
 		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
 		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
@@ -233,7 +237,7 @@ func (q *Queue) prepare() (err error) {
 
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
-	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.ack, q.count, q.countCapped, q.values} {
+	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.ack, q.reject, q.count, q.countCapped, q.values} {
 		if s != nil {
 			s.Close()
 		}
@@ -467,7 +471,16 @@ func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaini
 // Acknowledge marks a processing item as completed, deleting it unless
 // WithRemoveOnComplete(false) is set, in the file's next group commit round
 // Returns true only if exactly one processing row had this ack ID
-func (q *Queue) Acknowledge(ackID string) bool {
+func (q *Queue) Acknowledge(ackID string) bool { return q.finish(ackID, q.ack) }
+
+// Reject marks a processing item as failed for good: it is not requeued.
+// The row is deleted, or with WithRemoveOnComplete(false) kept with status
+// 'failed'. Same group commit and result as Acknowledge.
+// ponytail: reason is not stored (no column); add one when something reads it.
+func (q *Queue) Reject(ackID string, reason string) bool { return q.finish(ackID, q.reject) }
+
+// finish runs stmt (ack or reject) for the row of ackID.
+func (q *Queue) finish(ackID string, stmt *sql.Stmt) bool {
 	id, ok := parseAckID(ackID)
 	if !ok {
 		return false
@@ -479,14 +492,14 @@ func (q *Queue) Acknowledge(ackID string) bool {
 			result sql.Result
 			err    error
 		)
-		ack := q.ack
+		s := stmt
 		if tx != nil {
-			ack = tx.Stmt(ack)
+			s = tx.Stmt(s)
 		}
 		if q.removeOnComplete {
-			result, err = ack.Exec(id)
+			result, err = s.Exec(id)
 		} else {
-			result, err = ack.Exec(now, id)
+			result, err = s.Exec(now, id)
 		}
 		if err != nil {
 			return false, err

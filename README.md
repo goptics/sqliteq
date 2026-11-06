@@ -122,14 +122,19 @@ data, ok := pq.Dequeue() // "password reset"
 ```go
 item, ok, ackID := queue.DequeueWithAckId()
 if ok {
-	process(item)
-	queue.Acknowledge(ackID)
+	if err := process(item); err != nil {
+		queue.Reject(ackID, err.Error()) // failed for good: not requeued
+	} else {
+		queue.Acknowledge(ackID)
+	}
 }
 ```
 
 An item taken with `DequeueWithAckId` is marked as processing until it is acknowledged. The first time a queue is opened after its file is opened in the process, every item still marked as processing goes back to pending, so a job that was running when the process stopped runs again. There is no visibility timeout: unacknowledged items return only when the file is next opened, not when a closed queue is opened again on a file that is still open.
 
-By default an acknowledged item is deleted. With `WithRemoveOnComplete(false)` it is kept and marked as completed:
+`Reject(ackID, reason)` finishes an item that failed for good, as varmq does when a job returns an error or panics. It is never requeued. The reason is not stored.
+
+By default an acknowledged or rejected item is deleted. With `WithRemoveOnComplete(false)` it is kept and marked as `completed` or `failed`:
 
 ```go
 audit, err := qs.NewQueue("audit", sqliteq.WithRemoveOnComplete(false))
@@ -146,7 +151,7 @@ queue.EnqueueOnce([]byte("send invoice 42"), "invoice-42") // true, nothing stor
 pq.EnqueueOnce([]byte("rebuild index"), 1, "rebuild-index")
 ```
 
-The id is remembered while its row exists: pending, processing, or completed with `WithRemoveOnComplete(false)`. `Dequeue` deletes the row, and so does the ack with the default remove-on-complete; after that the id can be added again. `Purge` forgets every id. An empty id behaves like `Enqueue`.
+The id is remembered while its row exists: pending, processing, or completed or failed with `WithRemoveOnComplete(false)`. `Dequeue` deletes the row, and so does the ack or reject with the default remove-on-complete; after that the id can be added again. `Purge` forgets every id. An empty id behaves like `Enqueue`.
 
 ### Batch dequeue
 
@@ -237,7 +242,7 @@ On macOS, spell a path the same way every time: the registry key keeps the lette
 | ----------------------------- | ------------------------------ | ------------- | ---------------------------------------------------------------------- |
 | `WithSingleFile()`            | `New`                          | folder layout | `path` is one database file holding every queue                        |
 | `WithCheckpointPages(n)`      | `New`                          | `1000`        | WAL size, in pages, at which SQLite checkpoints automatically          |
-| `WithRemoveOnComplete(false)` | `NewQueue`, `NewPriorityQueue` | `true`        | Keep acknowledged items, marked as completed, instead of deleting them |
+| `WithRemoveOnComplete(false)` | `NewQueue`, `NewPriorityQueue` | `true`        | Keep acknowledged and rejected items, marked as `completed` or `failed`, instead of deleting them |
 
 `New` returns an error instead of panicking: for a path it cannot use, an invalid option (`WithCheckpointPages` below 1, or a nil option), or a path that is an existing file when `WithSingleFile()` is not given. `NewQueue` and `NewPriorityQueue` return an error for a nil option too.
 
@@ -286,7 +291,7 @@ Each queue is a table with these columns:
 - `priority`: priority queues only; a lower number comes out first. Opening an older table as a priority queue adds it.
 - `data`: the stored item.
 - `status`: `pending`, `processing` or `completed`.
-- `ack`: 0 when an item is added, 1 once it is acknowledged and kept with `WithRemoveOnComplete(false)`. On open, only `processing` rows with `ack` 0 go back to pending.
+- `ack`: 0 when an item is added, 1 once it is acknowledged or rejected and kept with `WithRemoveOnComplete(false)` (`status` `completed` or `failed`). On open, only `processing` rows with `ack` 0 go back to pending.
 - `ack_id`: kept from v0.2 so old tables need no rebuild; no longer used.
 - `job_id`: the id an item was added with through `EnqueueOnce`, unique among the rows that have one; NULL for `Enqueue`. Opening an older table adds it.
 - `created_at`, `updated_at`: when the item was added and last changed.
