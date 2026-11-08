@@ -1650,3 +1650,30 @@ func TestReservedQueueName(t *testing.T) {
 		t.Error("Expected a reserved name to fail")
 	}
 }
+
+// An item whose envelope does not decode to a string id is a plain job:
+// with a live mark (gated pops) it is handed out, finishes as usual, and
+// writes no record.
+func TestUndecodableEnvelopeIsPlainJob(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.CancelJob("other") // keeps the pops gated
+	bad := []string{`{bad`, `{"id":5}`, `{"id":null}`, `{"id":""}`, `[1]`, "plain", `{"id":"x"`}
+	for _, b := range bad {
+		q.Enqueue([]byte(b))
+	}
+	for i, b := range bad {
+		v, ack := pop(t, q)
+		if v != b {
+			t.Fatalf("pop %d: got %q, want %q", i, v, b)
+		}
+		if i%2 == 0 {
+			q.Acknowledge(ack)
+		} else {
+			q.Reject(ack, "r")
+		}
+	}
+	if n := countJobs(t, q); n != 0 {
+		t.Errorf("Expected no records, got %d", n)
+	}
+}
