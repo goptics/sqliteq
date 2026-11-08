@@ -1,9 +1,12 @@
 package sqliteq
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"testing"
+
+	"github.com/goptics/varmq/contract"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -651,5 +654,46 @@ func TestBatchPriorityOrder(t *testing.T) {
 		if !pq.Acknowledge(ackIDs[i]) {
 			t.Errorf("Acknowledge(%s) failed", ackIDs[i])
 		}
+	}
+}
+
+// A priority queue reports outcomes, drops marked waiting jobs in priority
+// order, and re-add clears the mark, as Queue does.
+func TestPriorityOutcomeAndCancel(t *testing.T) {
+	qs := mustNew(t, t.TempDir())
+	defer qs.Close()
+	pq, err := qs.NewPriorityQueue("pq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := otherProcess(t, pq.Queue)
+
+	pq.Enqueue(job("low"), 5)
+	pq.Enqueue(job("high"), 1)
+	pq.EnqueueOnce(job("mid"), 3, "mid")
+	if err := other.CancelJob("high"); err != nil {
+		t.Fatal(err)
+	}
+	chHigh, chMid := watch(other, "high"), watch(other, "mid")
+
+	if v, ack := pop(t, pq.Queue); v != string(job("mid")) {
+		t.Fatalf("got %s, want mid", v)
+	} else if !pq.AcknowledgeResult(ack, []byte(`7`)) {
+		t.Fatal("AcknowledgeResult failed")
+	}
+	if got := waitOutcome(t, chHigh); got.State != contract.JobCancelled {
+		t.Errorf("high: got %+v", got)
+	}
+	if got := waitOutcome(t, chMid); got.State != contract.JobCompleted || string(got.Result) != "7" {
+		t.Errorf("mid: got %+v", got)
+	}
+	if err := pq.CancelJob("mid"); !errors.Is(err, contract.ErrJobEnded) {
+		t.Errorf("got %v, want ErrJobEnded", err)
+	}
+
+	pq.CancelJob("again")
+	pq.EnqueueOnce(job("again"), 0, "again")
+	if v, _ := pop(t, pq.Queue); v != string(job("again")) {
+		t.Errorf("Expected the re-added job first, got %s", v)
 	}
 }

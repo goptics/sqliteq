@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goptics/varmq/contract"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -26,8 +28,13 @@ type Queue struct {
 	removeOnComplete bool
 	closed           atomic.Bool
 
+	jobs, cancelled string       // quoted outcome and cancel mark tables
+	w               watchers     // outcome watches and OnCancel hooks
+	records         atomic.Int64 // outcome records written, for trims
+
 	// Prepared once per handle; they close with the file's pool
-	insert, claim, pop, ack, reject, count, countCapped, values *sql.Stmt
+	insert, claim, pop, fin, count, countCapped, values *sql.Stmt
+	putJob, unmark, hasMark, isMarked                   *sql.Stmt
 }
 
 // claimed is one row a claim moved to processing
@@ -35,6 +42,7 @@ type claimed struct {
 	id       int64
 	priority int
 	data     []byte
+	once     sql.NullString // job_id
 }
 
 // newQueue creates a SQLite-based queue on its table: the table itself, the
@@ -48,7 +56,10 @@ func newQueue(f *file, name string, priority bool, opts ...Option) (*Queue, erro
 		priority:         priority,
 		order:            "id",
 		removeOnComplete: true, // Default to removing completed items
+		jobs:             quoteIdent(name + jobsSuffix),
+		cancelled:        quoteIdent(name + cancelledSuffix),
 	}
+	q.w.stop = make(chan struct{})
 	if priority {
 		q.order = "priority, id"
 	}
@@ -85,6 +96,9 @@ func (q *Queue) initSchema() error {
 	}
 	if err := q.addJobID(); err != nil {
 		return fmt.Errorf("failed to add job_id: %w", err)
+	}
+	if err := q.initSidecars(); err != nil {
+		return fmt.Errorf("failed to create outcome tables: %w", err)
 	}
 	return nil
 }
@@ -198,18 +212,16 @@ func (q *Queue) prepare() (err error) {
 		}
 	}()
 
-	cols, vals, returning := "data, status, ack, created_at, updated_at, job_id", "?, 'pending', 0, ?, ?, ?", "id, data"
+	cols, vals, returning := "data, status, ack, created_at, updated_at, job_id", "?, 'pending', 0, ?, ?, ?", "id, data, job_id"
 	if q.priority {
-		cols, vals, returning = cols+", priority", vals+", ?", "id, priority, data"
+		cols, vals, returning = cols+", priority", vals+", ?", "id, priority, data, job_id"
 	}
 	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)
 
-	ack := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing'", q.table)
-	reject := ack
+	// fin ends a processing row: deleted, or kept with its end as status
+	fin := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
 	if !q.removeOnComplete {
-		finish := "UPDATE %s SET status = '%s', ack = 1, updated_at = ? WHERE id = ? AND status = 'processing'"
-		ack = fmt.Sprintf(finish, q.table, "completed")
-		reject = fmt.Sprintf(finish, q.table, "failed")
+		fin = fmt.Sprintf("UPDATE %s SET status = ?, ack = 1, updated_at = ? WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
 	}
 
 	for _, s := range []struct {
@@ -220,9 +232,12 @@ func (q *Queue) prepare() (err error) {
 		// other failure still errors; it must repeat the index's WHERE
 		{&q.insert, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
-		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data", q.table, pending)},
-		{&q.ack, ack},
-		{&q.reject, reject},
+		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
+		{&q.fin, fin},
+		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
+		{&q.unmark, fmt.Sprintf("DELETE FROM %s WHERE job_id = ?", q.cancelled)},
+		{&q.hasMark, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE expires_at > ?)", q.cancelled)},
+		{&q.isMarked, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE job_id = ? AND expires_at > ?)", q.cancelled)},
 		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
 		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
 		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
@@ -237,7 +252,7 @@ func (q *Queue) prepare() (err error) {
 
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
-	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.ack, q.reject, q.count, q.countCapped, q.values} {
+	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.hasMark, q.isMarked} {
 		if s != nil {
 			s.Close()
 		}
@@ -351,7 +366,7 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 // returns them in queue order
 func (q *Queue) claimN(n int) ([]claimed, error) {
 	q.f.mu.Lock()
-	out, err := q.claimRows(n)
+	out, err := q.claimGated(n)
 	q.f.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -367,10 +382,56 @@ func (q *Queue) claimN(n int) ([]claimed, error) {
 	return out, nil
 }
 
-// claimRows runs the claim statement and reads every row it returns; the
+// claimGated claims up to n rows; with a live cancel mark on the file it
+// runs in one transaction that drops each marked row it claims (outcome
+// cancelled) and claims again, at most maxDrops drops. The caller holds the
+// write mutex.
+func (q *Queue) claimGated(n int) ([]claimed, error) {
+	now := time.Now()
+	if !q.anyMark(now) {
+		return q.claimRows(q.claim, n)
+	}
+
+	tx, err := q.f.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	claim := tx.Stmt(q.claim)
+	out := make([]claimed, 0, n)
+	for drops := 0; len(out) < n && drops < maxDrops; {
+		rows, err := q.claimRows(claim, n-len(out))
+		if err != nil || len(rows) == 0 {
+			if err != nil {
+				return nil, err
+			}
+			break
+		}
+		// Every claimed row is handed out or dropped, so a batch may pass the cap
+		for _, c := range rows {
+			id := jobIDOf(c.once, c.data)
+			drop, err := q.marked(tx, id, now)
+			if err != nil {
+				return nil, err
+			}
+			if !drop {
+				out = append(out, c)
+				continue
+			}
+			if _, err := q.end(tx, c.id, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
+				return nil, err
+			}
+			drops++
+		}
+	}
+	return out, tx.Commit()
+}
+
+// claimRows runs a claim statement and reads every row it returns; the
 // caller holds the write mutex
-func (q *Queue) claimRows(n int) ([]claimed, error) {
-	rows, err := q.claim.Query(time.Now().UTC(), n)
+func (q *Queue) claimRows(claim *sql.Stmt, n int) ([]claimed, error) {
+	rows, err := claim.Query(time.Now().UTC(), n)
 	if err != nil {
 		return nil, err
 	}
@@ -380,9 +441,9 @@ func (q *Queue) claimRows(n int) ([]claimed, error) {
 	for rows.Next() {
 		var c claimed
 		if q.priority {
-			err = rows.Scan(&c.id, &c.priority, &c.data)
+			err = rows.Scan(&c.id, &c.priority, &c.data, &c.once)
 		} else {
-			err = rows.Scan(&c.id, &c.data)
+			err = rows.Scan(&c.id, &c.data, &c.once)
 		}
 		if err != nil {
 			return nil, err
@@ -403,25 +464,45 @@ func (q *Queue) Dequeue() (any, bool) {
 	q.f.mu.Lock()
 	defer q.f.mu.Unlock()
 
-	// Deferred last, so the rows close (and the statement ends) before unlocking
-	rows, err := q.pop.Query()
+	now := time.Now()
+	if !q.anyMark(now) {
+		data, _, err := popRow(q.pop)
+		return data, err == nil
+	}
+
+	// Gated: a marked item is dropped (outcome cancelled) and the next one popped
+	tx, err := q.f.db.Begin()
 	if err != nil {
 		return nil, false
 	}
-	defer rows.Close()
-
-	var data []byte
-	found := false
-	for rows.Next() {
-		if err := rows.Scan(&data); err != nil {
+	defer tx.Rollback()
+	pop := tx.Stmt(q.pop)
+	for range maxDrops {
+		data, once, err := popRow(pop)
+		if err != nil {
+			break
+		}
+		id := jobIDOf(once, data)
+		drop, err := q.marked(tx, id, now)
+		if err != nil {
 			return nil, false
 		}
-		found = true
+		if !drop {
+			return data, tx.Commit() == nil
+		}
+		if err := q.record(tx, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
+			return nil, false
+		}
 	}
-	if rows.Err() != nil || !found {
-		return nil, false
-	}
-	return data, true
+	tx.Commit() // keep the drops; an empty queue or the cap hands out nothing
+	return nil, false
+}
+
+// popRow runs a pop statement: the deleted row's data and job_id, or
+// sql.ErrNoRows on an empty queue
+func popRow(pop *sql.Stmt) (data []byte, once sql.NullString, err error) {
+	err = pop.QueryRow().Scan(&data, &once)
+	return data, once, err
 }
 
 // DequeueWithAckId moves the next item to processing and returns it with its
@@ -471,44 +552,75 @@ func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaini
 // Acknowledge marks a processing item as completed, deleting it unless
 // WithRemoveOnComplete(false) is set, in the file's next group commit round
 // Returns true only if exactly one processing row had this ack ID
-func (q *Queue) Acknowledge(ackID string) bool { return q.finish(ackID, q.ack) }
+func (q *Queue) Acknowledge(ackID string) bool {
+	return q.finish(ackID, contract.JobCompleted, "", nil)
+}
 
 // Reject marks a processing item as failed for good: it is not requeued.
 // The row is deleted, or with WithRemoveOnComplete(false) kept with status
-// 'failed'. Same group commit and result as Acknowledge.
-// ponytail: reason is not stored (no column); add one when something reads it.
-func (q *Queue) Reject(ackID string, reason string) bool { return q.finish(ackID, q.reject) }
+// 'failed'. reason is the error of the job's outcome. Same group commit and
+// result as Acknowledge.
+func (q *Queue) Reject(ackID string, reason string) bool {
+	return q.finish(ackID, contract.JobFailed, reason, nil)
+}
 
-// finish runs stmt (ack or reject) for the row of ackID.
-func (q *Queue) finish(ackID string, stmt *sql.Stmt) bool {
+// finish ends the processing row of ackID with state in the file's next
+// group commit round. A round of one runs in its own transaction: the row
+// and its outcome record commit together.
+func (q *Queue) finish(ackID string, state contract.JobState, reason string, result []byte) bool {
 	id, ok := parseAckID(ackID)
 	if !ok {
 		return false
 	}
 
-	now := time.Now().UTC()
-	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
-		var (
-			result sql.Result
-			err    error
-		)
-		s := stmt
-		if tx != nil {
-			s = tx.Stmt(s)
+	now := time.Now()
+	return q.f.b.do(func(tx *sql.Tx) (ok bool, err error) {
+		if tx == nil {
+			if tx, err = q.f.db.Begin(); err != nil {
+				return false, err
+			}
+			defer func() {
+				if err == nil {
+					err = tx.Commit()
+				} else {
+					tx.Rollback()
+				}
+				ok = ok && err == nil
+			}()
 		}
-		if q.removeOnComplete {
-			result, err = s.Exec(id)
-		} else {
-			result, err = s.Exec(now, id)
-		}
-		if err != nil {
-			return false, err
-		}
-
 		// No row is an outcome, not an error: it must not fail the round
-		n, err := result.RowsAffected()
-		return err == nil && n == 1, err
+		return q.end(tx, id, "", state, reason, result, now)
 	})
+}
+
+// end finishes processing row id with state, in tx: the row is deleted or
+// kept with state as status, and a job with a Job ID gets its outcome
+// record. jobID is the row's, when the caller knows it. Reports whether
+// the row was processing.
+func (q *Queue) end(tx *sql.Tx, id int64, jobID string, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
+	var row *sql.Row
+	if q.removeOnComplete {
+		row = tx.Stmt(q.fin).QueryRow(id)
+	} else {
+		row = tx.Stmt(q.fin).QueryRow(string(state), now.UTC(), id)
+	}
+	var (
+		once sql.NullString
+		data []byte
+	)
+	switch err := row.Scan(&once, &data); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if jobID == "" {
+		jobID = jobIDOf(once, data)
+	}
+	if jobID == "" {
+		return true, nil
+	}
+	return true, q.record(tx, jobID, state, reason, result, now)
 }
 
 // Len returns the number of pending items in the queue
@@ -543,17 +655,30 @@ func (q *Queue) Values() []any {
 	return items
 }
 
-// Purge removes all items from the queue
+// Purge removes all items from the queue, with its outcome records and
+// cancel marks (spec 6.6, 6.14)
 func (q *Queue) Purge() {
 	q.f.mu.Lock()
 	defer q.f.mu.Unlock()
 
-	q.f.db.Exec(fmt.Sprintf("DELETE FROM %s", q.table))
+	tx, err := q.f.db.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+	for _, t := range []string{q.table, q.jobs, q.cancelled} {
+		if _, err := tx.Exec("DELETE FROM " + t); err != nil {
+			return
+		}
+	}
+	tx.Commit()
 }
 
-// Close closes the queue and its database connection
+// Close closes the queue and drops its outcome watches and OnCancel hooks
+// without calling them. The database file stays open for the Queues.
 func (q *Queue) Close() error {
 	q.closed.Store(true)
+	q.w.close()
 
 	return nil
 }
