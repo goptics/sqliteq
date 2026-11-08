@@ -2100,3 +2100,20 @@ func TestVarmqPause(t *testing.T) {
 		t.Fatal("job did not run after the other process resumed")
 	}
 }
+
+// An older table's totals start from the rows it holds.
+func TestTotalsSeededFromRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	writeV023File(t, path, "q", false)
+	qs := mustNew(t, path, WithSingleFile())
+	defer qs.Close()
+	q, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows int64
+	q.f.db.QueryRow(`SELECT COUNT(*) FROM "q"`).Scan(&rows)
+	if s := stats(t, q); rows == 0 || s.Totals.Submitted != uint64(rows) {
+		t.Errorf("got %+v, want submitted %d", s.Totals, rows)
+	}
+}

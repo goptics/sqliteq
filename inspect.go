@@ -34,7 +34,11 @@ const metaSuffix = "__sqliteq_meta"
 func (q *Queue) initMeta() error {
 	for _, s := range []string{
 		`CREATE TABLE IF NOT EXISTS %[2]s (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
-		`INSERT OR IGNORE INTO %[2]s (key, value) VALUES ('submitted', 0), ('completed', 0), ('failed', 0)`,
+		// An older table starts from the rows it holds
+		`INSERT OR IGNORE INTO %[2]s (key, value) VALUES
+			('submitted', (SELECT COUNT(*) FROM %[1]s)),
+			('completed', (SELECT COUNT(*) FROM %[1]s WHERE status = 'completed')),
+			('failed', (SELECT COUNT(*) FROM %[1]s WHERE status IN ('failed', 'cancelled')))`,
 		`CREATE TRIGGER IF NOT EXISTS %[3]s AFTER INSERT ON %[1]s BEGIN
 			UPDATE %[2]s SET value = value + 1 WHERE key = 'submitted';
 		END`,
@@ -68,8 +72,8 @@ func (q *Queue) QueueID() string {
 // QueueStats implements contract.QueueInspector, in one statement (one
 // snapshot). Counts: rows per status, cancelled under failed. Totals:
 // adds stored and jobs finished (cancelled ones as failed; a waiting job
-// dropped for a cancel is neither) since the table was first opened by
-// this version or the last Purge. Paused is the file's, not the cache.
+// dropped for a cancel is neither) since the last Purge; an older table
+// starts from the rows it held. Paused is the file's, not the cache.
 // ponytail: counts scan the table; index status if kept rows grow large.
 func (q *Queue) QueueStats(ctx context.Context) (contract.QueueStats, error) {
 	if q.closed.Load() {
