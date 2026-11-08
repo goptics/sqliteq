@@ -2180,3 +2180,35 @@ func TestResumeBetweenPopAndRead(t *testing.T) {
 		}
 	}
 }
+
+// Completed, failed and cancelled pages sort by finish, not by add.
+func TestJobsNewestFinishFirst(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+	for _, id := range []string{"a", "b", "c", "d", "e", "f"} {
+		q.Enqueue(job(id))
+	}
+	acks := make([]string, 6)
+	for i := range acks {
+		_, acks[i] = pop(t, q)
+	}
+	q.Acknowledge(acks[1])
+	q.Acknowledge(acks[0])
+	q.Reject(acks[3], "x")
+	q.Reject(acks[2], "x")
+	q.AcknowledgeCancelled(acks[5], "x")
+	q.AcknowledgeCancelled(acks[4], "y")
+	if got := ids(jobs(t, q, contract.JobCompleted, 0, 10)); !slices.Equal(got, []string{"a", "b"}) {
+		t.Errorf("completed: got %q", got)
+	}
+	if got := ids(jobs(t, q, contract.JobFailed, 0, 10)); !slices.Equal(got, []string{"e", "f", "c", "d"}) {
+		t.Errorf("failed: got %q", got)
+	}
+	cancelled := jobs(t, q, contract.JobCancelled, 0, 10)
+	if got := ids(cancelled); !slices.Equal(got, []string{"e", "f"}) {
+		t.Fatalf("cancelled: got %q", got)
+	}
+	if e := cancelled[0]; e.State != contract.JobCancelled || len(e.Errors) != 1 || e.Errors[0].Error != "y" {
+		t.Errorf("cancelled job: got %+v", e)
+	}
+}

@@ -103,9 +103,9 @@ func (q *Queue) QueueStats(ctx context.Context) (contract.QueueStats, error) {
 }
 
 // Jobs implements contract.QueueInspector: pending in hand-out order,
-// processing by ack id, completed and failed (with cancelled, state
-// cancelled) newest finish first. Not counted by sqliteq: attempts are 0
-// pending, else 1; an ended row's start is lost. errors: one entry, from
+// processing by ack id, completed, failed (with cancelled, state
+// cancelled) and cancelled newest finish first. Not counted by sqliteq:
+// attempts are 0 pending, else 1; an ended row's start is lost. errors: one entry, from
 // the job's outcome record, when it has one.
 // ponytail: ended pages sort by updated_at unindexed; fine until kept rows
 // grow large.
@@ -120,6 +120,8 @@ func (q *Queue) Jobs(ctx context.Context, state contract.JobState, offset, limit
 		where, order = "status = 'completed'", "updated_at DESC, id DESC"
 	case contract.JobFailed:
 		where, order = "status IN ('failed', 'cancelled')", "updated_at DESC, id DESC"
+	case contract.JobCancelled:
+		where, order = "status = 'cancelled'", "updated_at DESC, id DESC"
 	default:
 		return nil, fmt.Errorf("sqliteq: unknown job state %q", state)
 	}
@@ -161,7 +163,7 @@ func (q *Queue) Jobs(ctx context.Context, state contract.JobState, offset, limit
 			j.StartedAt, j.Attempts = unixMilli(updated), 1
 		default:
 			j.FinishedAt, j.Attempts = unixMilli(updated), 1
-			if j.ID != "" && state == contract.JobFailed {
+			if j.ID != "" && state != contract.JobCompleted {
 				ended = append(ended, len(jobs))
 			}
 		}
