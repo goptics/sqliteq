@@ -29,12 +29,14 @@ type Queue struct {
 	closed           atomic.Bool
 
 	jobs, cancelled string       // quoted outcome and cancel mark tables
+	meta            string       // quoted totals table
+	id              string       // QueueID
 	w               watchers     // outcome watches and OnCancel hooks
 	records         atomic.Int64 // outcome records written, for trims
 
 	// Prepared once per handle; they close with the file's pool
 	insert, claim, pop, fin, count, countCapped, values *sql.Stmt
-	putJob, unmark, hasMark, isMarked                   *sql.Stmt
+	putJob, unmark, hasMark, isMarked, tally            *sql.Stmt
 }
 
 // claimed is one row a claim moved to processing
@@ -58,6 +60,8 @@ func newQueue(f *file, name string, priority bool, opts ...Option) (*Queue, erro
 		removeOnComplete: true, // Default to removing completed items
 		jobs:             quoteIdent(name + jobsSuffix),
 		cancelled:        quoteIdent(name + cancelledSuffix),
+		meta:             quoteIdent(name + metaSuffix),
+		id:               queueID(f.key, name, priority),
 	}
 	q.w.stop = make(chan struct{})
 	if priority {
@@ -99,6 +103,9 @@ func (q *Queue) initSchema() error {
 	}
 	if err := q.initSidecars(); err != nil {
 		return fmt.Errorf("failed to create outcome tables: %w", err)
+	}
+	if err := q.initMeta(); err != nil {
+		return fmt.Errorf("failed to create meta table: %w", err)
 	}
 	return nil
 }
@@ -241,6 +248,7 @@ func (q *Queue) prepare() (err error) {
 		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
 		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
 		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
+		{&q.tally, fmt.Sprintf("UPDATE %s SET value = value + 1 WHERE key = ?", q.meta)},
 	} {
 		if *s.stmt, err = q.f.db.Prepare(s.query); err != nil {
 			return err
@@ -252,7 +260,7 @@ func (q *Queue) prepare() (err error) {
 
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
-	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.hasMark, q.isMarked} {
+	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.hasMark, q.isMarked, q.tally} {
 		if s != nil {
 			s.Close()
 		}
@@ -614,7 +622,16 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 			}()
 		}
 		// No row is an outcome, not an error: it must not fail the round
-		return q.end(tx, id, "", state, reason, result, now)
+		if ok, err = q.end(tx, id, "", state, reason, result, now); !ok || err != nil {
+			return ok, err
+		}
+		// Totals: cancelled counts as failed (spec 6.14)
+		total := "failed"
+		if state == contract.JobCompleted {
+			total = "completed"
+		}
+		_, err = tx.Stmt(q.tally).Exec(total)
+		return err == nil, err
 	})
 }
 
@@ -680,8 +697,8 @@ func (q *Queue) Values() []any {
 	return items
 }
 
-// Purge removes all items from the queue, with its outcome records and
-// cancel marks (spec 6.6, 6.14)
+// Purge removes all items from the queue, with its outcome records, cancel
+// marks and totals (spec 6.6, 6.14)
 func (q *Queue) Purge() {
 	q.f.mu.Lock()
 	defer q.f.mu.Unlock()
@@ -695,6 +712,9 @@ func (q *Queue) Purge() {
 		if _, err := tx.Exec("DELETE FROM " + t); err != nil {
 			return
 		}
+	}
+	if _, err := tx.Exec("UPDATE " + q.meta + " SET value = 0 WHERE key <> 'paused_at'"); err != nil {
+		return
 	}
 	tx.Commit()
 }

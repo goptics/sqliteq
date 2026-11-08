@@ -2,12 +2,15 @@ package sqliteq
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1675,5 +1678,217 @@ func TestUndecodableEnvelopeIsPlainJob(t *testing.T) {
 	}
 	if n := countJobs(t, q); n != 0 {
 		t.Errorf("Expected no records, got %d", n)
+	}
+}
+
+// QueueID is sqliteq:<8 hex of the file's path>:fifo|prio:<name in lower
+// case>: one file agrees in every process, two files never collide.
+func TestQueueID(t *testing.T) {
+	dir := t.TempDir()
+	qs := mustNew(t, dir)
+	defer qs.Close()
+	q, _ := qs.NewQueue("Jobs")
+	pq, _ := qs.NewPriorityQueue("Prio")
+	sum := sha256.Sum256([]byte(q.f.key))
+	if want := "sqliteq:" + hex.EncodeToString(sum[:4]) + ":fifo:jobs"; q.QueueID() != want {
+		t.Errorf("got %q, want %q", q.QueueID(), want)
+	}
+	if id := pq.QueueID(); !strings.HasPrefix(id, "sqliteq:") || !strings.HasSuffix(id, ":prio:prio") {
+		t.Errorf("priority queue id %q", id)
+	}
+	if otherProcess(t, q).QueueID() != q.QueueID() {
+		t.Error("Expected one id for one file in every process")
+	}
+
+	// Same table name, other file
+	single := mustNew(t, filepath.Join(dir, "single.db"), WithSingleFile())
+	defer single.Close()
+	q2, _ := single.NewQueue("jobs")
+	if q2.QueueID() == q.QueueID() {
+		t.Error("Expected two files to have two ids")
+	}
+	if strings.Contains(q2.QueueID(), dir) {
+		t.Error("Expected no path in the id")
+	}
+}
+
+// stats reads QueueStats, failing on an error.
+func stats(t *testing.T, q *Queue) contract.QueueStats {
+	t.Helper()
+	s, err := q.QueueStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// QueueStats counts rows per state (cancelled under failed), totals every
+// add and finish, and survives no Purge; the default deletes ended rows.
+func TestQueueStats(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keep=%t", keep), func(t *testing.T) {
+			q, qs := openQueue(t, WithRemoveOnComplete(!keep))
+			defer qs.Close()
+			for _, id := range []string{"a", "b", "c", "d", "e"} {
+				q.Enqueue(job(id))
+			}
+			q.EnqueueOnce(job("f"), "f")
+			q.EnqueueOnce(job("f"), "f") // repeat: not submitted
+			q.CancelJob("d")
+
+			_, a := pop(t, q)
+			_, b := pop(t, q)
+			_, c := pop(t, q)
+			pop(t, q) // drops d (cancelled, in no total), hands out e
+			q.Acknowledge(a)
+			q.Reject(b, "boom")
+			q.AcknowledgeCancelled(c, "stop")
+
+			kept := int64(0)
+			if keep {
+				kept = 1
+			}
+			want := contract.QueueStats{
+				Counts: contract.JobCounts{Pending: 1, Processing: 1, Completed: kept, Failed: 3 * kept},
+				Totals: contract.JobTotals{Submitted: 6, Completed: 1, Failed: 2},
+			}
+			if got := stats(t, q); got != want {
+				t.Errorf("got %+v, want %+v", got, want)
+			}
+			if got := stats(t, otherProcess(t, q)); got != want {
+				t.Errorf("other process: got %+v, want %+v", got, want)
+			}
+
+			q.Purge()
+			if got := stats(t, q); got != (contract.QueueStats{}) {
+				t.Errorf("after Purge: got %+v", got)
+			}
+		})
+	}
+}
+
+// jobs reads one page of Jobs, failing on an error.
+func jobs(t *testing.T, q *Queue, state contract.JobState, offset, limit int) []contract.JobRecord {
+	t.Helper()
+	j, err := q.Jobs(context.Background(), state, offset, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+func ids(js []contract.JobRecord) []string {
+	out := make([]string, len(js))
+	for i, j := range js {
+		out[i] = j.ID
+	}
+	return out
+}
+
+// Jobs pages each state: pending in hand-out order, processing by ack id,
+// completed and failed (with cancelled) newest first; payload is the
+// envelope's data, verbatim.
+func TestJobs(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+	before := time.Now().UnixMilli()
+	q.Enqueue([]byte(`{"id":"a","status":"Created","data":{"n":1.000000000000001},"enqueued_at":7}`))
+	q.Enqueue([]byte("plain"))
+	q.Enqueue([]byte(`[1,2]`))
+	for _, id := range []string{"b", "c", "d", "e", "f"} {
+		q.Enqueue(job(id))
+	}
+	if got := ids(jobs(t, q, contract.JobPending, 0, 100)); !slices.Equal(got, []string{"a", "", "", "b", "c", "d", "e", "f"}) {
+		t.Fatalf("pending: got %q", got)
+	}
+	page := jobs(t, q, contract.JobPending, 0, 3)
+	if string(page[0].Payload) != `{"n":1.000000000000001}` || page[0].EnqueuedAt != 7 || page[0].Attempts != 0 || page[0].StartedAt != 0 {
+		t.Errorf("envelope: got %+v", page[0])
+	}
+	if string(page[1].Payload) != `"plain"` || page[1].EnqueuedAt < before {
+		t.Errorf("plain bytes: got %+v (enqueued_at from the row)", page[1])
+	}
+	if string(page[2].Payload) != `[1,2]` {
+		t.Errorf("JSON item: got %s", page[2].Payload)
+	}
+	if got := ids(jobs(t, q, contract.JobPending, 6, 5)); !slices.Equal(got, []string{"e", "f"}) {
+		t.Errorf("offset 6: got %q", got)
+	}
+
+	acks := map[string]string{}
+	for range 7 {
+		v, ack := pop(t, q)
+		acks[v] = ack
+	}
+	plainAck := acks["plain"]
+	q.Acknowledge(acks[`{"id":"a","status":"Created","data":{"n":1.000000000000001},"enqueued_at":7}`])
+	q.Reject(acks["plain"], "no id")
+	q.Reject(acks[string(job("b"))], "boom")
+	q.AcknowledgeCancelled(acks[string(job("c"))], "stopped")
+	q.Acknowledge(acks[string(job("d"))])
+
+	// A running job without an id shows its ack id
+	proc := jobs(t, q, contract.JobProcessing, 0, 10)
+	if got := ids(proc); !slices.Equal(got, []string{acks["[1,2]"], "e"}) {
+		t.Errorf("processing: got %q", got)
+	}
+	for _, j := range proc {
+		if j.State != contract.JobProcessing || j.Attempts != 1 || j.StartedAt < before || j.FinishedAt != 0 {
+			t.Errorf("processing job: got %+v", j)
+		}
+	}
+
+	if got := ids(jobs(t, q, contract.JobCompleted, 0, 10)); !slices.Equal(got, []string{"d", "a"}) {
+		t.Errorf("completed: got %q", got)
+	}
+	failed := jobs(t, q, contract.JobFailed, 0, 10)
+	if got := ids(failed); !slices.Equal(got, []string{"c", "b", plainAck}) {
+		t.Fatalf("failed: got %q", got)
+	}
+	if failed[0].State != contract.JobCancelled || len(failed[0].Errors) != 1 || failed[0].Errors[0].Error != "stopped" {
+		t.Errorf("cancelled: got %+v", failed[0])
+	}
+	if b := failed[1]; b.State != contract.JobFailed || b.FinishedAt < before || b.Attempts != 1 ||
+		!slices.Equal(b.Errors, []contract.JobError{{Attempt: 1, At: b.FinishedAt, Error: "boom"}}) {
+		t.Errorf("failed: got %+v", b)
+	}
+	if len(failed[2].Errors) != 0 {
+		t.Errorf("Expected no errors without an outcome record, got %+v", failed[2].Errors)
+	}
+	if got := ids(jobs(t, q, contract.JobFailed, 1, 1)); !slices.Equal(got, []string{"b"}) {
+		t.Errorf("failed page 2: got %q", got)
+	}
+
+	if j := jobs(t, q, contract.JobPending, 0, 0); j == nil || len(j) != 0 {
+		t.Errorf("limit 0: got %#v", j)
+	}
+	if _, err := q.Jobs(context.Background(), "bogus", 0, 10); err == nil {
+		t.Error("Expected an unknown state to fail")
+	}
+}
+
+// With the default WithRemoveOnComplete(true) ended jobs are not kept, so
+// their pages are empty.
+func TestJobsRemoveOnComplete(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Enqueue(job("a"))
+	_, ack := pop(t, q)
+	q.Acknowledge(ack)
+	if j := jobs(t, q, contract.JobCompleted, 0, 10); len(j) != 0 {
+		t.Errorf("got %+v", j)
+	}
+}
+
+// A closed queue answers stats and jobs with an error, as varmq lists it.
+func TestInspectClosed(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Close()
+	if _, err := q.QueueStats(context.Background()); err == nil {
+		t.Error("Expected QueueStats to fail on a closed queue")
+	}
+	if _, err := q.Jobs(context.Background(), contract.JobPending, 0, 1); err == nil {
+		t.Error("Expected Jobs to fail on a closed queue")
 	}
 }
