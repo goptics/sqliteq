@@ -399,21 +399,21 @@ func (q *Queue) claimGated(n int) (out []claimed, capped bool, err error) {
 	}
 	defer tx.Rollback()
 
-	claim := tx.Stmt(q.claim)
+	claim, isMarked := tx.Stmt(q.claim), tx.Stmt(q.isMarked)
 	out = make([]claimed, 0, n)
 	drops := 0
 	for len(out) < n && drops < maxDrops {
-		rows, err := q.claimRows(claim, n-len(out))
+		// No more than the drops left: a batch never passes the cap
+		rows, err := q.claimRows(claim, min(n-len(out), maxDrops-drops))
 		if err != nil {
 			return nil, false, err
 		}
 		if len(rows) == 0 {
 			break
 		}
-		// Every claimed row is handed out or dropped, so a batch may pass the cap
 		for _, c := range rows {
 			id := jobIDOf(c.once, c.data)
-			drop, err := q.marked(tx, id, now)
+			drop, err := marked(isMarked, id, now)
 			if err != nil {
 				return nil, false, err
 			}
@@ -471,33 +471,45 @@ func (q *Queue) Dequeue() (any, bool) {
 		data, _, err := popRow(q.pop)
 		return data, err == nil
 	}
+	for {
+		data, capped, err := q.popGated(now)
+		if err != nil || data != nil || !capped {
+			return data, err == nil && data != nil
+		}
+	}
+}
 
-	// Gated: a marked item is dropped (outcome cancelled) and the next one popped
+// popGated pops in one transaction, dropping each marked item it pops
+// (outcome cancelled), at most maxDrops; capped reports it stopped there
+// with nothing. The caller holds the write mutex.
+func (q *Queue) popGated(now time.Time) (data []byte, capped bool, err error) {
 	tx, err := q.f.db.Begin()
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 	defer tx.Rollback()
-	pop := tx.Stmt(q.pop)
+	pop, isMarked := tx.Stmt(q.pop), tx.Stmt(q.isMarked)
 	for range maxDrops {
 		data, once, err := popRow(pop)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, tx.Commit() // keep the drops
+		}
 		if err != nil {
-			break
+			return nil, false, err
 		}
 		id := jobIDOf(once, data)
-		drop, err := q.marked(tx, id, now)
+		drop, err := marked(isMarked, id, now)
 		if err != nil {
-			return nil, false
+			return nil, false, err
 		}
 		if !drop {
-			return data, tx.Commit() == nil
+			return data, false, tx.Commit()
 		}
 		if err := q.record(tx, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
-			return nil, false
+			return nil, false, err
 		}
 	}
-	tx.Commit() // keep the drops; an empty queue or the cap hands out nothing
-	return nil, false
+	return nil, true, tx.Commit()
 }
 
 // popRow runs a pop statement: the deleted row's data and job_id, or
@@ -514,11 +526,17 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 		return nil, false, ""
 	}
 
-	c, _, err := q.claimN(1)
-	if err != nil || len(c) == 0 {
-		return nil, false, ""
+	// A pop stopped at the drop cap has nothing yet: pop again, it can't
+	// report items left
+	for {
+		c, capped, err := q.claimN(1)
+		if err != nil || len(c) == 0 && !capped {
+			return nil, false, ""
+		}
+		if len(c) > 0 {
+			return c[0].data, true, strconv.FormatInt(c[0].id, 10)
+		}
 	}
-	return c[0].data, true, strconv.FormatInt(c[0].id, 10)
 }
 
 // DequeueBatchWithAckIds implements varmq.IBatchAcknowledgeable: it moves up

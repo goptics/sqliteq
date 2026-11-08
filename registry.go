@@ -150,6 +150,10 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 	}
 
 	key := foldName(name)
+	// A queue's indexes, sidecar tables and trigger are named <name>__sqliteq_*
+	if strings.Contains(key, "__sqliteq_") {
+		return nil, fmt.Errorf("sqliteq: queue name %q must not contain __sqliteq_", name)
+	}
 	if h, ok := f.handles[key]; ok {
 		if (h.pq != nil) != priority {
 			return nil, fmt.Errorf("sqliteq: %q is already open as a %s", name, h.kind())

@@ -92,13 +92,16 @@ func (q *Queue) AcknowledgeCancelled(ackID, reason string) bool {
 // cancel request made after the call, through any queue object on this
 // database file, until stop. Marks are polled every pollEvery; each call
 // runs on its own goroutine. A mark gone by the poll (the job finished or
-// was re-added) is never reported. A closed queue reports nothing.
+// was re-added) is never reported. A closed queue, or a failed first read,
+// reports nothing.
 func (q *Queue) OnCancel(fn func(jobID string)) (stop func()) {
 	// Read before the lock: a mark made after this read has a higher seq
 	var last sql.NullInt64
-	_ = q.f.db.QueryRow(fmt.Sprintf("SELECT MAX(seq) FROM %s", q.cancelled)).Scan(&last)
+	if err := q.f.db.QueryRow(fmt.Sprintf("SELECT MAX(seq) FROM %s", q.cancelled)).Scan(&last); err != nil {
+		return func() {} // 0 would replay every live mark
+	}
 
-	p := &fn
+	h := &cancelHook{fn: fn, from: last.Int64}
 	w := &q.w
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -106,51 +109,63 @@ func (q *Queue) OnCancel(fn func(jobID string)) (stop func()) {
 		return func() {}
 	}
 	if len(w.hooks) == 0 {
-		w.lastSeq = last.Int64
-		w.era++
+		w.lastSeq = h.from // no poll read marks for anyone since
 	}
 	if w.hooks == nil {
-		w.hooks = map[*func(string)]struct{}{}
+		w.hooks = map[*cancelHook]struct{}{}
 	}
-	w.hooks[p] = struct{}{}
+	w.hooks[h] = struct{}{}
 	w.startLocked(q)
 
 	return func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		delete(w.hooks, p)
+		delete(w.hooks, h)
 	}
 }
 
-// pollCancels passes the live marks newer than seq to hooks, a snapshot
-// taken in era.
-func (q *Queue) pollCancels(seq int64, era int, hooks []func(string)) {
+// cancelHook is one OnCancel callback; it gets marks with seq above from.
+type cancelHook struct {
+	fn   func(string)
+	from int64
+}
+
+// pollCancels reads the live marks newer than seq and passes each to the
+// hooks live after the read whose from is below it, so a hook added during
+// the read still gets its marks, and a stopped one gets none.
+func (q *Queue) pollCancels(seq int64) {
 	rows, err := q.f.db.Query(fmt.Sprintf("SELECT seq, job_id FROM %s WHERE seq > ? AND expires_at > ? ORDER BY seq LIMIT %d",
 		q.cancelled, maxDrops), seq, time.Now().UnixMilli())
 	if err != nil {
 		return
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if rows.Scan(&seq, &id) != nil {
-			continue
-		}
-		ids = append(ids, id)
+	type mark struct {
+		seq int64
+		id  string
 	}
-	if rows.Close() != nil || rows.Err() != nil {
+	var marks []mark
+	for rows.Next() {
+		var m mark
+		if rows.Scan(&m.seq, &m.id) == nil {
+			marks = append(marks, m)
+		}
+	}
+	if rows.Close() != nil || rows.Err() != nil || len(marks) == 0 {
 		return // read again from the old seq
 	}
 
 	w := &q.w
 	w.mu.Lock()
-	if w.era == era {
-		w.lastSeq = max(w.lastSeq, seq)
+	defer w.mu.Unlock()
+	if w.closed {
+		return
 	}
-	w.mu.Unlock()
-	for _, id := range ids {
-		for _, fn := range hooks {
-			go fn(id)
+	w.lastSeq = max(w.lastSeq, marks[len(marks)-1].seq)
+	for h := range w.hooks {
+		for _, m := range marks {
+			if m.seq > h.from {
+				go h.fn(m.id)
+			}
 		}
 	}
 }
@@ -165,12 +180,13 @@ func (q *Queue) anyMark(now time.Time) bool {
 	return n == 1
 }
 
-// marked reports whether job id has a live mark, in tx.
-func (q *Queue) marked(tx *sql.Tx, id string, now time.Time) (bool, error) {
+// marked reports whether job id has a live mark; isMarked is q.isMarked
+// in the caller's tx.
+func marked(isMarked *sql.Stmt, id string, now time.Time) (bool, error) {
 	if id == "" {
 		return false, nil
 	}
 	var n int
-	err := tx.Stmt(q.isMarked).QueryRow(id, now.UnixMilli()).Scan(&n)
+	err := isMarked.QueryRow(id, now.UnixMilli()).Scan(&n)
 	return n == 1, err
 }
