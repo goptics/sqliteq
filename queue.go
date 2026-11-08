@@ -19,6 +19,10 @@ import (
 // remainingCap bounds the pending count a batch pop reports
 const remainingCap = 256
 
+// afterEmptyPop runs between an empty pop outside a tx and its read of the
+// pause row; tests only.
+var afterEmptyPop = func() {}
+
 // Queue implements the Queue interface using SQLite as the storage backend
 type Queue struct {
 	f                *file
@@ -409,17 +413,23 @@ func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
 // runs in one transaction that drops each marked row it claims (outcome
 // cancelled) and claims again, at most maxDrops drops; capped reports that
 // it stopped there. An empty claim reads the pause row: refused when it is
-// set. The caller holds the write mutex.
-// ponytail: outside a tx a Pause and Resume from another process, both
-// between the claim and that read, make one empty pop look like a failure.
+// set. Outside a tx a Resume from another process can land between the two,
+// so an empty claim found unpaused claims once more. The caller holds the
+// write mutex.
+// ponytail: a second Pause and Resume, both in the window again, still make
+// one empty pop look like a failure.
 func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err error) {
 	now := time.Now()
 	if !q.anyMark(now) {
-		if out, err = q.claimRows(q.claim, n); err != nil || len(out) > 0 {
-			return out, false, false, err
+		for try := range 2 {
+			if out, err = q.claimRows(q.claim, n); err != nil || len(out) > 0 {
+				return out, false, false, err
+			}
+			afterEmptyPop()
+			if refused, err = readPaused(q.pausedAt); err != nil || refused || try == 1 {
+				return nil, false, refused, err
+			}
 		}
-		refused, err = readPaused(q.pausedAt)
-		return nil, false, refused, err
 	}
 
 	tx, err := q.f.db.Begin()
@@ -510,15 +520,21 @@ func (q *Queue) Dequeue() (any, bool) {
 }
 
 // dequeue is Dequeue under the write mutex; an empty pop reads the pause
-// row, refused when it is set.
+// row, refused when it is set, and pops once more when it is not (see
+// claimGated).
 func (q *Queue) dequeue() (data []byte, ok, refused bool) {
 	now := time.Now()
 	if !q.anyMark(now) {
-		data, _, err := popRow(q.pop)
-		if errors.Is(err, sql.ErrNoRows) {
-			refused, _ = readPaused(q.pausedAt)
+		for try := range 2 {
+			data, _, err := popRow(q.pop)
+			if !errors.Is(err, sql.ErrNoRows) {
+				return data, err == nil, false
+			}
+			afterEmptyPop()
+			if refused, err = readPaused(q.pausedAt); err != nil || refused || try == 1 {
+				return nil, false, refused
+			}
 		}
-		return data, err == nil, refused
 	}
 	for {
 		data, capped, refused, err := q.popGated(now)

@@ -2145,3 +2145,38 @@ func TestPauseHookStopAndStaleRefusal(t *testing.T) {
 		t.Errorf("hooks: got %v", calls)
 	}
 }
+
+// A Resume from another process between an empty pop and its read of the
+// pause row is not a failed pop: the pop goes again and hands out the item.
+func TestResumeBetweenPopAndRead(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	other := otherProcess(t, q)
+	t.Cleanup(func() { afterEmptyPop = func() {} })
+	pops := []struct {
+		name string
+		pop  func() bool
+	}{
+		{"Dequeue", func() bool { _, ok := q.Dequeue(); return ok }},
+		{"DequeueWithAckId", func() bool { _, ok, _ := q.DequeueWithAckId(); return ok }},
+		{"DequeueBatchWithAckIds", func() bool {
+			n, _, _ := q.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
+			return n == 1
+		}},
+	}
+	for _, p := range pops {
+		q.Enqueue([]byte(p.name))
+		if err := other.Pause(); err != nil {
+			t.Fatal(err)
+		}
+		afterEmptyPop = func() {
+			afterEmptyPop = func() {}
+			if err := other.Resume(); err != nil {
+				t.Error(err)
+			}
+		}
+		if !p.pop() {
+			t.Errorf("%s: Expected the item after the Resume", p.name)
+		}
+	}
+}
