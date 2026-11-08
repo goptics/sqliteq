@@ -9,7 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `Reject(ackID, reason)` on `Queue` and `PriorityQueue`, required by varmq's `IAcknowledgeable` since varmq#173: finishes an item that failed for good, never requeued. Deleted like an ack, or with `WithRemoveOnComplete(false)` kept with `status` `failed`. Same group commit as `Acknowledge`. The reason is not stored.
+- `Reject(ackID, reason)` on `Queue` and `PriorityQueue`, required by varmq's `IAcknowledgeable` since varmq#173: finishes an item that failed for good, never requeued. Deleted like an ack, or with `WithRemoveOnComplete(false)` kept with `status` `failed`. Same group commit as `Acknowledge`. The reason is the job's outcome error.
+- Job outcome (varmq spec 6.13): `WatchOutcome` (`contract.OutcomeWatcher`) and `AcknowledgeResult` (`contract.ResultAcknowledgeable`) on both queues. A job with a Job ID (`EnqueueOnce` id, else the item's JSON `id`) gets a record in `<name>__sqliteq_jobs` when it ends, same transaction as the finish. Watches poll it every 50 ms, from any queue object on the file, any process. Retention: completed 1000 / 24 h, failed and cancelled 10000 / 7 d.
+- Job cancel (varmq spec 6.14): `CancelJob`, `OnCancel`, `AcknowledgeCancelled` (`contract.JobCanceller`, `CancelNotifier`, `CancelAcknowledgeable`). Marks in `<name>__sqliteq_cancelled`, 24 h each. Every pop drops a marked waiting job (outcome `cancelled`, at most 1000 per pop); `OnCancel` polls new marks. `ErrJobEnded` when the record shows it ended.
+- `EnqueueOnce` that stores an id drops its old record and mark (trigger). `Purge` clears records and marks too. `Queue.Close` drops watches and hooks.
+
+### Changed
+
+- Requires Go 1.27 (varmq dependency). Transactions begin `IMMEDIATE`. A finish (`Acknowledge`, `Reject`) always runs in a transaction; a pop runs in one while any cancel mark is live.
 
 ## [0.3.0] - 2026-10-23
 
