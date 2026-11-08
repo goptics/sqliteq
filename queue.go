@@ -364,12 +364,12 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 
 // claimN moves up to n pending rows to processing in one statement and
 // returns them in queue order
-func (q *Queue) claimN(n int) ([]claimed, error) {
+func (q *Queue) claimN(n int) ([]claimed, bool, error) {
 	q.f.mu.Lock()
-	out, err := q.claimGated(n)
+	out, capped, err := q.claimGated(n)
 	q.f.mu.Unlock()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// RETURNING order is unspecified
@@ -379,33 +379,35 @@ func (q *Queue) claimN(n int) ([]claimed, error) {
 		}
 		return cmp.Compare(a.id, b.id)
 	})
-	return out, nil
+	return out, capped, nil
 }
 
 // claimGated claims up to n rows; with a live cancel mark on the file it
 // runs in one transaction that drops each marked row it claims (outcome
-// cancelled) and claims again, at most maxDrops drops. The caller holds the
-// write mutex.
-func (q *Queue) claimGated(n int) ([]claimed, error) {
+// cancelled) and claims again, at most maxDrops drops; capped reports that
+// it stopped there. The caller holds the write mutex.
+func (q *Queue) claimGated(n int) (out []claimed, capped bool, err error) {
 	now := time.Now()
 	if !q.anyMark(now) {
-		return q.claimRows(q.claim, n)
+		out, err = q.claimRows(q.claim, n)
+		return out, false, err
 	}
 
 	tx, err := q.f.db.Begin()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer tx.Rollback()
 
 	claim := tx.Stmt(q.claim)
-	out := make([]claimed, 0, n)
-	for drops := 0; len(out) < n && drops < maxDrops; {
+	out = make([]claimed, 0, n)
+	drops := 0
+	for len(out) < n && drops < maxDrops {
 		rows, err := q.claimRows(claim, n-len(out))
-		if err != nil || len(rows) == 0 {
-			if err != nil {
-				return nil, err
-			}
+		if err != nil {
+			return nil, false, err
+		}
+		if len(rows) == 0 {
 			break
 		}
 		// Every claimed row is handed out or dropped, so a batch may pass the cap
@@ -413,19 +415,19 @@ func (q *Queue) claimGated(n int) ([]claimed, error) {
 			id := jobIDOf(c.once, c.data)
 			drop, err := q.marked(tx, id, now)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if !drop {
 				out = append(out, c)
 				continue
 			}
 			if _, err := q.end(tx, c.id, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			drops++
 		}
 	}
-	return out, tx.Commit()
+	return out, len(out) < n && drops >= maxDrops, tx.Commit()
 }
 
 // claimRows runs a claim statement and reads every row it returns; the
@@ -512,7 +514,7 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 		return nil, false, ""
 	}
 
-	c, err := q.claimN(1)
+	c, _, err := q.claimN(1)
 	if err != nil || len(c) == 0 {
 		return nil, false, ""
 	}
@@ -530,12 +532,17 @@ func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaini
 		return 0, 0, nil
 	}
 
-	c, err := q.claimN(want)
+	c, capped, err := q.claimN(want)
 	if err != nil {
 		return 0, 0, err
 	}
+	// At the drop cap items may wait still: report one, so the caller pops again
+	left := 0
+	if capped {
+		left = 1
+	}
 	if len(c) == 0 {
-		return 0, 0, nil
+		return 0, left, nil
 	}
 	for i, row := range c {
 		items[i], ackIDs[i] = row.data, strconv.FormatInt(row.id, 10)
@@ -546,7 +553,7 @@ func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaini
 	if err := q.countCapped.QueryRow().Scan(&remaining); err != nil {
 		return len(c), 1, nil
 	}
-	return len(c), remaining, nil
+	return len(c), max(remaining, left), nil
 }
 
 // Acknowledge marks a processing item as completed, deleting it unless

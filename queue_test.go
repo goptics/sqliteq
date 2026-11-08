@@ -1340,3 +1340,27 @@ func TestVarmqRemoteResultAndCancel(t *testing.T) {
 		}
 	}
 }
+
+// A pop drops at most maxDrops marked items; at the cap it reports items
+// left, and the next pop goes on.
+func TestCancelDropCap(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	for i := range maxDrops {
+		id := "m" + strconv.Itoa(i)
+		q.Enqueue(job(id))
+		q.CancelJob(id)
+	}
+	q.Enqueue([]byte("plain"))
+
+	items, acks := make([]any, 1), make([]string, 1)
+	if n, left, err := q.DequeueBatchWithAckIds(items, acks); err != nil || n != 0 || left != 1 {
+		t.Fatalf("at the cap: got n=%d left=%d err=%v, want 0, 1", n, left, err)
+	}
+	if v, _ := pop(t, q); v != "plain" {
+		t.Errorf("got %s, want plain", v)
+	}
+	if n := countJobs(t, q); n != maxDrops {
+		t.Errorf("Expected %d cancelled records, got %d", maxDrops, n)
+	}
+}

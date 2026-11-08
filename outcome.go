@@ -164,6 +164,7 @@ type watchers struct {
 	byID    map[string]map[*outcomeWatch]struct{}
 	hooks   map[*func(string)]struct{}
 	lastSeq int64 // newest cancel mark seq OnCancel has seen
+	era     int   // bumped when OnCancel resets lastSeq; a poll from an older era must not advance it
 	polling bool
 	closed  bool
 	stop    chan struct{} // closed by close
@@ -264,14 +265,14 @@ func (q *Queue) poll() {
 		for fn := range w.hooks {
 			hooks = append(hooks, *fn)
 		}
-		seq := w.lastSeq
+		seq, era := w.lastSeq, w.era
 		w.mu.Unlock()
 
 		if len(ids) > 0 {
 			q.catchUp(ids)
 		}
 		if len(hooks) > 0 {
-			q.pollCancels(seq, hooks)
+			q.pollCancels(seq, era, hooks)
 		}
 	}
 }

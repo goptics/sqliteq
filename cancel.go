@@ -107,6 +107,7 @@ func (q *Queue) OnCancel(fn func(jobID string)) (stop func()) {
 	}
 	if len(w.hooks) == 0 {
 		w.lastSeq = last.Int64
+		w.era++
 	}
 	if w.hooks == nil {
 		w.hooks = map[*func(string)]struct{}{}
@@ -121,8 +122,9 @@ func (q *Queue) OnCancel(fn func(jobID string)) (stop func()) {
 	}
 }
 
-// pollCancels passes the live marks newer than seq to hooks.
-func (q *Queue) pollCancels(seq int64, hooks []func(string)) {
+// pollCancels passes the live marks newer than seq to hooks, a snapshot
+// taken in era.
+func (q *Queue) pollCancels(seq int64, era int, hooks []func(string)) {
 	rows, err := q.f.db.Query(fmt.Sprintf("SELECT seq, job_id FROM %s WHERE seq > ? AND expires_at > ? ORDER BY seq LIMIT %d",
 		q.cancelled, maxDrops), seq, time.Now().UnixMilli())
 	if err != nil {
@@ -142,7 +144,9 @@ func (q *Queue) pollCancels(seq int64, hooks []func(string)) {
 
 	w := &q.w
 	w.mu.Lock()
-	w.lastSeq = max(w.lastSeq, seq)
+	if w.era == era {
+		w.lastSeq = max(w.lastSeq, seq)
+	}
 	w.mu.Unlock()
 	for _, id := range ids {
 		for _, fn := range hooks {

@@ -14,9 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Job cancel (varmq spec 6.14): `CancelJob`, `OnCancel`, `AcknowledgeCancelled` (`contract.JobCanceller`, `CancelNotifier`, `CancelAcknowledgeable`). Marks in `<name>__sqliteq_cancelled`, 24 h each. Every pop drops a marked waiting job (outcome `cancelled`, at most 1000 per pop); `OnCancel` polls new marks. `ErrJobEnded` when the record shows it ended.
 - `EnqueueOnce` that stores an id drops its old record and mark (trigger). `Purge` clears records and marks too. `Queue.Close` drops watches and hooks.
 
+### Breaking
+
+- Requires Go 1.27 (was 1.24), for the varmq dependency.
+
 ### Changed
 
-- Requires Go 1.27 (varmq dependency). Transactions begin `IMMEDIATE`. A finish (`Acknowledge`, `Reject`) always runs in a transaction; a pop runs in one while any cancel mark is live.
+- Transactions begin `IMMEDIATE`. A finish (`Acknowledge`, `Reject`) always runs in a transaction; a pop runs in one while any cancel mark is live.
 
 ## [0.3.0] - 2026-10-23
 
