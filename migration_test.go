@@ -129,6 +129,12 @@ func TestMigrateV02File(t *testing.T) {
 				if got := indexNames(t, db, name); fmt.Sprint(got) != fmt.Sprint(want) {
 					t.Errorf("Round %d: indexes = %v, want %v", round, got, want)
 				}
+				for _, side := range []string{name + jobsSuffix, name + cancelledSuffix, name + readdSuffix} {
+					var n int
+					if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name = ?", side).Scan(&n); err != nil || n != 1 {
+						t.Errorf("Round %d: expected %s on the old file, got %d %v", round, side, n, err)
+					}
+				}
 
 				if round == 1 {
 					// The two processing rows are pending again after recovery

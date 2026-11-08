@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1052,8 +1053,11 @@ func TestWatchEndedBeforeAndCancel(t *testing.T) {
 	noOutcome(t, ch)
 
 	q.Close()
-	q.WatchOutcome("early", func(o contract.JobOutcome) { ch <- o })()
+	q.WatchOutcome("early", func(o contract.JobOutcome) { ch <- o })
 	noOutcome(t, ch)
+	if err := q.CancelJob("x"); !errors.Is(err, errClosed) {
+		t.Errorf("CancelJob on a closed queue: got %v, want errClosed", err)
+	}
 }
 
 // Two queue objects on one file, as two processes: each learns of jobs the
@@ -1246,15 +1250,34 @@ func TestOnCancel(t *testing.T) {
 	}
 }
 
-// Retention trims each state group by age and count.
+// Retention trims each state group by age and count; the count limit
+// spares records younger than trimFloor; a queue object's first record
+// trims.
 func TestOutcomeRetention(t *testing.T) {
 	q, qs := openQueue(t)
 	defer qs.Close()
 	now := time.Now()
-	tx, _ := q.f.db.Begin()
-	for i := range keepCompleted + 5 {
-		tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES (?, 'completed', ?)", "c"+strconv.Itoa(i), now.UnixMilli()+int64(i))
+	insert := func(tx *sql.Tx, prefix string, n int, at time.Time) {
+		for i := range n {
+			if _, err := tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES (?, 'completed', ?)", prefix+strconv.Itoa(i), at.UnixMilli()+int64(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
+
+	tx, _ := q.f.db.Begin()
+	insert(tx, "fresh", keepCompleted+5, now)
+	if err := q.trim(tx, now); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+	if n := countJobs(t, q); n != keepCompleted+5 {
+		t.Fatalf("Expected records younger than trimFloor kept, got %d", n)
+	}
+	q.f.db.Exec("DELETE FROM " + q.jobs)
+
+	tx, _ = q.f.db.Begin()
+	insert(tx, "c", keepCompleted+5, now.Add(-2*trimFloor))
 	tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES ('old', 'failed', ?)", now.Add(-keepFailedAge).UnixMilli())
 	tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES ('new', 'cancelled', ?)", now.UnixMilli())
 	if err := q.trim(tx, now); err != nil {
@@ -1268,6 +1291,17 @@ func TestOutcomeRetention(t *testing.T) {
 	q.f.db.QueryRow("SELECT job_id FROM " + q.jobs + " WHERE state = 'completed' ORDER BY finished_at LIMIT 1").Scan(&oldest)
 	if oldest != "c5" {
 		t.Errorf("Expected the 5 oldest completed trimmed, oldest left %s", oldest)
+	}
+
+	q2 := otherProcess(t, q) // records counter at 0
+	q2.f.db.Exec("UPDATE "+q.jobs+" SET finished_at = ? WHERE job_id = 'c5'", now.Add(-keepCompletedAge).UnixMilli())
+	q2.Enqueue(job("one"))
+	_, ack := pop(t, q2)
+	q2.Acknowledge(ack)
+	var n int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.jobs + " WHERE job_id = 'c5'").Scan(&n)
+	if n != 0 {
+		t.Error("Expected a queue object's first record to trim")
 	}
 }
 
@@ -1362,5 +1396,221 @@ func TestCancelDropCap(t *testing.T) {
 	}
 	if n := countJobs(t, q); n != maxDrops {
 		t.Errorf("Expected %d cancelled records, got %d", maxDrops, n)
+	}
+}
+
+// Queues.Close stops polls and drops live watches and hooks without
+// calling them.
+func TestCloseDropsWatchesAndHooks(t *testing.T) {
+	q, qs := openQueue(t)
+	q2 := otherProcess(t, q)
+	ch := watch(q, "w")
+	ids := make(chan string, 1)
+	q.OnCancel(func(id string) { ids <- id })
+	if err := qs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-q.w.stop:
+	default:
+		t.Fatal("Expected Close to stop the poll")
+	}
+	q2.Enqueue(job("w"))
+	_, ack := pop(t, q2)
+	q2.Acknowledge(ack)
+	q2.CancelJob("c")
+	noOutcome(t, ch)
+	select {
+	case id := <-ids:
+		t.Errorf("hook called after Close with %q", id)
+	default:
+	}
+	if stop := q.OnCancel(func(string) { t.Error("hook on a closed queue") }); stop == nil {
+		t.Error("Expected a stop func")
+	}
+}
+
+// A hook added while a poll reads gets the marks made after its call; a
+// stopped hook gets none; a mark whose job finished (stale) reaches nobody.
+func TestOnCancelHooksDuringPoll(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	a, b := make(chan string, 4), make(chan string, 4)
+	stopA := q.OnCancel(func(id string) { a <- id })
+	q.w.mu.Lock()
+	seq := q.w.lastSeq // a poll's snapshot, taken before B
+	q.w.mu.Unlock()
+	q.CancelJob("before-b")
+	stopB := q.OnCancel(func(id string) { b <- id })
+	q.CancelJob("x")
+	q.pollCancels(seq)
+
+	// The queue's own poll may report a mark too: compare distinct ids
+	got := func(ch chan string) []string {
+		var ids []string
+		for {
+			select {
+			case id := <-ch:
+				ids = append(ids, id)
+			case <-time.After(4 * pollEvery):
+				slices.Sort(ids)
+				return slices.Compact(ids)
+			}
+		}
+	}
+	if ids := got(a); !slices.Equal(ids, []string{"before-b", "x"}) {
+		t.Errorf("hook A: got %v", ids)
+	}
+	if ids := got(b); !slices.Equal(ids, []string{"x"}) {
+		t.Errorf("hook B: got %v, want only the mark after its call", ids)
+	}
+
+	var xSeq int64
+	q.f.db.QueryRow("SELECT seq FROM " + q.cancelled + " WHERE job_id = 'x'").Scan(&xSeq)
+	stopA()
+	q.Enqueue(job("y"))
+	_, ack := pop(t, q)
+	q.CancelJob("y")
+	q.Acknowledge(ack) // the finish drops the mark: stale
+	q.CancelJob("z")
+	q.pollCancels(xSeq)
+	if ids := got(a); len(ids) != 0 {
+		t.Errorf("stopped hook got %v", ids)
+	}
+	if ids := got(b); !slices.Equal(ids, []string{"z"}) {
+		t.Errorf("hook B: got %v, want z only (y is stale)", ids)
+	}
+	stopB()
+}
+
+// A repeat CancelJob gets a new seq and expiry, so hooks hear it again.
+func TestCancelRepeatRenotifies(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	ids := make(chan string, 4)
+	defer q.OnCancel(func(id string) { ids <- id })()
+	read := func() (seq, exp int64) {
+		q.f.db.QueryRow("SELECT seq, expires_at FROM "+q.cancelled+" WHERE job_id = 'x'").Scan(&seq, &exp)
+		return
+	}
+	for i := range 2 {
+		q.CancelJob("x")
+		select {
+		case <-ids:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("cancel %d not reported", i+1)
+		}
+		if i == 0 {
+			s1, e1 := read()
+			time.Sleep(2 * time.Millisecond)
+			defer func() {
+				if s2, e2 := read(); s2 <= s1 || e2 <= e1 {
+					t.Errorf("Expected a new seq and expiry: %d,%d -> %d,%d", s1, e1, s2, e2)
+				}
+			}()
+		}
+	}
+}
+
+// A gated Dequeue that drops the last item returns empty and keeps the
+// drop; the mark is gone after it.
+func TestDequeueGatedEmpty(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Enqueue(job("x"))
+	q.CancelJob("x")
+	ch := watch(q, "x")
+	if v, ok := q.Dequeue(); ok {
+		t.Fatalf("got %v", v)
+	}
+	if got := waitOutcome(t, ch); got.State != contract.JobCancelled {
+		t.Errorf("got %+v", got)
+	}
+	var marks int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.cancelled).Scan(&marks)
+	if q.Len() != 0 || marks != 0 {
+		t.Errorf("Expected no item and no mark, got %d and %d", q.Len(), marks)
+	}
+}
+
+// With WithRemoveOnComplete(false) each end keeps its row with its status,
+// and the record keeps the result.
+func TestKeptRowEnds(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+	q.Enqueue(job("r"))
+	q.Enqueue(job("c"))
+	_, ackR := pop(t, q)
+	_, ackC := pop(t, q)
+	if !q.AcknowledgeResult(ackR, []byte(`"ok"`)) || !q.AcknowledgeCancelled(ackC, "stop") {
+		t.Fatal("finish failed")
+	}
+	if countRows(t, q.f.db, "status = 'completed'") != 1 || countRows(t, q.f.db, "status = 'cancelled'") != 1 {
+		t.Error("Expected one completed and one cancelled row")
+	}
+	if got := waitOutcome(t, watch(q, "r")); string(got.Result) != `"ok"` {
+		t.Errorf("got %+v", got)
+	}
+	if got := waitOutcome(t, watch(q, "c")); got.State != contract.JobCancelled || got.Error != "stop" {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// A read reaches only watches started before it: an earlier run's record,
+// read before a re-add, never ends a watch made after.
+func TestDeliverSkipsNewerWatches(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	ch := watch(q, "x")
+	q.w.mu.Lock()
+	gen := q.w.gen
+	q.w.mu.Unlock()
+	q.deliver(contract.JobOutcome{ID: "x", State: contract.JobCompleted}, gen-1)
+	noOutcome(t, ch)
+	q.deliver(contract.JobOutcome{ID: "x", State: contract.JobCompleted}, gen)
+	waitOutcome(t, ch)
+}
+
+// Every watch fires when far more jobs end between two polls than
+// retention keeps, and more ids are watched than one read used to take.
+func TestWatchBurst(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q2 := otherProcess(t, q)
+	const n = 3 * keepCompleted
+	var fired atomic.Int64
+	done := make(chan struct{})
+	for i := range n {
+		id := "b" + strconv.Itoa(i)
+		q.WatchOutcome(id, func(contract.JobOutcome) {
+			if fired.Add(1) == n {
+				close(done)
+			}
+		})
+		q.Enqueue(job(id))
+	}
+	items, acks := make([]any, 500), make([]string, 500)
+	for {
+		k, _, err := q2.DequeueBatchWithAckIds(items, acks)
+		if err != nil || k == 0 {
+			break
+		}
+		for _, a := range acks[:k] {
+			q2.Acknowledge(a)
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("%d of %d watches fired", fired.Load(), n)
+	}
+}
+
+// Queue names may not hold __sqliteq_, which names a queue's own tables.
+func TestReservedQueueName(t *testing.T) {
+	qs := mustNew(t, filepath.Join(t.TempDir(), "one.db"), WithSingleFile())
+	defer qs.Close()
+	if _, err := qs.NewQueue("orders__sqliteq_jobs"); err == nil {
+		t.Error("Expected a reserved name to fail")
 	}
 }
