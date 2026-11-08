@@ -1397,6 +1397,42 @@ func TestCancelDropCap(t *testing.T) {
 	if n := countJobs(t, q); n != maxDrops {
 		t.Errorf("Expected %d cancelled records, got %d", maxDrops, n)
 	}
+
+	// Single-item pops can't report items left: past the cap they pop again
+	for _, p := range []struct {
+		name string
+		pop  func() (any, bool)
+	}{
+		{"DequeueWithAckId", func() (any, bool) { v, ok, _ := q.DequeueWithAckId(); return v, ok }},
+		{"Dequeue", q.Dequeue},
+	} {
+		for i := range maxDrops + 1 {
+			id := p.name + strconv.Itoa(i)
+			q.Enqueue(job(id))
+			q.CancelJob(id)
+		}
+		q.Enqueue([]byte("plain"))
+		if v, ok := p.pop(); !ok || string(v.([]byte)) != "plain" {
+			t.Errorf("%s past the cap: got %v %v, want plain", p.name, v, ok)
+		}
+	}
+}
+
+// sweep trims records past their age and drops expired marks.
+func TestSweep(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	old := time.Now().Add(-keepFailedAge).UnixMilli()
+	q.f.db.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES ('old', 'failed', ?)", old)
+	q.f.db.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES ('new', 'failed', ?)", time.Now().UnixMilli())
+	q.f.db.Exec("INSERT INTO "+q.cancelled+" (job_id, expires_at) VALUES ('gone', ?)", old)
+	q.CancelJob("live")
+	q.sweep()
+	var marks int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.cancelled).Scan(&marks)
+	if countJobs(t, q) != 1 || marks != 1 {
+		t.Errorf("Expected 1 record and 1 mark left, got %d and %d", countJobs(t, q), marks)
+	}
 }
 
 // Queues.Close stops polls and drops live watches and hooks without
