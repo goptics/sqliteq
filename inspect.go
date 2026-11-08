@@ -28,7 +28,7 @@ var (
 const metaSuffix = "__sqliteq_meta"
 
 // initMeta creates the meta table (key -> integer: the totals submitted,
-// completed, failed) and the trigger that counts
+// completed, failed; paused_at while paused) and the trigger that counts
 // stored adds; a repeat EnqueueOnce stores no row, so fires none. The
 // caller holds the write mutex.
 func (q *Queue) initMeta() error {

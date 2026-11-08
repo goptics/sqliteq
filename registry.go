@@ -186,6 +186,7 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 
 	if !f.recovered[key] {
 		if err := h.queue().requeueNoAck(); err != nil {
+			h.queue().Close() // stops a pause poll
 			return nil, fmt.Errorf("failed to requeue unacknowledged rows: %w", err)
 		}
 		f.recovered[key] = true

@@ -172,7 +172,8 @@ type outcomeWatch struct {
 }
 
 // watchers are a queue object's outcome watches and OnCancel hooks, and the
-// state of its one poll goroutine. mu is never held across a query.
+// state of its one poll goroutine, which also polls the pause. mu is never
+// held across a query.
 type watchers struct {
 	mu      sync.Mutex
 	byID    map[string]map[*outcomeWatch]struct{}
@@ -267,8 +268,9 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 	}
 }
 
-// poll reads new outcome records and cancel marks every pollEvery, and
-// sweeps every sweepEvery, until Close or until nothing is watched.
+// poll reads new outcome records, cancel marks and, while the cache says
+// paused, the pause row every pollEvery, and sweeps every sweepEvery,
+// until Close or until nothing is watched and the cache says running.
 func (q *Queue) poll() {
 	t := time.NewTicker(pollEvery)
 	defer t.Stop()
@@ -282,7 +284,8 @@ func (q *Queue) poll() {
 		}
 
 		w.mu.Lock()
-		if len(w.byID) == 0 && len(w.hooks) == 0 {
+		paused := q.pz.paused.Load()
+		if len(w.byID) == 0 && len(w.hooks) == 0 && !paused {
 			w.polling = false
 			w.mu.Unlock()
 			return
@@ -296,6 +299,9 @@ func (q *Queue) poll() {
 		}
 		if hooks {
 			q.pollCancels(seq)
+		}
+		if paused {
+			q.pollPause()
 		}
 		if time.Since(swept) >= sweepEvery {
 			swept = time.Now()

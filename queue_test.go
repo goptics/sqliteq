@@ -1892,3 +1892,211 @@ func TestInspectClosed(t *testing.T) {
 		t.Error("Expected Jobs to fail on a closed queue")
 	}
 }
+
+func TestImplementsPause(t *testing.T) {
+	var (
+		_ varmq.QueuePauser    = (*Queue)(nil)
+		_ varmq.QueuePauser    = (*PriorityQueue)(nil)
+		_ varmq.PauseNotifier  = (*Queue)(nil)
+		_ varmq.PauseNotifier  = (*PriorityQueue)(nil)
+		_ varmq.QueueInspector = (*Queue)(nil)
+		_ varmq.QueueInspector = (*PriorityQueue)(nil)
+	)
+}
+
+// refusedPops checks that every pop kind hands out nothing and reports a
+// pause.
+func refusedPops(t *testing.T, q *Queue) {
+	t.Helper()
+	before := q.PauseRefusals()
+	if _, ok := q.Dequeue(); ok {
+		t.Error("Dequeue handed out an item while paused")
+	}
+	if _, ok, _ := q.DequeueWithAckId(); ok {
+		t.Error("DequeueWithAckId handed out an item while paused")
+	}
+	items, acks := make([]any, 4), make([]string, 4)
+	if n, rem, err := q.DequeueBatchWithAckIds(items, acks); n != 0 || rem != 0 || err != nil {
+		t.Errorf("batch pop while paused: got %d %d %v", n, rem, err)
+	}
+	if got := q.PauseRefusals() - before; got != 3 {
+		t.Errorf("Expected 3 refusals, got %d", got)
+	}
+	if !q.Paused() {
+		t.Error("Expected a refused pop to leave Paused true")
+	}
+}
+
+// Pause stops every pop, keeps its first time, and is kept in the file;
+// Resume lets pops go on. Hooks hear each change once.
+func TestPause(t *testing.T) {
+	for _, marked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("marked=%t", marked), func(t *testing.T) {
+			q, qs := openQueue(t)
+			defer qs.Close()
+			if marked {
+				q.CancelJob("other") // gated pops
+			}
+			var calls []bool
+			var mu sync.Mutex
+			stop := q.OnPauseChange(func(p bool) {
+				mu.Lock()
+				calls = append(calls, p)
+				mu.Unlock()
+			})
+			defer stop()
+			enqueueN(t, q, 3)
+
+			if q.Paused() {
+				t.Fatal("Expected a new queue to run")
+			}
+			if err := q.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			first := stats(t, q)
+			if !q.Paused() || !first.Paused || first.PausedAt == 0 {
+				t.Fatalf("after Pause: Paused %t, stats %+v", q.Paused(), first)
+			}
+			time.Sleep(2 * time.Millisecond)
+			if err := q.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			if s := stats(t, q); s.PausedAt != first.PausedAt {
+				t.Errorf("Expected a second Pause to keep %d, got %d", first.PausedAt, s.PausedAt)
+			}
+			refusedPops(t, q)
+			if !q.Enqueue([]byte("added while paused")) || q.Len() != 4 {
+				t.Error("Expected adds to land while paused")
+			}
+
+			if err := q.Resume(); err != nil {
+				t.Fatal(err)
+			}
+			if err := q.Resume(); err != nil {
+				t.Fatal(err)
+			}
+			if q.Paused() || stats(t, q).Paused {
+				t.Error("Expected Resume to clear the pause")
+			}
+			if _, ok := q.Dequeue(); !ok {
+				t.Error("Expected pops to go on after Resume")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(calls, []bool{true, false}) {
+				t.Errorf("hooks: got %v", calls)
+			}
+		})
+	}
+}
+
+// waitPaused waits for q.Paused to become want.
+func waitPaused(t *testing.T, q *Queue, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for q.Paused() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("Paused stayed %t", !want)
+		}
+		time.Sleep(pollEvery / 5)
+	}
+}
+
+// A pause from another process stops this one's pops at once; its Resume
+// reaches this object's Paused and hooks by the poll.
+func TestPauseAcrossProcesses(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	other := otherProcess(t, q)
+	resumed := make(chan struct{}, 1)
+	defer q.OnPauseChange(func(p bool) {
+		if !p {
+			resumed <- struct{}{}
+		}
+	})()
+	enqueueN(t, q, 2)
+
+	if err := other.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	if q.Paused() {
+		t.Fatal("Expected the cache to wait for a pop or the poll")
+	}
+	refusedPops(t, q)
+
+	if err := other.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	waitPaused(t, q, false)
+	select {
+	case <-resumed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no resume hook")
+	}
+	if _, ok := q.Dequeue(); !ok {
+		t.Error("Expected pops to go on after the other process resumed")
+	}
+}
+
+// A pause is kept in the file: it outlives the process, and Purge keeps it.
+func TestPauseSurvivesReopenAndPurge(t *testing.T) {
+	dir := t.TempDir()
+	qs := mustNew(t, dir)
+	q, _ := qs.NewQueue("q")
+	q.Enqueue([]byte("x"))
+	if err := q.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	q.Purge()
+	q.Enqueue([]byte("y"))
+	qs.Close()
+
+	qs = mustNew(t, dir)
+	defer qs.Close()
+	q, _ = qs.NewQueue("q")
+	if !q.Paused() || !stats(t, q).Paused {
+		t.Fatal("Expected the pause to outlive the process")
+	}
+	refusedPops(t, q)
+	q.Resume()
+	if v, ok := q.Dequeue(); !ok || string(v.([]byte)) != "y" {
+		t.Errorf("got %v %t, want y", v, ok)
+	}
+	q.Close()
+	if q.Pause() == nil || q.Resume() == nil {
+		t.Error("Expected Pause and Resume on a closed queue to fail")
+	}
+}
+
+// varmq: a paused queue holds the worker in every process; a Resume from
+// another process wakes it.
+func TestVarmqPause(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	other := otherProcess(t, q)
+
+	ran := make(chan int, 4)
+	w := varmq.NewWorker(func(j varmq.Job[int]) { ran <- j.Data() })
+	defer w.Stop()
+	handle := w.WithPersistentQueue(q)
+	if err := handle.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	if !handle.IsPaused() {
+		t.Fatal("Expected the handle to report the pause")
+	}
+	handle.Add(1)
+	select {
+	case v := <-ran:
+		t.Fatalf("job %d ran while paused", v)
+	case <-time.After(10 * pollEvery):
+	}
+	if err := other.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("job did not run after the other process resumed")
+	}
+}

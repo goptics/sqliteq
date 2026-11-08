@@ -29,14 +29,15 @@ type Queue struct {
 	closed           atomic.Bool
 
 	jobs, cancelled string       // quoted outcome and cancel mark tables
-	meta            string       // quoted totals table
+	meta            string       // quoted totals and pause table
 	id              string       // QueueID
-	w               watchers     // outcome watches and OnCancel hooks
+	w               watchers     // outcome watches, OnCancel hooks, pause poll
+	pz              pauseState   // Paused cache and OnPauseChange hooks
 	records         atomic.Int64 // outcome records written, for trims
 
 	// Prepared once per handle; they close with the file's pool
 	insert, claim, pop, fin, count, countCapped, values *sql.Stmt
-	putJob, unmark, hasMark, isMarked, tally            *sql.Stmt
+	putJob, unmark, hasMark, isMarked, pausedAt, tally  *sql.Stmt
 }
 
 // claimed is one row a claim moved to processing
@@ -82,6 +83,13 @@ func newQueue(f *file, name string, priority bool, opts ...Option) (*Queue, erro
 	}
 	if err := q.prepare(); err != nil {
 		return nil, fmt.Errorf("failed to prepare statements: %w", err)
+	}
+	// A pause kept in the file holds this object from its first pop
+	if paused, err := readPaused(q.pausedAt); err != nil {
+		q.closeStmts()
+		return nil, fmt.Errorf("failed to read pause: %w", err)
+	} else if paused {
+		q.setPaused(true)
 	}
 
 	return q, nil
@@ -211,7 +219,8 @@ func indexColumns(db *sql.DB, index string) ([]string, error) {
 }
 
 // prepare prepares every statement of the queue once. Each read keeps
-// status = 'pending' literal, or SQLite cannot use the partial index.
+// status = 'pending' literal, or SQLite cannot use the partial index. Pops
+// select nothing while the pause row exists.
 func (q *Queue) prepare() (err error) {
 	defer func() {
 		if err != nil {
@@ -223,7 +232,8 @@ func (q *Queue) prepare() (err error) {
 	if q.priority {
 		cols, vals, returning = cols+", priority", vals+", ?", "id, priority, data, job_id"
 	}
-	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)
+	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') ORDER BY %s",
+		q.table, q.meta, q.order)
 
 	// fin ends a processing row: deleted, or kept with its end as status
 	fin := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
@@ -248,6 +258,7 @@ func (q *Queue) prepare() (err error) {
 		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
 		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
 		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
+		{&q.pausedAt, fmt.Sprintf("SELECT value FROM %s WHERE key = 'paused_at'", q.meta)},
 		{&q.tally, fmt.Sprintf("UPDATE %s SET value = value + 1 WHERE key = ?", q.meta)},
 	} {
 		if *s.stmt, err = q.f.db.Prepare(s.query); err != nil {
@@ -260,7 +271,7 @@ func (q *Queue) prepare() (err error) {
 
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
-	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.hasMark, q.isMarked, q.tally} {
+	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.hasMark, q.isMarked, q.pausedAt, q.tally} {
 		if s != nil {
 			s.Close()
 		}
@@ -371,13 +382,17 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 }
 
 // claimN moves up to n pending rows to processing in one statement and
-// returns them in queue order
-func (q *Queue) claimN(n int) ([]claimed, bool, error) {
+// returns them in queue order; refused reports a pause stopped it
+func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
+	g := q.pz.gen.Load()
 	q.f.mu.Lock()
-	out, capped, err := q.claimGated(n)
+	out, capped, refused, err = q.claimGated(n)
 	q.f.mu.Unlock()
-	if err != nil {
-		return nil, false, err
+	if refused {
+		q.refused(g)
+	}
+	if err != nil || refused {
+		return nil, false, refused, err
 	}
 
 	// RETURNING order is unspecified
@@ -387,23 +402,29 @@ func (q *Queue) claimN(n int) ([]claimed, bool, error) {
 		}
 		return cmp.Compare(a.id, b.id)
 	})
-	return out, capped, nil
+	return out, capped, false, nil
 }
 
 // claimGated claims up to n rows; with a live cancel mark on the file it
 // runs in one transaction that drops each marked row it claims (outcome
 // cancelled) and claims again, at most maxDrops drops; capped reports that
-// it stopped there. The caller holds the write mutex.
-func (q *Queue) claimGated(n int) (out []claimed, capped bool, err error) {
+// it stopped there. An empty claim reads the pause row: refused when it is
+// set. The caller holds the write mutex.
+// ponytail: outside a tx a Pause and Resume from another process, both
+// between the claim and that read, make one empty pop look like a failure.
+func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err error) {
 	now := time.Now()
 	if !q.anyMark(now) {
-		out, err = q.claimRows(q.claim, n)
-		return out, false, err
+		if out, err = q.claimRows(q.claim, n); err != nil || len(out) > 0 {
+			return out, false, false, err
+		}
+		refused, err = readPaused(q.pausedAt)
+		return nil, false, refused, err
 	}
 
 	tx, err := q.f.db.Begin()
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	defer tx.Rollback()
 
@@ -414,7 +435,7 @@ func (q *Queue) claimGated(n int) (out []claimed, capped bool, err error) {
 		// No more than the drops left: a batch never passes the cap
 		rows, err := q.claimRows(claim, min(n-len(out), maxDrops-drops))
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 		if len(rows) == 0 {
 			break
@@ -423,19 +444,26 @@ func (q *Queue) claimGated(n int) (out []claimed, capped bool, err error) {
 			id := jobIDOf(c.once, c.data)
 			drop, err := marked(isMarked, id, now)
 			if err != nil {
-				return nil, false, err
+				return nil, false, false, err
 			}
 			if !drop {
 				out = append(out, c)
 				continue
 			}
 			if _, err := q.end(tx, c.id, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
-				return nil, false, err
+				return nil, false, false, err
 			}
 			drops++
 		}
 	}
-	return out, len(out) < n && drops >= maxDrops, tx.Commit()
+	capped = len(out) < n && drops >= maxDrops
+	if len(out) == 0 && !capped {
+		// The write lock is held: the row read is the one the claim saw
+		if refused, err = readPaused(tx.Stmt(q.pausedAt)); err != nil {
+			return nil, false, false, err
+		}
+	}
+	return out, capped, refused, tx.Commit()
 }
 
 // claimRows runs a claim statement and reads every row it returns; the
@@ -471,53 +499,70 @@ func (q *Queue) Dequeue() (any, bool) {
 		return nil, false
 	}
 
+	g := q.pz.gen.Load()
 	q.f.mu.Lock()
-	defer q.f.mu.Unlock()
+	data, ok, refused := q.dequeue()
+	q.f.mu.Unlock()
+	if refused {
+		q.refused(g)
+	}
+	return data, ok
+}
 
+// dequeue is Dequeue under the write mutex; an empty pop reads the pause
+// row, refused when it is set.
+func (q *Queue) dequeue() (data []byte, ok, refused bool) {
 	now := time.Now()
 	if !q.anyMark(now) {
 		data, _, err := popRow(q.pop)
-		return data, err == nil
+		if errors.Is(err, sql.ErrNoRows) {
+			refused, _ = readPaused(q.pausedAt)
+		}
+		return data, err == nil, refused
 	}
 	for {
-		data, capped, err := q.popGated(now)
-		if err != nil || data != nil || !capped {
-			return data, err == nil && data != nil
+		data, capped, refused, err := q.popGated(now)
+		if err != nil || data != nil || refused || !capped {
+			return data, err == nil && data != nil, refused
 		}
 	}
 }
 
 // popGated pops in one transaction, dropping each marked item it pops
 // (outcome cancelled), at most maxDrops; capped reports it stopped there
-// with nothing. The caller holds the write mutex.
-func (q *Queue) popGated(now time.Time) (data []byte, capped bool, err error) {
+// with nothing, refused that the pause row stopped it. The caller holds
+// the write mutex.
+func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err error) {
 	tx, err := q.f.db.Begin()
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	defer tx.Rollback()
 	pop, isMarked := tx.Stmt(q.pop), tx.Stmt(q.isMarked)
 	for range maxDrops {
 		data, once, err := popRow(pop)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, false, tx.Commit() // keep the drops
+			if refused, err = readPaused(tx.Stmt(q.pausedAt)); err != nil {
+				return nil, false, false, err
+			}
+			return nil, false, refused, tx.Commit() // keep the drops
 		}
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 		id := jobIDOf(once, data)
 		drop, err := marked(isMarked, id, now)
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 		if !drop {
-			return data, false, tx.Commit()
+			return data, false, false, tx.Commit()
 		}
 		if err := q.record(tx, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 	}
-	return nil, true, tx.Commit()
+	return nil, true, false, tx.Commit()
 }
 
 // popRow runs a pop statement: the deleted row's data and job_id, or
@@ -537,8 +582,8 @@ func (q *Queue) DequeueWithAckId() (any, bool, string) {
 	// A pop stopped at the drop cap has nothing yet: pop again, it can't
 	// report items left
 	for {
-		c, capped, err := q.claimN(1)
-		if err != nil || len(c) == 0 && !capped {
+		c, capped, refused, err := q.claimN(1)
+		if err != nil || refused || len(c) == 0 && !capped {
 			return nil, false, ""
 		}
 		if len(c) > 0 {
@@ -558,9 +603,9 @@ func (q *Queue) DequeueBatchWithAckIds(items []any, ackIDs []string) (n, remaini
 		return 0, 0, nil
 	}
 
-	c, capped, err := q.claimN(want)
-	if err != nil {
-		return 0, 0, err
+	c, capped, refused, err := q.claimN(want)
+	if err != nil || refused {
+		return 0, 0, err // paused: nothing left to pop until a Resume
 	}
 	// At the drop cap items may wait still: report one, so the caller pops again
 	left := 0
@@ -698,7 +743,7 @@ func (q *Queue) Values() []any {
 }
 
 // Purge removes all items from the queue, with its outcome records, cancel
-// marks and totals (spec 6.6, 6.14)
+// marks and totals; a pause stays (spec 6.6, 6.7, 6.14)
 func (q *Queue) Purge() {
 	q.f.mu.Lock()
 	defer q.f.mu.Unlock()
