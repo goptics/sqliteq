@@ -1862,6 +1862,9 @@ func TestJobs(t *testing.T) {
 	if j := jobs(t, q, contract.JobPending, 0, 0); j == nil || len(j) != 0 {
 		t.Errorf("limit 0: got %#v", j)
 	}
+	if j := jobs(t, q, contract.JobPending, 0, -1); j == nil || len(j) != 0 {
+		t.Errorf("limit -1: got %#v", j)
+	}
 	if _, err := q.Jobs(context.Background(), "bogus", 0, 10); err == nil {
 		t.Error("Expected an unknown state to fail")
 	}
@@ -1895,12 +1898,10 @@ func TestInspectClosed(t *testing.T) {
 
 func TestImplementsPause(t *testing.T) {
 	var (
-		_ varmq.QueuePauser    = (*Queue)(nil)
-		_ varmq.QueuePauser    = (*PriorityQueue)(nil)
-		_ varmq.PauseNotifier  = (*Queue)(nil)
-		_ varmq.PauseNotifier  = (*PriorityQueue)(nil)
-		_ varmq.QueueInspector = (*Queue)(nil)
-		_ varmq.QueueInspector = (*PriorityQueue)(nil)
+		_ varmq.QueuePauser   = (*Queue)(nil)
+		_ varmq.QueuePauser   = (*PriorityQueue)(nil)
+		_ varmq.PauseNotifier = (*Queue)(nil)
+		_ varmq.PauseNotifier = (*PriorityQueue)(nil)
 	)
 }
 
@@ -2022,6 +2023,9 @@ func TestPauseAcrossProcesses(t *testing.T) {
 	if q.Paused() {
 		t.Fatal("Expected the cache to wait for a pop or the poll")
 	}
+	if !stats(t, q).Paused {
+		t.Error("Expected QueueStats to read the pause from the file")
+	}
 	refusedPops(t, q)
 
 	if err := other.Resume(); err != nil {
@@ -2047,7 +2051,11 @@ func TestPauseSurvivesReopenAndPurge(t *testing.T) {
 	if err := q.Pause(); err != nil {
 		t.Fatal(err)
 	}
+	at := stats(t, q).PausedAt
 	q.Purge()
+	if s := stats(t, q); s.PausedAt != at || s.Totals != (contract.JobTotals{}) {
+		t.Errorf("after Purge: got %+v, want paused_at %d and no totals", s, at)
+	}
 	q.Enqueue([]byte("y"))
 	qs.Close()
 
@@ -2210,5 +2218,43 @@ func TestJobsNewestFinishFirst(t *testing.T) {
 	}
 	if e := cancelled[0]; e.State != contract.JobCancelled || len(e.Errors) != 1 || e.Errors[0].Error != "y" {
 		t.Errorf("cancelled job: got %+v", e)
+	}
+}
+
+// Seeding counts kept ended rows too: cancelled as failed.
+func TestTotalsSeededFromEndedRows(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+	enqueueN(t, q, 4)
+	_, a := pop(t, q)
+	_, b := pop(t, q)
+	_, c := pop(t, q)
+	q.Acknowledge(a)
+	q.Reject(b, "boom")
+	q.AcknowledgeCancelled(c, "stop")
+	if _, err := q.f.db.Exec("DROP TABLE " + q.meta); err != nil {
+		t.Fatal(err)
+	}
+	want := contract.JobTotals{Submitted: 4, Completed: 1, Failed: 2}
+	if got := stats(t, otherProcess(t, q)).Totals; got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+// A finish that ends no row (repeat, stale or unknown ack) counts nothing.
+func TestTotalsIgnoreNoopFinish(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Enqueue(job("a"))
+	_, ack := pop(t, q)
+	if !q.Acknowledge(ack) {
+		t.Fatal("Acknowledge failed")
+	}
+	if q.Acknowledge(ack) || q.Reject(ack, "x") || q.AcknowledgeCancelled(ack, "x") ||
+		q.Acknowledge("garbage") || q.Reject("999", "x") {
+		t.Error("Expected a finish of no processing row to return false")
+	}
+	if got, want := stats(t, q).Totals, (contract.JobTotals{Submitted: 1, Completed: 1}); got != want {
+		t.Errorf("got %+v, want %+v", got, want)
 	}
 }
