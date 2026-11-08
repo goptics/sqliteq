@@ -1,2 +1,14 @@
+github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/goptics/varmq v1.10.1-0.20261108145618-0a9288ee1092 h1:oFPxzb1mXotIzHHKlxz+kUGO1ASrWZkg2nmkYhrgx60=
+github.com/goptics/varmq v1.10.1-0.20261108145618-0a9288ee1092/go.mod h1:RLnozQPouu3sq2tHoCixCXSoCZMPjB90MNEHvlpFz+E=
+github.com/goptics/varmq/contract v0.4.1-0.20261108145618-0a9288ee1092 h1:wWq1t3n0//1/URO+uwwdEybf6GJcVHmmtJ9lcKAHxRY=
+github.com/goptics/varmq/contract v0.4.1-0.20261108145618-0a9288ee1092/go.mod h1:55tOUywUsZhBgyo8oJhNmKMknETVHL2OuMrITztanXg=
 github.com/mattn/go-sqlite3 v1.14.28 h1:ThEiQrnbtumT+QMknw63Befp/ce/nUPgBPMlRFEum7A=
 github.com/mattn/go-sqlite3 v1.14.28/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
+github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
+github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
+github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
+gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
