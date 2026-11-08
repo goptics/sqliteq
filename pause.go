@@ -18,10 +18,12 @@ import (
 // the poll, which reads the row every pollEvery, so a Resume from another
 // process reaches it within pollEvery.
 
-// pauseState is a Queue's Paused cache and OnPauseChange hooks.
+// pauseState is a Queue's Paused cache and OnPauseChange hooks. mu makes
+// each gen check and cache swap one step, so a stale read never overwrites
+// a newer Pause or Resume of this object.
 type pauseState struct {
-	paused   atomic.Bool
-	gen      atomic.Uint64 // moves at each Pause and Resume
+	paused   atomic.Bool   // written under mu
+	gen      atomic.Uint64 // moves at each Pause and Resume; under mu
 	refusals atomic.Uint64 // pops refused for a pause
 	mu       sync.Mutex
 	hooks    map[*func(bool)]struct{}
@@ -51,8 +53,7 @@ func (q *Queue) setPauseRow(p bool, query string, args ...any) error {
 	if err != nil {
 		return err
 	}
-	q.pz.gen.Add(1)
-	q.setPaused(p)
+	q.setPaused(p, true, 0)
 	return nil
 }
 
@@ -90,12 +91,28 @@ func (q *Queue) OnPauseChange(fn func(paused bool)) (cancel func()) {
 	}
 }
 
-// setPaused updates the cache; on a change it starts the poll (paused) and
-// calls the hooks.
-func (q *Queue) setPaused(p bool) {
-	if q.pz.paused.Swap(p) == p {
+// setPaused sets the cache to p: own for this object's Pause or Resume,
+// which moves gen; else only if gen is still g, the gen of the call that
+// read p (a Pause or Resume since may be newer than p). On a change, after
+// mu, it starts the poll (paused) and calls the hooks.
+func (q *Queue) setPaused(p, own bool, g uint64) {
+	q.pz.mu.Lock()
+	if own {
+		q.pz.gen.Add(1)
+	} else if q.pz.gen.Load() != g {
+		q.pz.mu.Unlock()
 		return
 	}
+	if q.pz.paused.Swap(p) == p {
+		q.pz.mu.Unlock()
+		return
+	}
+	fns := make([]func(bool), 0, len(q.pz.hooks))
+	for h := range q.pz.hooks {
+		fns = append(fns, *h)
+	}
+	q.pz.mu.Unlock()
+
 	if p {
 		w := &q.w
 		w.mu.Lock()
@@ -104,37 +121,22 @@ func (q *Queue) setPaused(p bool) {
 		}
 		w.mu.Unlock()
 	}
-
-	q.pz.mu.Lock()
-	fns := make([]func(bool), 0, len(q.pz.hooks))
-	for h := range q.pz.hooks {
-		fns = append(fns, *h)
-	}
-	q.pz.mu.Unlock()
 	for _, fn := range fns {
 		fn(p)
-	}
-}
-
-// observe applies p, read by a call that began at gen g, unless a Pause or
-// Resume of this object came since: p may then be older than what it set.
-func (q *Queue) observe(g uint64, p bool) {
-	if q.pz.gen.Load() == g {
-		q.setPaused(p)
 	}
 }
 
 // refused records a pop refused for a pause, by a call that began at gen g.
 func (q *Queue) refused(g uint64) {
 	q.pz.refusals.Add(1)
-	q.observe(g, true)
+	q.setPaused(true, false, g)
 }
 
 // pollPause reads the pause row for the poll.
 func (q *Queue) pollPause() {
 	g := q.pz.gen.Load()
 	if paused, err := readPaused(q.pausedAt); err == nil {
-		q.observe(g, paused)
+		q.setPaused(paused, false, g)
 	}
 }
 

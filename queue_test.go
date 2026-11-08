@@ -2117,3 +2117,31 @@ func TestTotalsSeededFromRows(t *testing.T) {
 		t.Errorf("got %+v, want submitted %d", s.Totals, rows)
 	}
 }
+
+// A stopped hook gets no calls; a refusal read before this object's own
+// Resume does not undo it.
+func TestPauseHookStopAndStaleRefusal(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	var calls []bool
+	var mu sync.Mutex
+	defer q.OnPauseChange(func(p bool) {
+		mu.Lock()
+		calls = append(calls, p)
+		mu.Unlock()
+	})()
+	q.OnPauseChange(func(bool) { t.Error("A stopped hook was called") })()
+
+	q.Pause()
+	g := q.pz.gen.Load()
+	q.Resume()
+	q.refused(g)
+	if q.Paused() {
+		t.Error("Expected a stale refusal to leave the Resume")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(calls, []bool{true, false}) {
+		t.Errorf("hooks: got %v", calls)
+	}
+}
