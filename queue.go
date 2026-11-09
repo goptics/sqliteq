@@ -93,7 +93,7 @@ func newQueue(f *file, name string, priority bool, opts ...Option) (*Queue, erro
 		q.closeStmts()
 		return nil, fmt.Errorf("failed to read pause: %w", err)
 	} else if paused {
-		q.setPaused(true, true, 0)
+		q.setPaused(true, q.pz.gen.Load())
 	}
 
 	return q, nil

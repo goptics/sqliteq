@@ -23,7 +23,7 @@ import (
 // a newer Pause or Resume of this object.
 type pauseState struct {
 	paused   atomic.Bool   // written under mu
-	gen      atomic.Uint64 // moves at each Pause and Resume; under mu
+	gen      atomic.Uint64 // moves at each Pause and Resume, after its write
 	refusals atomic.Uint64 // pops refused for a pause
 	mu       sync.Mutex
 	hooks    map[*func(bool)]struct{}
@@ -53,7 +53,7 @@ func (q *Queue) setPauseRow(p bool, query string, args ...any) error {
 	if err != nil {
 		return err
 	}
-	q.setPaused(p, true, 0)
+	q.setPaused(p, q.pz.gen.Add(1))
 	return nil
 }
 
@@ -91,15 +91,13 @@ func (q *Queue) OnPauseChange(fn func(paused bool)) (cancel func()) {
 	}
 }
 
-// setPaused sets the cache to p: own for this object's Pause or Resume,
-// which moves gen; else only if gen is still g, the gen of the call that
-// read p (a Pause or Resume since may be newer than p). On a change, after
-// mu, it starts the poll (paused) and calls the hooks.
-func (q *Queue) setPaused(p, own bool, g uint64) {
+// setPaused sets the cache to p if gen is still g: the gen of the call
+// that read p (a pop or the poll; a Pause or Resume since may be newer than
+// p), or the one this object's own Pause or Resume moved it to. On a
+// change, after mu, it starts the poll (paused) and calls the hooks.
+func (q *Queue) setPaused(p bool, g uint64) {
 	q.pz.mu.Lock()
-	if own {
-		q.pz.gen.Add(1)
-	} else if q.pz.gen.Load() != g {
+	if q.pz.gen.Load() != g {
 		q.pz.mu.Unlock()
 		return
 	}
@@ -129,14 +127,14 @@ func (q *Queue) setPaused(p, own bool, g uint64) {
 // refused records a pop refused for a pause, by a call that began at gen g.
 func (q *Queue) refused(g uint64) {
 	q.pz.refusals.Add(1)
-	q.setPaused(true, false, g)
+	q.setPaused(true, g)
 }
 
 // pollPause reads the pause row for the poll.
 func (q *Queue) pollPause() {
 	g := q.pz.gen.Load()
 	if paused, err := readPaused(q.pausedAt); err == nil {
-		q.setPaused(paused, false, g)
+		q.setPaused(paused, g)
 	}
 }
 
