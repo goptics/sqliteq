@@ -133,7 +133,7 @@ An item taken with `DequeueWithAckId` is marked as processing until it is acknow
 
 `Reject(ackID, reason)` finishes an item that failed for good, as VarMQ does when a job returns an error or panics. It is never requeued. When the job has a job ID, the reason is stored as its outcome error.
 
-By default an acknowledged or rejected item is deleted. With `WithRemoveOnComplete(false)` it is kept and marked as `completed` or `failed`:
+By default an acknowledged or rejected item is deleted. With `WithRemoveOnComplete(false)` it is kept and marked as `completed`, `failed` or `cancelled`:
 
 ```go
 audit, err := qs.NewQueue("audit", sqliteq.WithRemoveOnComplete(false))
@@ -193,7 +193,7 @@ queue.Add("hello")
 
 Requires VarMQ ≥ v1.11.0. The [VarMQ versions table](https://varmq.goptics.org/start/installation/#versions) shows which release supports which feature.
 
-sqliteq imports VarMQ only in tests. Its `go.mod` still requires VarMQ, so sqliteq needs Go 1.27, as VarMQ does.
+sqliteq imports VarMQ's `contract` module, and it imports VarMQ itself only in tests. Its `go.mod` still requires VarMQ, so sqliteq needs Go 1.27, as VarMQ does.
 
 A worker whose only source is the sqliteq queue claims several jobs in one statement through `DequeueBatchWithAckIds`. A worker bound to several queues claims one job per call. A job added with an ID (`WithJobId`, or one from `WithJobIdGenerator`) goes through `EnqueueOnce`.
 
@@ -201,7 +201,7 @@ sqliteq has no workflow store and no `JobReader`. So VarMQ's one-job read (`GET 
 
 ### Job outcome and cancel
 
-A job has a job ID when it was added with `EnqueueOnce`, or when its item is a JSON object with an `id` field. A VarMQ job that has an ID carries it in that field. Only a job with a job ID gets an outcome or can be cancelled.
+A job has a job ID when it was added with `EnqueueOnce`, or when its item is a JSON object with an `id` field. A VarMQ job that has an ID carries it in that field. Only a job with a job ID gets an outcome or can be cancelled. Whoever writes an item controls its `id` field, so accept items only from trusted producers.
 
 ```go
 cancel := q.WatchOutcome("job-0b7e9c2a", func(o contract.JobOutcome) {
@@ -234,7 +234,7 @@ Records are kept by count and by age, with fixed limits:
 
 The count limit never deletes a record younger than one minute, so a burst cannot trim a record before a watch reads it.
 
-`CancelJob(id)` writes a cancel mark to `<name>__sqliteq_cancelled`, which lasts 24 hours. Every pop drops a marked waiting job: it never runs, and its outcome is `cancelled`. One pop drops at most 1000 marked jobs, and the next pop goes on. `OnCancel` hooks in every process on the file learn of each new mark. VarMQ then cancels the job's context, and a job that stops for it finishes with `AcknowledgeCancelled`.
+`CancelJob(id)` writes a cancel mark to `<name>__sqliteq_cancelled`, which lasts 24 hours. Every pop drops a marked waiting job: it never runs, and its outcome is `cancelled`. One transaction drops at most 1000 marked jobs. A single-item pop then goes on, and a batch pop reports an item left. `OnCancel` hooks in every process on the file learn of each new mark. VarMQ then cancels the job's context, and a job that stops for it finishes with `AcknowledgeCancelled`.
 
 `CancelJob` returns `contract.ErrJobEnded` when the job's outcome record shows that it ended. An unknown ID is marked too, so a later `Enqueue` of it is dropped. An `EnqueueOnce` that stores the ID deletes its old record and mark. Any ID can be marked, so authorize and rate-limit untrusted callers of `CancelJob`.
 
@@ -242,7 +242,7 @@ The count limit never deletes a record younger than one minute, so a burst canno
 
 Both queue types implement VarMQ's `contract.QueueInspector`. So a bound queue shows up in VarMQ's REST API (`GET /queues`, `GET /queues/{id}/jobs`) and in vartop, as a redisq queue does.
 
-- **Queue ID**: `sqliteq:<h>:fifo:<name>` or `sqliteq:<h>:prio:<name>`, with `<name>` in lower case. `<h>` is the first 8 hex digits of the SHA-256 of the database file's resolved path. So every process on the file agrees, and two files with one queue name never collide. No path shows in the ID. sqliteq has no in-memory mode, so every queue has a file. A file reached through two different paths (another mount, say) gets two IDs.
+- **Queue ID**: `sqliteq:<h>:fifo:<name>` or `sqliteq:<h>:prio:<name>`, with `<name>` in lower case. `<h>` is the first 8 hex digits of the SHA-256 of the database file's resolved path. So every process on the file agrees, and two files with one queue name almost never collide. No path shows in the ID. sqliteq has no in-memory mode, so every queue has a file. A file reached through two different paths (another mount, say) gets two IDs.
 - **Counts**: rows per `status`, read in one statement. Cancelled rows count as failed. Completed and failed rows exist only with `WithRemoveOnComplete(false)`. By default they are deleted, so those counts are 0. Kept rows have no retention.
 - **Totals**: `submitted` counts stored adds, and a repeat `EnqueueOnce` is not one. `completed` and `failed` count finishes. `AcknowledgeCancelled` counts as failed, and a waiting job dropped for a cancel counts as neither. The totals live in `<name>__sqliteq_meta`, and `Purge` resets them. When this version first opens an older table, the totals start from the rows that the table holds. So jobs deleted before the upgrade (the default `WithRemoveOnComplete(true)`) are missing from them.
 - **Jobs**: pending in hand-out order, processing by ack ID, and completed, failed and cancelled newest finish first. The failed list includes cancelled rows, with `state` `cancelled`. `payload` is the VarMQ envelope's `data`, or the stored item itself (as a JSON string when it is not JSON). A job without a job ID shows its ack ID once handed out. sqliteq does not count attempts: they read 0 while pending and 1 after. A kept row loses its start time when it ends. A failed job's `errors` holds its reason while its outcome record is kept.
@@ -310,7 +310,7 @@ On macOS, spell a path the same way every time: the registry key keeps the lette
 | ----------------------------- | ------------------------------ | ------------- | ---------------------------------------------------------------------- |
 | `WithSingleFile()`            | `New`                          | folder layout | `path` is one database file holding every queue                        |
 | `WithCheckpointPages(n)`      | `New`                          | `1000`        | WAL size, in pages, at which SQLite checkpoints automatically          |
-| `WithRemoveOnComplete(false)` | `NewQueue`, `NewPriorityQueue` | `true`        | Keep acknowledged and rejected items, marked as `completed` or `failed`, instead of deleting them |
+| `WithRemoveOnComplete(false)` | `NewQueue`, `NewPriorityQueue` | `true`        | Keep finished items, marked as `completed`, `failed` or `cancelled`, instead of deleting them |
 
 `New` returns an error instead of panicking: for a path it cannot use, an invalid option (`WithCheckpointPages` below 1, or a nil option), or a path that is an existing file when `WithSingleFile()` is not given. `NewQueue` and `NewPriorityQueue` return an error for a nil option too.
 
@@ -334,7 +334,7 @@ Each queue is a table with these columns:
 - `priority`: priority queues only; a lower number comes out first. Opening an older table as a priority queue adds it.
 - `data`: the stored item.
 - `status`: `pending`, `processing`, or on a kept row `completed`, `failed` or `cancelled`.
-- `ack`: 0 when an item is added, 1 once it is acknowledged or rejected and kept with `WithRemoveOnComplete(false)` (`status` `completed` or `failed`). On open, only `processing` rows with `ack` 0 go back to pending.
+- `ack`: 0 when an item is added, 1 once it is acknowledged or rejected and kept with `WithRemoveOnComplete(false)` (`status` `completed`, `failed` or `cancelled`). On open, only `processing` rows with `ack` 0 go back to pending.
 - `ack_id`: kept from v0.2 so old tables need no rebuild; no longer used.
 - `job_id`: the id an item was added with through `EnqueueOnce`, unique among the rows that have one; NULL for `Enqueue`. Opening an older table adds it.
 - `created_at`, `updated_at`: when the item was added and last changed.
@@ -381,6 +381,12 @@ On top of that table:
 - Use globally unique ids with `EnqueueOnce` (UUID or nanoid, never a per-process counter).
 
 sqliteq runs SQLite in WAL mode with `synchronous=NORMAL`, unchanged from v0.2. A job whose `Enqueue` returned true survives a crash of the process. After a power loss or an operating system crash, the last commits before the failure may be lost, because SQLite rolls back what the WAL had not yet synced; the database itself stays consistent.
+
+## Upgrading from v0.3
+
+- Requires Go 1.27, because `go.mod` requires VarMQ.
+- A queue name must not contain `__sqliteq_`. Rename such a queue before the upgrade, or it fails to open.
+- The first open of a queue adds the tables `<name>__sqliteq_meta`, `<name>__sqliteq_jobs` and `<name>__sqliteq_cancelled`, and their triggers. The data in the queue is kept.
 
 ## Upgrading from v0.2
 
