@@ -275,6 +275,9 @@ resize, _ := qs.NewQueue("resize")
 publish, _ := qs.NewQueue("publish")
 
 wf := varmq.NewWorkflow(store)
+worker := varmq.NewErrWorker(func(j varmq.Job[string]) error { return nil })
+defer worker.WaitAndStop()
+
 a := wf.Add("resize", worker.WithQueue(resize), "photo.jpg")
 wf.Add("publish", worker.WithQueue(publish), "photo.jpg").After(a)
 

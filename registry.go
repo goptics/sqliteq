@@ -73,6 +73,8 @@ func dsn(path string) string {
 // registry holds every open file in the process, keyed by resolved path.
 // Lock order is queues.mu, then registry.mu, then file.mu. A file's
 // batcher.mu is never held across a commit, so never together with file.mu.
+// A workflow store's write transaction holds file.mu, so it never takes
+// queues.mu: queues.handleOf reads an atomic copy-on-write map.
 var registry = struct {
 	mu    sync.Mutex
 	files map[string]*file

@@ -3,16 +3,18 @@ package sqliteq
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
 type queues struct {
 	cfg    storeConfig
-	root   string             // folder, or the resolved file under WithSingleFile
-	files  map[*file]struct{} // one reference held per file
-	byID   map[string]*handle // queues this client opened, by QueueID: FinishTask's lookup
+	root   string                             // folder, or the resolved file under WithSingleFile
+	files  map[*file]struct{}                 // one reference held per file
+	byID   atomic.Pointer[map[string]*handle] // queues by QueueID, copy on write under mu; read lock-free
 	closed bool
 	mu     sync.Mutex
 }
@@ -45,12 +47,13 @@ func New(path string, opts ...StoreOption) (Queues, error) {
 		return nil, err
 	}
 
-	return &queues{
+	qs := &queues{
 		cfg:   cfg,
 		root:  root,
 		files: map[*file]struct{}{},
-		byID:  map[string]*handle{},
-	}, nil
+	}
+	qs.byID.Store(&map[string]*handle{})
+	return qs, nil
 }
 
 // layout checks path against the chosen layout and returns the store root.
@@ -86,7 +89,7 @@ func layout(path string, singleFile bool) (string, error) {
 	if _, err := checkDSN(real); err != nil {
 		return "", err
 	}
-	return abs, nil
+	return real, nil
 }
 
 // filePath returns the resolved database file for a queue name.
@@ -100,21 +103,24 @@ func (qs *queues) filePath(name string) (string, error) {
 	return resolve(filepath.Join(qs.root, foldName(name)+".db"))
 }
 
-// rootOf is the scope root of a database file path: the file under
-// WithSingleFile, else its folder, resolved.
-func (qs *queues) rootOf(path string) string {
-	if qs.cfg.singleFile {
-		return path
-	}
-	return filepath.Dir(path)
+// handleOf returns the queue this client opened under id. It takes no lock:
+// a workflow write holds the file's write mutex, which comes after mu.
+func (qs *queues) handleOf(id string) (*handle, bool) {
+	h, ok := (*qs.byID.Load())[id]
+	return h, ok
 }
 
-// handleOf returns the queue this client opened under id.
-func (qs *queues) handleOf(id string) (*handle, bool) {
-	qs.mu.Lock()
-	defer qs.mu.Unlock()
-	h, ok := qs.byID[id]
-	return h, ok
+// setHandle records h under its QueueID, replacing a held one when replace;
+// the caller holds mu.
+func (qs *queues) setHandle(h *handle, replace bool) {
+	old := *qs.byID.Load()
+	id := h.queue().id
+	if _, ok := old[id]; ok && !replace {
+		return
+	}
+	next := maps.Clone(old)
+	next[id] = h
+	qs.byID.Store(&next)
 }
 
 // open finds or creates the handle for name, taking a reference on its file
@@ -142,7 +148,7 @@ func (qs *queues) open(name string, priority bool, opts []Option) (*handle, erro
 
 	fresh := f == nil
 	if fresh {
-		if f, err = acquire(path, qs.rootOf(path), qs.cfg.checkpointPages); err != nil {
+		if f, err = acquire(path, qs.root, qs.cfg.checkpointPages); err != nil {
 			return nil, err
 		}
 	}
@@ -156,7 +162,7 @@ func (qs *queues) open(name string, priority bool, opts []Option) (*handle, erro
 	}
 
 	qs.files[f] = struct{}{}
-	qs.byID[h.queue().id] = h
+	qs.setHandle(h, true)
 	return h, nil
 }
 
@@ -192,6 +198,6 @@ func (qs *queues) Close() error {
 		errs = append(errs, f.release())
 	}
 	qs.files = nil
-	qs.byID = nil
+	qs.byID.Store(&map[string]*handle{})
 	return errors.Join(errs...)
 }

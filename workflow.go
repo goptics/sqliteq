@@ -402,11 +402,8 @@ func (s *WorkflowStore) planQueue(name string, q, item any) (*handle, []byte, er
 func (qs *queues) learn(h *handle) {
 	qs.mu.Lock()
 	defer qs.mu.Unlock()
-	if qs.byID == nil {
-		return
-	}
-	if _, ok := qs.byID[h.queue().id]; !ok {
-		qs.byID[h.queue().id] = h
+	if !qs.closed {
+		qs.setHandle(h, false)
 	}
 }
 
@@ -759,11 +756,11 @@ func (s *WorkflowStore) load(ctx context.Context, q querier, id string) (*wfFlow
 
 // mut is the part of a task (and of the workflow) the machine changes.
 type mut struct {
-	state, undoState             contract.JobState
-	open, undoOpen               int
-	reason, undoReason           string
-	wfState                      contract.WorkflowState
-	failed, cancelled, undoCance bool
+	state, undoState              contract.JobState
+	open, undoOpen                int
+	reason, undoReason            string
+	wfState                       contract.WorkflowState
+	failed, cancelled, undoCancel bool
 }
 
 func (w *wfFlow) snapshot() map[string]mut {
@@ -771,7 +768,7 @@ func (w *wfFlow) snapshot() map[string]mut {
 	for name, t := range w.tasks {
 		m[name] = mut{state: t.state, undoState: t.undoState, open: t.open, undoOpen: t.undoOpen, reason: t.reason, undoReason: t.undoReason}
 	}
-	m[""] = mut{wfState: w.state, failed: w.failed, cancelled: w.cancelled, undoCance: w.undoOnCancel}
+	m[""] = mut{wfState: w.state, failed: w.failed, cancelled: w.cancelled, undoCancel: w.undoOnCancel}
 	return m
 }
 
@@ -784,7 +781,7 @@ func (w *wfFlow) dirty(orig map[string]mut) (tasks []string, flow bool) {
 			tasks = append(tasks, name)
 		}
 	}
-	return tasks, orig[""] != mut{wfState: w.state, failed: w.failed, cancelled: w.cancelled, undoCance: w.undoOnCancel}
+	return tasks, orig[""] != mut{wfState: w.state, failed: w.failed, cancelled: w.cancelled, undoCancel: w.undoOnCancel}
 }
 
 // save writes what changed since orig; result is the finishing task's

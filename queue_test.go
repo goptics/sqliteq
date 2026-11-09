@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -2712,7 +2713,7 @@ func TestWorkflowCrashAfterRecord(t *testing.T) {
 	if err := e.st.Submit(ctx, wfPlan("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
 		t.Fatal(err)
 	}
-	_, ack := take(t, e.a)
+	_, _ = take(t, e.a)
 	end := done("w1", "a", `1`)
 	var r endResult
 	if err := e.st.write(ctx, func(tx *sql.Tx) (err error) {
@@ -2734,7 +2735,6 @@ func TestWorkflowCrashAfterRecord(t *testing.T) {
 	if ok, _ := e.st.Runnable(ctx, "w1", task, false); ok {
 		t.Fatal("Expected the redelivered job to be skipped")
 	}
-	_ = ack
 	e.finish(t, e.a, ack2, contract.TaskEnd{Workflow: "w1", Task: "a", Outcome: contract.OutcomeCancelled, Reason: "workflow cancelled"})
 	if got := taskStates(e.state(t, "w1")); got != "a=completed b=pending" || e.b.Len() != 1 {
 		t.Errorf("Expected the end unchanged and one push, got %s, b %d", got, e.b.Len())
@@ -2843,9 +2843,12 @@ func TestWorkflowSingleFileAtomic(t *testing.T) {
 		t.Fatalf("Expected no outbox rows in one file, got %d", n)
 	}
 	_, ack := take(t, e.a)
-	e.qs.(*queues).mu.Lock()
-	delete(e.qs.(*queues).byID, e.b.QueueID()) // b is not open in this client
-	e.qs.(*queues).mu.Unlock()
+	qs := e.qs.(*queues)
+	qs.mu.Lock()
+	unknown := maps.Clone(*qs.byID.Load())
+	delete(unknown, e.b.QueueID()) // b is not open in this client
+	qs.byID.Store(&unknown)
+	qs.mu.Unlock()
 	if _, ok := e.st.FinishTask(e.a.QueueID(), ack, done("w1", "a", "")); ok {
 		t.Fatal("Expected FinishTask to fail when a push target is unknown")
 	}

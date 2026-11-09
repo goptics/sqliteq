@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/goptics/varmq/contract"
 )
 
 // mustNew opens a store at path and fails the test on error.
@@ -696,5 +698,54 @@ func TestReopenAfterCloseNoRecovery(t *testing.T) {
 	}
 	if !q.Acknowledge(ackID) {
 		t.Error("Acknowledge on the closed handle failed after the reopen")
+	}
+}
+
+// The scope is the canonical store root: a symlinked folder, and a queue
+// file that is a symlink inside it, give the queues and the store one scope.
+func TestScopeThroughSymlinks(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("Cannot create a symlink: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "elsewhere.db")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(real, "a.db")); err != nil {
+		t.Skipf("Cannot create a symlink: %v", err)
+	}
+
+	qs := mustNew(t, link)
+	defer qs.Close()
+	a, err := qs.NewQueue("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := qs.NewQueue("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := NewWorkflowStore(qs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	want, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "sqliteq:" + want
+	if a.ScopeID() != want || b.ScopeID() != want || st.ScopeID() != want {
+		t.Fatalf("Expected scope %q, got %q %q %q", want, a.ScopeID(), b.ScopeID(), st.ScopeID())
+	}
+	if got, ok := contract.LookupWorkflowStore(a.ScopeID()); !ok || got != contract.WorkflowStore(st) {
+		t.Error("Expected the queue's scope to find the store")
+	}
+	plan := wfPlan("w1", planTask("w1", "x", a), planTask("w1", "y", b, "x"))
+	if err := st.Submit(context.Background(), plan); err != nil {
+		t.Fatalf("Expected Submit across the symlinked queues to succeed, got %v", err)
 	}
 }
