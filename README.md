@@ -39,6 +39,7 @@
 - **Job outcomes**: `WatchOutcome` tells any process on the file when a job completes, fails or is cancelled, with the worker's result.
 - **Job cancel**: `CancelJob` drops a waiting job, and `OnCancel` tells every process on the file to stop a running one.
 - **Job records and inspection**: counts, totals and job lists for VarMQ's REST API and vartop.
+- **[Workflows](#workflows)**: `NewWorkflowStore` keeps VarMQ workflows (a DAG of jobs across queues) in SQLite, so they survive a restart.
 - **Durable queue pause**: `Pause` stops the pops of every process on the file, and the pause outlives restarts.
 - **Automatic WAL checkpoints**, tunable with `WithCheckpointPages`.
 - **Thread-safe**: share one queue object across goroutines.
