@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/goptics/varmq/contract"
@@ -33,7 +37,7 @@ type endResult struct {
 // settles the job and returns ok with no IDs. A completed result over the
 // limit fails the task (ErrResultTooLarge); one that is not JSON is dropped.
 func (s *WorkflowStore) FinishTask(queueID, ackID string, e contract.TaskEnd) ([]string, bool) {
-	h, ok := s.qs.handleOf(queueID)
+	h, ok := s.lookup(queueID)
 	if !ok {
 		log.Printf("sqliteq: finish task %s/%s: queue %s is not open in this client", e.Workflow, e.Task, queueID)
 		return nil, false
@@ -63,10 +67,12 @@ func (s *WorkflowStore) FinishTask(queueID, ackID string, e contract.TaskEnd) ([
 	e.Reason, e.Result = reason, result
 
 	if !validWorkflowID(e.Workflow) || !validTaskName(e.Task) {
-		return nil, q.finish(ackID, state, reason, result)
+		_, err := q.finishDirect(ackID, state, reason, result)
+		return nil, err == nil
 	}
 
 	ctx := context.Background()
+	s.preResolve(ctx, e.Workflow)
 	var r endResult
 	var acked bool
 	err := s.write(ctx, func(tx *sql.Tx) (err error) {
@@ -91,14 +97,18 @@ func (s *WorkflowStore) FinishTask(queueID, ackID string, e contract.TaskEnd) ([
 	}
 
 	pushed := r.pushed
-	if !s.single {
-		pushed = nil
-		if r.minSeq != 0 {
-			pushed = s.drain(ctx, `workflow_id = ? AND seq >= ?`, e.Workflow, r.minSeq)
+	if r.minSeq != 0 {
+		for _, id := range s.drain(ctx, `workflow_id = ? AND seq >= ?`, e.Workflow, r.minSeq) {
+			if !slices.Contains(pushed, id) {
+				pushed = append(pushed, id)
+			}
 		}
 	}
 	if !acked {
-		q.finish(ackID, state, reason, result)
+		if _, err := q.finishDirect(ackID, state, reason, result); err != nil {
+			log.Printf("sqliteq: finishing workflow %s task %s: ack: %v", e.Workflow, e.Task, err)
+			return nil, false
+		}
 	}
 	if r.refinish {
 		pushed = r.targets
@@ -142,25 +152,125 @@ func (s *WorkflowStore) endTx(ctx context.Context, tx *sql.Tx, queueID string, e
 	return r, err
 }
 
-// endPurged ends the workflow tasks of items a Purge of queue q removed as
-// cancelled (reason "queue purged"), so their workflows go on. There is no
-// job to settle: Purge deleted it. A task not in q, or one that had ended,
-// changes nothing.
-func (s *WorkflowStore) endPurged(q *Queue, tags []wfItemTag) {
-	ctx := context.Background()
+// purgeIntent is a purged workflow item whose end is still to be applied.
+type purgeIntent struct {
+	seq      int64 // 0: not stored
+	queueID  string
+	tag      wfItemTag
+	storedAt int64
+}
+
+// recordPurge stores an intent per tag in the workflow file before the
+// Purge deletes the rows, so a crash after the delete loses no end: the
+// recovery loop applies leftovers.
+func (s *WorkflowStore) recordPurge(ctx context.Context, q *Queue, tags []wfItemTag) []purgeIntent {
+	var out []purgeIntent
 	for _, tag := range tags {
-		e := contract.TaskEnd{Workflow: tag.wf, Task: tag.task, Undo: tag.undo, Outcome: contract.OutcomeCancelled, Reason: purgeReason}
-		var r endResult
-		err := s.write(ctx, func(tx *sql.Tx) (err error) {
-			r, err = s.endTx(ctx, tx, q.id, e)
-			return err
-		})
+		s.f.mu.Lock()
+		res, err := s.f.db.ExecContext(ctx, `INSERT INTO `+wfPurged+` (queue_id, workflow_id, task, undo, created_at) VALUES (?, ?, ?, ?, ?)`,
+			q.id, tag.wf, tag.task, btoi(tag.undo), s.now().UnixMilli())
+		s.f.mu.Unlock()
 		if err != nil {
-			log.Printf("sqliteq: purge of %s: ending workflow %s task %s: %v", q.name, tag.wf, tag.task, err)
+			log.Printf("sqliteq: purge of %s: recording workflow %s task %s: %v", q.name, tag.wf, tag.task, err)
 			continue
 		}
-		if r.minSeq != 0 {
-			s.drain(ctx, `workflow_id = ? AND seq >= ?`, tag.wf, r.minSeq)
+		seq, _ := res.LastInsertId()
+		out = append(out, purgeIntent{seq: seq, queueID: q.id, tag: tag})
+	}
+	return out
+}
+
+// endPurged applies the ends of items a Purge of queue q removed: each
+// intent, then the tags the delete's own read found that no intent covers.
+func (s *WorkflowStore) endPurged(q *Queue, intents []purgeIntent, tags []wfItemTag) {
+	seen := map[wfItemTag]bool{}
+	for _, in := range intents {
+		seen[in.tag] = true
+	}
+	for _, tag := range tags {
+		if !seen[tag] {
+			intents = append(intents, purgeIntent{queueID: q.id, tag: tag})
 		}
 	}
+	for _, in := range intents {
+		s.applyIntent(context.Background(), in)
+	}
+}
+
+// applyIntent ends the purged task as cancelled (reason "queue purged") and
+// deletes the intent, in one transaction. A task not in the queue, or one
+// that had ended, changes nothing.
+func (s *WorkflowStore) applyIntent(ctx context.Context, in purgeIntent) {
+	s.preResolve(ctx, in.tag.wf)
+	e := contract.TaskEnd{Workflow: in.tag.wf, Task: in.tag.task, Undo: in.tag.undo, Outcome: contract.OutcomeCancelled, Reason: purgeReason}
+	var r endResult
+	err := s.write(ctx, func(tx *sql.Tx) (err error) {
+		if r, err = s.endTx(ctx, tx, in.queueID, e); err != nil || in.seq == 0 {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM `+wfPurged+` WHERE seq = ?`, in.seq)
+		return err
+	})
+	if err != nil {
+		log.Printf("sqliteq: purge: ending workflow %s task %s: %v", in.tag.wf, in.tag.task, err)
+		return
+	}
+	if r.minSeq != 0 {
+		s.drain(ctx, `workflow_id = ? AND seq >= ?`, in.tag.wf, r.minSeq)
+	}
+}
+
+// applyIntents applies the intents at least minAge old.
+func (s *WorkflowStore) applyIntents(minAge time.Duration) {
+	rows, err := s.f.db.Query(`SELECT seq, queue_id, workflow_id, task, undo FROM `+wfPurged+` WHERE created_at <= ? ORDER BY seq LIMIT ?`,
+		s.now().Add(-minAge).UnixMilli(), drainBatch)
+	if err != nil {
+		return
+	}
+	var list []purgeIntent
+	for rows.Next() {
+		var in purgeIntent
+		var undo int
+		if rows.Scan(&in.seq, &in.queueID, &in.tag.wf, &in.tag.task, &undo) == nil {
+			in.tag.undo = undo == 1
+			list = append(list, in)
+		}
+	}
+	rows.Close()
+	for _, in := range list {
+		s.applyIntent(context.Background(), in)
+	}
+}
+
+// purgeStore returns the store whose workflows a Purge of the file must end:
+// the registered one, else one opened on demand when the file's workflow
+// tables exist (nil when they do not). done releases an on-demand store.
+func (f *file) purgeStore() (ws *WorkflowStore, done func()) {
+	if st, ok := contract.LookupWorkflowStore(f.scope); ok {
+		if ws, ok := st.(*WorkflowStore); ok {
+			return ws, func() {}
+		}
+	}
+	root := strings.TrimPrefix(f.scope, "sqliteq:")
+	single := root == f.key
+	wf, release := f, func() {}
+	if single {
+		var n int
+		if f.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = '__sqliteq_wf_workflows'`).Scan(&n) != nil || n == 0 {
+			return nil, func() {}
+		}
+	} else {
+		path, err := resolve(filepath.Join(root, workflowsFile))
+		if _, serr := os.Stat(path); err != nil || serr != nil {
+			return nil, func() {}
+		}
+		if wf, err = acquire(path, root, f.pages); err != nil {
+			log.Printf("sqliteq: purge: opening the workflow file: %v", err)
+			return nil, func() {}
+		}
+		release = func() { wf.release() }
+	}
+	qs := &queues{cfg: storeConfig{singleFile: single, checkpointPages: f.pages}, root: root, files: map[*file]struct{}{}}
+	qs.byID.Store(&map[string]*handle{})
+	return &WorkflowStore{qs: qs, f: wf, single: single, scope: f.scope, cfg: workflowConfig{resultLimit: defaultResultLimit, retention: defaultRetention}}, release
 }

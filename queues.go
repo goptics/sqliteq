@@ -65,6 +65,9 @@ func layout(path string, singleFile bool) (string, error) {
 		if exists && info.IsDir() {
 			return "", fmt.Errorf("sqliteq: %s is a folder; WithSingleFile needs a file path", path)
 		}
+		if filepath.Base(path) == workflowsFile {
+			return "", fmt.Errorf("sqliteq: %s is the workflow store's file name; choose another", path)
+		}
 		return resolve(path)
 	}
 

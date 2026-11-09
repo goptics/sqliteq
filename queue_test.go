@@ -2352,7 +2352,7 @@ func withUndo(tp contract.TaskPlan, wf string, q any) contract.TaskPlan {
 	return tp
 }
 
-func wfPlan(id string, tasks ...contract.TaskPlan) contract.WorkflowPlan {
+func planWF(id string, tasks ...contract.TaskPlan) contract.WorkflowPlan {
 	return contract.WorkflowPlan{ID: id, Hash: id + "-hash", Tasks: tasks}
 }
 
@@ -2475,7 +2475,7 @@ func TestWorkflowHappyPath(t *testing.T) {
 	eachLayout(t, func(t *testing.T, single bool) {
 		e := newWFEnv(t, single)
 		ctx := context.Background()
-		plan := wfPlan("w1", planTask("w1", "t1", e.a), planTask("w1", "t2", e.p, "t1"), planTask("w1", "t3", e.b, "t2"))
+		plan := planWF("w1", planTask("w1", "t1", e.a), planTask("w1", "t2", e.p, "t1"), planTask("w1", "t3", e.b, "t2"))
 		plan.Tasks[1].Priority = 5
 		if err := e.st.Submit(ctx, plan); err != nil {
 			t.Fatal(err)
@@ -2564,13 +2564,13 @@ func TestWorkflowSubmitChecks(t *testing.T) {
 
 	bad := map[string]contract.WorkflowPlan{
 		"empty":       {ID: "x", Hash: "h"},
-		"bad id":      wfPlan("a b", planTask("a b", "t", e.a)),
-		"index":       wfPlan("index", planTask("index", "t", e.a)),
-		"bad task":    wfPlan("x", planTask("x", "t t", e.a)),
-		"other scope": wfPlan("x", planTask("x", "t", oq)),
-		"not a queue": wfPlan("x", planTask("x", "t", "q")),
-		"bad item":    wfPlan("x", func() contract.TaskPlan { tp := planTask("x", "t", e.a); tp.Item = []byte("[1]"); return tp }()),
-		"dup name":    wfPlan("x", planTask("x", "t", e.a), planTask("x", "t", e.a)),
+		"bad id":      planWF("a b", planTask("a b", "t", e.a)),
+		"index":       planWF("index", planTask("index", "t", e.a)),
+		"bad task":    planWF("x", planTask("x", "t t", e.a)),
+		"other scope": planWF("x", planTask("x", "t", oq)),
+		"not a queue": planWF("x", planTask("x", "t", "q")),
+		"bad item":    planWF("x", func() contract.TaskPlan { tp := planTask("x", "t", e.a); tp.Item = []byte("[1]"); return tp }()),
+		"dup name":    planWF("x", planTask("x", "t", e.a), planTask("x", "t", e.a)),
 	}
 	for name, plan := range bad {
 		if err := e.st.Submit(ctx, plan); err == nil {
@@ -2594,7 +2594,7 @@ func TestWorkflowFailureAndCompensation(t *testing.T) {
 	eachLayout(t, func(t *testing.T, single bool) {
 		e := newWFEnv(t, single)
 		ctx := context.Background()
-		plan := wfPlan("w2",
+		plan := planWF("w2",
 			withUndo(planTask("w2", "a", e.a), "w2", e.b),
 			withUndo(planTask("w2", "b", e.a, "a"), "w2", e.b),
 			planTask("w2", "c", e.a, "b"))
@@ -2637,7 +2637,7 @@ func TestWorkflowFailureAndCompensation(t *testing.T) {
 		}
 
 		// FailFast: the first failure cancels what waits
-		ff := wfPlan("w3", planTask("w3", "a", e.a), planTask("w3", "b", e.a), planTask("w3", "c", e.a, "a"))
+		ff := planWF("w3", planTask("w3", "a", e.a), planTask("w3", "b", e.a), planTask("w3", "c", e.a, "a"))
 		ff.FailFast = true
 		if err := e.st.Submit(ctx, ff); err != nil {
 			t.Fatal(err)
@@ -2660,7 +2660,7 @@ func TestWorkflowCancel(t *testing.T) {
 		if err := e.st.Cancel(ctx, "missing", nil); !errors.Is(err, contract.ErrWorkflowNotFound) {
 			t.Errorf("Expected ErrWorkflowNotFound, got %v", err)
 		}
-		plan := wfPlan("w1", withUndo(planTask("w1", "a", e.a), "w1", e.b), planTask("w1", "b", e.a, "a"))
+		plan := planWF("w1", withUndo(planTask("w1", "a", e.a), "w1", e.b), planTask("w1", "b", e.a, "a"))
 		if err := e.st.Submit(ctx, plan); err != nil {
 			t.Fatal(err)
 		}
@@ -2694,7 +2694,7 @@ func TestWorkflowCancel(t *testing.T) {
 func TestWorkflowResultLimit(t *testing.T) {
 	e := newWFEnv(t, false, WithWorkflowResultLimit(8))
 	ctx := context.Background()
-	if err := e.st.Submit(ctx, wfPlan("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.a, "a"))); err != nil {
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.a, "a"))); err != nil {
 		t.Fatal(err)
 	}
 	_, ack := take(t, e.a)
@@ -2710,7 +2710,7 @@ func TestWorkflowResultLimit(t *testing.T) {
 func TestWorkflowCrashAfterRecord(t *testing.T) {
 	e := newWFEnv(t, false)
 	ctx := context.Background()
-	if err := e.st.Submit(ctx, wfPlan("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = take(t, e.a)
@@ -2745,7 +2745,7 @@ func TestWorkflowCrashAfterRecord(t *testing.T) {
 func TestWorkflowRecoverOnOpen(t *testing.T) {
 	e := newWFEnv(t, false)
 	ctx := context.Background()
-	if err := e.st.Submit(ctx, wfPlan("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = take(t, e.a)
@@ -2774,7 +2774,7 @@ func TestWorkflowRecoveryLoop(t *testing.T) {
 	defer func() { recoverEvery = old }()
 	e := newWFEnv(t, false)
 	ctx := context.Background()
-	if err := e.st.Submit(ctx, wfPlan("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = take(t, e.a)
@@ -2797,7 +2797,7 @@ func TestWorkflowRecoveryLoop(t *testing.T) {
 func TestWorkflowDuplicatePush(t *testing.T) {
 	e := newWFEnv(t, false)
 	ctx := context.Background()
-	if err := e.st.Submit(ctx, wfPlan("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
 		t.Fatal(err)
 	}
 	_, ack := take(t, e.a)
@@ -2819,7 +2819,7 @@ func TestWorkflowDuplicatePush(t *testing.T) {
 	}
 	rows.Close()
 	e.st.drain(ctx, where, args...) // step b done, the crash comes before the ack
-	if !pushRow(&handle{q: e.b}, row) || e.b.Len() != 1 {
+	if pushRow(&handle{q: e.b}, row) != nil || e.b.Len() != 1 {
 		t.Fatalf("Expected the duplicate push to store nothing, got %d rows", e.b.Len())
 	}
 	// Redelivery of a: skipped, then finished; b is still queued once
@@ -2831,32 +2831,186 @@ func TestWorkflowDuplicatePush(t *testing.T) {
 	}
 }
 
-// Single file: the end, the pushes and the ack are one transaction, so a
-// failed push (an unopened queue) leaves everything as it was.
+// Single file: the end and the ack are one transaction. A push target this
+// client cannot reach gets an outbox row in that transaction; the recovery
+// loop pushes it once a client opens the queue.
 func TestWorkflowSingleFileAtomic(t *testing.T) {
 	e := newWFEnv(t, true)
 	ctx := context.Background()
-	if err := e.st.Submit(ctx, wfPlan("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
 		t.Fatal(err)
 	}
 	if n := e.outbox(t); n != 0 {
-		t.Fatalf("Expected no outbox rows in one file, got %d", n)
+		t.Fatalf("Expected no outbox rows while every queue is reachable, got %d", n)
 	}
 	_, ack := take(t, e.a)
-	qs := e.qs.(*queues)
-	qs.mu.Lock()
-	unknown := maps.Clone(*qs.byID.Load())
-	delete(unknown, e.b.QueueID()) // b is not open in this client
-	qs.byID.Store(&unknown)
-	qs.mu.Unlock()
-	if _, ok := e.st.FinishTask(e.a.QueueID(), ack, done("w1", "a", "")); ok {
-		t.Fatal("Expected FinishTask to fail when a push target is unknown")
+	hide := func(id string) {
+		qs := e.qs.(*queues)
+		qs.mu.Lock()
+		m := maps.Clone(*qs.byID.Load())
+		delete(m, id)
+		qs.byID.Store(&m)
+		qs.mu.Unlock()
 	}
-	if got := taskStates(e.state(t, "w1")); got != "a=pending b=waiting" {
-		t.Errorf("Expected the workflow untouched, got %s", got)
+	e.b.Close() // closed: the registry still lists it, the table does not
+	hide(e.b.QueueID())
+	registry.mu.Lock()
+	delete(e.a.f.handles, "b")
+	registry.mu.Unlock()
+	pushed, ok := e.st.FinishTask(e.a.QueueID(), ack, done("w1", "a", ""))
+	if !ok || len(pushed) != 0 {
+		t.Fatalf("Expected ok with no push, got %v %t", pushed, ok)
 	}
-	if n := stats(t, e.a).Counts.Processing; n != 1 {
-		t.Errorf("Expected the job still processing, got %d processing", n)
+	if got := taskStates(e.state(t, "w1")); got != "a=completed b=pending" || e.outbox(t) != 1 {
+		t.Errorf("Expected the end recorded and one outbox row, got %s, %d rows", got, e.outbox(t))
+	}
+	if n := stats(t, e.a).Counts.Processing; n != 0 {
+		t.Errorf("Expected the job acknowledged, got %d processing", n)
+	}
+	// Opened later (here by a second client): the loop pushes the row
+	other := mustNew(t, e.qs.(*queues).root, WithSingleFile())
+	defer other.Close()
+	b2, err := other.NewQueue("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.st.recoverOutbox(0)
+	if e.outbox(t) != 0 || b2.Len() != 1 {
+		t.Errorf("Expected the row pushed, got %d rows, b %d", e.outbox(t), b2.Len())
+	}
+}
+
+// FinishTask finds a queue opened by any client of the scope in this process.
+func TestWorkflowQueueOfAnotherClient(t *testing.T) {
+	eachLayout(t, func(t *testing.T, single bool) {
+		e := newWFEnv(t, single)
+		var other Queues
+		if single {
+			other = mustNew(t, e.qs.(*queues).root, WithSingleFile())
+		} else {
+			other = mustNew(t, e.dir)
+		}
+		defer other.Close()
+		c, err := other.NewQueue("c") // known to the second client only
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+		if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "c", c, "a"))); err != nil {
+			t.Fatal(err)
+		}
+		_, ack := take(t, e.a)
+		// Forget what Submit learned: the lookup goes through the registry
+		qs := e.qs.(*queues)
+		qs.mu.Lock()
+		qs.byID.Store(&map[string]*handle{})
+		qs.mu.Unlock()
+		if _, ok := e.st.FinishTask(e.a.QueueID(), ack, done("w1", "a", "")); !ok {
+			t.Fatal("FinishTask failed")
+		}
+		if c.Len() != 1 {
+			t.Errorf("Expected the task pushed into the other client's queue, got %d", c.Len())
+		}
+	})
+}
+
+// A plain job cannot hold a wf: job ID, and a row that already holds one is
+// not taken for the workflow's push.
+func TestWorkflowJobIDHeldByPlainJob(t *testing.T) {
+	eachLayout(t, func(t *testing.T, single bool) {
+		e := newWFEnv(t, single)
+		if e.a.EnqueueOnce(job("wf:w1:a"), "wf:w1:a") || e.a.EnqueueOnce(wfItem("w1", "other", false), "wf:w1:a") {
+			t.Error("Expected a plain job refused a wf: job ID")
+		}
+		// A row planted by an older version, before the guard
+		if _, err := e.a.f.db.Exec(`INSERT INTO "a" (data, status, ack, created_at, updated_at, job_id) VALUES (?, 'pending', 0, 0, 0, 'wf:w1:a')`, job("wf:w1:a")); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.st.Submit(context.Background(), planWF("w1", planTask("w1", "a", e.a))); err != nil {
+			t.Fatal(err)
+		}
+		if e.outbox(t) != 1 || e.a.Len() != 1 {
+			t.Errorf("Expected the push kept in the outbox, got %d rows, a %d", e.outbox(t), e.a.Len())
+		}
+		e.st.recoverOutbox(0)
+		if e.outbox(t) != 1 {
+			t.Error("Expected the row to stay while the job ID is held")
+		}
+	})
+}
+
+// A Deps entry that names no task is refused; an ended, expired, unswept
+// workflow does not block a Submit of its ID.
+func TestWorkflowSubmitDepsAndExpired(t *testing.T) {
+	e := newWFEnv(t, false, WithWorkflowRetention(time.Hour))
+	ctx := context.Background()
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a, "ghost"))); err == nil {
+		t.Error("Expected a dependency on no task refused")
+	}
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixMilli())
+	e.st.setClock(func() time.Time { return time.UnixMilli(clock.Load()) })
+	if err := e.st.Submit(ctx, planWF("w2", planTask("w2", "a", e.a))); err != nil {
+		t.Fatal(err)
+	}
+	_, ack := take(t, e.a)
+	e.finish(t, e.a, ack, done("w2", "a", ""))
+	clock.Add(2 * time.Hour.Milliseconds())
+	again := planWF("w2", planTask("w2", "a", e.a))
+	again.Hash = "new"
+	if err := e.st.Submit(ctx, again); err != nil {
+		t.Fatalf("Expected a new workflow under the expired ID, got %v", err)
+	}
+	if got := taskStates(e.state(t, "w2")); got != "a=pending" {
+		t.Errorf("got %s", got)
+	}
+}
+
+// Purge with no store registered still ends the purged workflow tasks, from
+// the workflow tables on disk; under WithSingleFile in one transaction.
+func TestWorkflowPurgeWithoutStore(t *testing.T) {
+	eachLayout(t, func(t *testing.T, single bool) {
+		e := newWFEnv(t, single)
+		ctx := context.Background()
+		plan := planWF("w1", planTask("w1", "a", e.a), planTask("w1", "z", e.b, "a"))
+		plan.Tasks[1].Always = true
+		if err := e.st.Submit(ctx, plan); err != nil {
+			t.Fatal(err)
+		}
+		e.st.Close() // unregisters; the tables stay
+		e.a.Purge()
+		st, err := NewWorkflowStore(e.qs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		r, err := st.Record(ctx, "w1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := taskStates(r); got != "a=cancelled z=pending" || e.b.Len() != 1 {
+			t.Errorf("got %s, b %d", got, e.b.Len())
+		}
+	})
+}
+
+// Folder layout: a purge intent a crash left is applied by the recovery.
+func TestWorkflowPurgeIntentRecovery(t *testing.T) {
+	e := newWFEnv(t, false)
+	ctx := context.Background()
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
+		t.Fatal(err)
+	}
+	e.st.recordPurge(ctx, e.a, []wfItemTag{{wf: "w1", task: "a"}}) // the crash comes after this
+	e.a.purge(nil)
+	e.st.recoverOutbox(0)
+	if got := taskStates(e.state(t, "w1")); got != "a=cancelled b=cancelled" {
+		t.Errorf("got %s", got)
+	}
+	var n int
+	e.st.f.db.QueryRow(`SELECT COUNT(*) FROM ` + wfPurged).Scan(&n)
+	if n != 0 {
+		t.Errorf("Expected the intent deleted, got %d", n)
 	}
 }
 
@@ -2869,7 +3023,7 @@ func TestWorkflowRetention(t *testing.T) {
 		clock.Store(time.Now().UnixMilli())
 		e.st.setClock(func() time.Time { return time.UnixMilli(clock.Load()) })
 		for _, id := range []string{"ended", "running"} {
-			if err := e.st.Submit(ctx, wfPlan(id, planTask(id, "a", e.a))); err != nil {
+			if err := e.st.Submit(ctx, planWF(id, planTask(id, "a", e.a))); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -2899,7 +3053,7 @@ func TestWorkflowRetention(t *testing.T) {
 			t.Errorf("Expected the tasks swept too, got %d", n)
 		}
 		// A finish of a swept workflow settles the job and returns ok
-		if err := e.st.Submit(ctx, wfPlan("gone", planTask("gone", "a", e.a))); err != nil {
+		if err := e.st.Submit(ctx, planWF("gone", planTask("gone", "a", e.a))); err != nil {
 			t.Fatal(err)
 		}
 		_, ack = take(t, e.a)
@@ -2917,7 +3071,7 @@ func TestWorkflowListing(t *testing.T) {
 	clock.Store(1_000_000)
 	e.st.setClock(func() time.Time { return time.UnixMilli(clock.Load()) })
 	for _, id := range []string{"b", "a", "c"} {
-		if err := e.st.Submit(ctx, wfPlan(id, planTask(id, "t", e.a))); err != nil {
+		if err := e.st.Submit(ctx, planWF(id, planTask(id, "t", e.a))); err != nil {
 			t.Fatal(err)
 		}
 		if id == "a" {
@@ -2980,6 +3134,7 @@ func TestWorkflowTag(t *testing.T) {
 		{"index", `{"id":"wf:index:t","wf":"index","task":"t"}`, false},
 		{"upper WF", `{"id":"wf:w:t","wf":"w","WF":"x","task":"t"}`, false},
 		{"upper Task", `{"id":"wf:w:t","wf":"w","Task":"t"}`, false},
+		{"dotted I", `{"\u0130d":"x","id":"wf:w:t","wf":"w","task":"t"}`, true},
 		{"Id", `{"Id":"wf:w:t","id":"wf:w:t","wf":"w","task":"t"}`, false},
 		{"long s", `{"id":"wf:w:t","wf":"w","taſk":"t","task":"t"}`, false},
 		{"kelvin", `{"id":"wf:w:t","wf":"w","tasK":"t","task":"t"}`, false},
@@ -2998,7 +3153,7 @@ func TestWorkflowItemSurvivesCancelMark(t *testing.T) {
 	eachLayout(t, func(t *testing.T, single bool) {
 		e := newWFEnv(t, single)
 		ctx := context.Background()
-		if err := e.st.Submit(ctx, wfPlan("w1", planTask("w1", "a", e.a))); err != nil {
+		if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a))); err != nil {
 			t.Fatal(err)
 		}
 		if err := e.a.CancelJob("wf:w1:a"); err != nil {
@@ -3037,7 +3192,7 @@ func TestWorkflowPurge(t *testing.T) {
 	eachLayout(t, func(t *testing.T, single bool) {
 		e := newWFEnv(t, single)
 		ctx := context.Background()
-		plan := wfPlan("w1", planTask("w1", "a", e.a), planTask("w1", "n", e.a, "a"), planTask("w1", "z", e.b, "a"))
+		plan := planWF("w1", planTask("w1", "a", e.a), planTask("w1", "n", e.a, "a"), planTask("w1", "z", e.b, "a"))
 		plan.Tasks[2].Always = true
 		if err := e.st.Submit(ctx, plan); err != nil {
 			t.Fatal(err)

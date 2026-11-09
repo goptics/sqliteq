@@ -2,10 +2,12 @@ package sqliteq
 
 import (
 	"cmp"
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"strconv"
 	"strings"
@@ -339,6 +341,27 @@ func (q *Queue) ScopeID() string {
 	return q.f.scope
 }
 
+// finishDirect is finish in a transaction of its own, outside the group
+// commit: found is false when no processing row had the ack ID, which is no
+// error (a re-finish).
+func (q *Queue) finishDirect(ackID string, state contract.JobState, reason string, result []byte) (found bool, err error) {
+	id, ok := parseAckID(ackID)
+	if !ok {
+		return false, nil
+	}
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
+	tx, err := q.f.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if found, err = q.finishTx(tx, id, state, reason, result, time.Now()); err != nil {
+		return false, err
+	}
+	return found, tx.Commit()
+}
+
 // Enqueue adds an item to the queue
 // Returns true if the operation was successful
 func (q *Queue) Enqueue(item any) bool {
@@ -368,6 +391,20 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 		return false
 	}
 
+	// A wf: ID belongs to workflow items; a plain job must not hold one
+	if strings.HasPrefix(id, "wf:") {
+		var b []byte
+		switch v := data.(type) {
+		case []byte:
+			b = v
+		case string:
+			b = []byte(v)
+		}
+		if tag, ok := workflowTag(b); !ok || tag.jobID() != id {
+			return false
+		}
+	}
+
 	// No id is NULL, which the job_id index leaves out; "" would be one id
 	var jobID any
 	if id != "" {
@@ -392,17 +429,56 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 	})
 }
 
+// errJobIDTaken: the job ID belongs to a row that is not the same workflow task.
+var errJobIDTaken = errors.New("sqliteq: job id is held by another job")
+
 // enqueueTx is enqueue in the caller's tx, which holds the file's write
-// mutex: one pending row under id, none when a row with that id exists.
+// mutex: one pending row under id. A repeat is fine only when the stored row
+// is the same workflow item (same wf, task and undo); else errJobIDTaken.
 func (q *Queue) enqueueTx(tx *sql.Tx, item []byte, priority int, id string) error {
 	now := time.Now().UTC()
 	insert := tx.Stmt(q.insert)
+	var res sql.Result
+	var err error
 	if q.priority {
-		_, err := insert.Exec(item, now, now, id, priority)
+		res, err = insert.Exec(item, now, now, id, priority)
+	} else {
+		res, err = insert.Exec(item, now, now, id)
+	}
+	if err != nil {
 		return err
 	}
-	_, err := insert.Exec(item, now, now, id)
-	return err
+	if n, err := res.RowsAffected(); err != nil || n > 0 {
+		return err
+	}
+	var data []byte
+	if err := tx.QueryRow(fmt.Sprintf("SELECT data FROM %s WHERE job_id = ?", q.table), id).Scan(&data); err != nil {
+		return err
+	}
+	want, ok := workflowTag(item)
+	if have, hok := workflowTag(data); !ok || !hok || have != want {
+		return errJobIDTaken
+	}
+	return nil
+}
+
+// pushWorkflow adds a workflow item under its job ID in a transaction of its
+// own (see enqueueTx).
+func (q *Queue) pushWorkflow(item []byte, priority int, id string) error {
+	if q.closed.Load() {
+		return errClosed
+	}
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
+	tx, err := q.f.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := q.enqueueTx(tx, item, priority, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // claimN moves up to n pending rows to processing in one statement and
@@ -787,19 +863,47 @@ func (q *Queue) Values() []any {
 // marks and totals; a pause stays (spec 6.6, 6.7, 6.14). A purged workflow
 // task or undo ends cancelled (reason "queue purged"), so its workflow goes
 // on: dependents follow their policy, and what that releases is pushed after
-// the delete. Without a workflow store for the queue's scope, no workflow
-// ends.
+// the delete. The workflow store is the registered one, or one opened on
+// demand when the file has workflow tables. Under WithSingleFile the delete
+// and the ends are one transaction. Folder layout: an intent is stored in
+// the workflow file first, and the recovery loop applies one a crash left.
 func (q *Queue) Purge() {
-	store, _ := contract.LookupWorkflowStore(q.f.scope)
-	ws, _ := store.(*WorkflowStore)
-	if tags := q.purge(ws != nil); ws != nil {
-		ws.endPurged(q, tags)
+	ws, done := q.f.purgeStore()
+	defer done()
+	if ws == nil {
+		q.purge(nil)
+		return
 	}
+	ctx := context.Background()
+	pending := q.pendingTags()
+	if ws.single {
+		for _, tag := range pending {
+			ws.preResolve(ctx, tag.wf)
+		}
+		for _, tag := range q.purge(ws) {
+			ws.drain(ctx, `workflow_id = ?`, tag.wf)
+		}
+		return
+	}
+	intents := ws.recordPurge(ctx, q, pending)
+	ws.endPurged(q, intents, q.purge(ws))
 }
 
-// purge deletes the rows under the write mutex; with workflows it first
-// reads the tags of the pending and processing workflow items.
-func (q *Queue) purge(workflows bool) (tags []wfItemTag) {
+// pendingTags reads the workflow tags of the queued and running items.
+func (q *Queue) pendingTags() []wfItemTag {
+	tx, err := q.f.db.Begin()
+	if err != nil {
+		return nil
+	}
+	defer tx.Rollback()
+	tags, _ := q.workflowTags(tx)
+	return tags
+}
+
+// purge deletes the rows under the write mutex and returns the workflow tags
+// it found in them (read in the same transaction); with a single-file store
+// it also ends those tasks in the transaction, and returns them.
+func (q *Queue) purge(ws *WorkflowStore) (tags []wfItemTag) {
 	q.f.mu.Lock()
 	defer q.f.mu.Unlock()
 
@@ -808,7 +912,7 @@ func (q *Queue) purge(workflows bool) (tags []wfItemTag) {
 		return nil
 	}
 	defer tx.Rollback()
-	if workflows {
+	if ws != nil {
 		if tags, err = q.workflowTags(tx); err != nil {
 			return nil
 		}
@@ -820,6 +924,16 @@ func (q *Queue) purge(workflows bool) (tags []wfItemTag) {
 	}
 	if _, err := tx.Exec("UPDATE " + q.meta + " SET value = 0 WHERE key <> 'paused_at'"); err != nil {
 		return nil
+	}
+	if ws != nil && ws.single {
+		ctx := context.Background()
+		for _, tag := range tags {
+			e := contract.TaskEnd{Workflow: tag.wf, Task: tag.task, Undo: tag.undo, Outcome: contract.OutcomeCancelled, Reason: purgeReason}
+			if _, err := ws.endTx(ctx, tx, q.id, e); err != nil {
+				log.Printf("sqliteq: purge of %s: ending workflow %s task %s: %v", q.name, tag.wf, tag.task, err)
+				return nil
+			}
+		}
 	}
 	if tx.Commit() != nil {
 		return nil

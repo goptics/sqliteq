@@ -35,7 +35,7 @@ func workflowExample() {
 		log.Fatalf("Failed to create queue: %v", err)
 	}
 
-	// Create the store after the queues; it registers itself for their scope
+	// The store registers itself for the scope of the queues
 	store, err := sqliteq.NewWorkflowStore(qs)
 	if err != nil {
 		log.Fatalf("Failed to create workflow store: %v", err)

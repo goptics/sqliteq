@@ -87,6 +87,9 @@ func acquire(path, root string, pages int) (*file, error) {
 	defer registry.mu.Unlock()
 
 	if f, ok := registry.files[path]; ok {
+		if f.scope != "sqliteq:"+root {
+			return nil, fmt.Errorf("sqliteq: %s is already open under scope %s, not sqliteq:%s", path, f.scope, root)
+		}
 		if f.pages != pages {
 			return nil, fmt.Errorf("sqliteq: %s is already open with checkpoint pages %d, not %d", path, f.pages, pages)
 		}

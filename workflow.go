@@ -48,11 +48,16 @@ const (
 	wfWorkflows = `"__sqliteq_wf_workflows"`
 	wfTasks     = `"__sqliteq_wf_tasks"`
 	wfOutbox    = `"__sqliteq_wf_outbox"`
+	wfPurged    = `"__sqliteq_wf_purged"`
 
 	// sweepWorkflowsEvery is how often the loop drops expired workflows.
 	sweepWorkflowsEvery = time.Minute
+	// sweepOnSubmit is the least time between the sweeps Submit starts.
+	sweepOnSubmit = 30 * time.Second
 	// drainBatch is how many outbox rows one read takes.
 	drainBatch = 256
+	// drainCap is the most rows one drain pushes: a backlog goes on next tick.
+	drainCap = 2048
 	// purgeReason is the reason of a task its queue's Purge ended.
 	purgeReason = "queue purged"
 )
@@ -109,6 +114,8 @@ type WorkflowStore struct {
 
 	stop      chan struct{}
 	done      chan struct{}
+	warned    sync.Map     // keys logged once
+	sweptAt   atomic.Int64 // Unix ms of the last sweep Submit started
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -218,6 +225,14 @@ func (s *WorkflowStore) init() error {
 			priority INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS ` + wfPurged + ` (
+			seq INTEGER PRIMARY KEY AUTOINCREMENT,
+			queue_id TEXT NOT NULL,
+			workflow_id TEXT NOT NULL,
+			task TEXT NOT NULL,
+			undo INTEGER NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS "__sqliteq_wf_outbox_workflow" ON ` + wfOutbox + ` (workflow_id)`,
 	} {
 		if _, err := s.f.db.Exec(stmt); err != nil {
@@ -292,12 +307,6 @@ func validWFName(s string, n int) bool {
 func validWorkflowID(id string) bool { return validWFName(id, 128) && id != "index" }
 func validTaskName(n string) bool    { return validWFName(n, 64) }
 
-// wfFold lower-cases s the way encoding/json matches keys: ASCII case, and
-// U+017F and U+212A fold to s and k.
-func wfFold(s string) string {
-	return strings.ToLower(strings.NewReplacer("ſ", "s", "K", "k").Replace(s))
-}
-
 // wfItemTag is the workflow fields of an item.
 type wfItemTag struct {
 	wf, task string
@@ -318,10 +327,10 @@ func workflowTag(data []byte) (wfItemTag, bool) {
 	if json.Unmarshal(data, &env) != nil {
 		return t, false
 	}
+	// encoding/json would read such a key as that field
 	for k := range env {
-		switch f := wfFold(k); f {
-		case "id", "wf", "task", "undo":
-			if k != f {
+		for _, name := range [...]string{"id", "wf", "task", "undo"} {
+			if k != name && strings.EqualFold(k, name) {
 				return t, false
 			}
 		}
@@ -346,9 +355,13 @@ func workflowTag(data []byte) (wfItemTag, bool) {
 	return t, id == want
 }
 
-func isWorkflowItem(data []byte) bool {
-	_, ok := workflowTag(data)
-	return ok
+// jobID is the job ID a Submit gives the task or undo.
+func (t wfItemTag) jobID() string {
+	id := "wf:" + t.wf + ":" + t.task
+	if t.undo {
+		id += ":undo"
+	}
+	return id
 }
 
 // querier is what a *sql.DB and a *sql.Tx share.
@@ -407,6 +420,78 @@ func (qs *queues) learn(h *handle) {
 	}
 }
 
+// lookup finds queue id for any client of the scope in this process: this
+// client's table first, then the file registry; a hit is learned. Call it
+// outside the file's write mutex: the registry lock comes before it.
+func (s *WorkflowStore) lookup(id string) (*handle, bool) {
+	if h, ok := s.qs.handleOf(id); ok {
+		return h, true
+	}
+	var found *handle
+	registry.mu.Lock()
+	for _, f := range registry.files {
+		if f.scope != s.scope {
+			continue
+		}
+		for _, h := range f.handles {
+			if h.queue().id == id {
+				found = h
+			}
+		}
+	}
+	registry.mu.Unlock()
+	if found == nil {
+		return nil, false
+	}
+	s.qs.learn(found)
+	return found, true
+}
+
+// openIDs learns every queue of the scope open in this process and returns
+// their IDs.
+func (s *WorkflowStore) openIDs() []string {
+	var hs []*handle
+	registry.mu.Lock()
+	for _, f := range registry.files {
+		if f.scope == s.scope {
+			for _, h := range f.handles {
+				hs = append(hs, h)
+			}
+		}
+	}
+	registry.mu.Unlock()
+	for _, h := range hs {
+		s.qs.learn(h)
+	}
+	m := *s.qs.byID.Load()
+	ids := make([]string, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// preResolve looks up the queues of workflow id before a write, so the
+// transaction (which holds the file mutex) only reads the lock-free table.
+func (s *WorkflowStore) preResolve(ctx context.Context, id string) {
+	rows, err := s.f.db.QueryContext(ctx, `SELECT queue_id FROM `+wfTasks+` WHERE workflow_id = ?
+		UNION SELECT undo_queue_id FROM `+wfTasks+` WHERE workflow_id = ? AND has_undo = 1`, id, id)
+	if err != nil {
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var q string
+		if rows.Scan(&q) == nil {
+			ids = append(ids, q)
+		}
+	}
+	rows.Close()
+	for _, q := range ids {
+		s.lookup(q)
+	}
+}
+
 func btoi(b bool) int {
 	if b {
 		return 1
@@ -433,7 +518,16 @@ func (s *WorkflowStore) Submit(ctx context.Context, p contract.WorkflowPlan) err
 		qh    *handle
 	}
 	plan := make([]planned, len(p.Tasks))
+	names := make(map[string]bool, len(p.Tasks))
+	for _, tp := range p.Tasks {
+		names[tp.Name] = true
+	}
 	for i, tp := range p.Tasks {
+		for _, d := range tp.Deps {
+			if !names[d] {
+				return fmt.Errorf("varmq: task %q depends on %q, which is not in the workflow", tp.Name, d)
+			}
+		}
 		if !validTaskName(tp.Name) {
 			return fmt.Errorf("varmq: invalid task name %q", tp.Name)
 		}
@@ -464,6 +558,9 @@ func (s *WorkflowStore) Submit(ctx context.Context, p contract.WorkflowPlan) err
 	var minSeq int64
 	var exists bool
 	err := s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.dropExpired(ctx, tx, p.ID); err != nil {
+			return err
+		}
 		var hash string
 		switch err := tx.QueryRowContext(ctx, `SELECT hash FROM `+wfWorkflows+` WHERE id = ?`, p.ID).Scan(&hash); {
 		case err == nil:
@@ -528,8 +625,10 @@ func (s *WorkflowStore) Submit(ctx context.Context, p contract.WorkflowPlan) err
 		if minSeq != 0 {
 			s.drain(ctx, `workflow_id = ? AND seq >= ?`, p.ID, minSeq)
 		}
-		if err := s.sweep(ctx); err != nil {
-			log.Printf("sqliteq: sweeping workflows: %v", err)
+		if last := s.sweptAt.Load(); s.now().UnixMilli()-last >= sweepOnSubmit.Milliseconds() && s.sweptAt.CompareAndSwap(last, s.now().UnixMilli()) {
+			if err := s.sweep(ctx); err != nil {
+				log.Printf("sqliteq: sweeping workflows: %v", err)
+			}
 		}
 	}
 	return nil
@@ -554,7 +653,8 @@ func (s *WorkflowStore) stamp(w *wfFlow, fx []wfEffect) {
 // release turns the pushes of fx into rows (reading and clearing each task's
 // stored item) and delivers them in tx.
 // Folder layout: outbox rows, minSeq the first one's seq (0 when none).
-// Single file: straight into the queues, ids the queue IDs it pushed into.
+// Single file: straight into the queues (ids), except those this client
+// cannot reach, which get outbox rows.
 func (s *WorkflowStore) release(ctx context.Context, tx *sql.Tx, w *wfFlow, fx []wfEffect) (minSeq int64, ids []string, err error) {
 	var rows []outRow
 	for _, e := range fx {
@@ -582,18 +682,20 @@ func (s *WorkflowStore) release(ctx context.Context, tx *sql.Tx, w *wfFlow, fx [
 	}
 
 	for _, r := range rows {
-		if s.single {
-			h, ok := s.qs.handleOf(r.queueID)
-			if !ok {
-				return 0, nil, fmt.Errorf("sqliteq: workflow %s: queue %s is not open in this client", w.id, r.queueID)
-			}
-			if err = h.queue().enqueueTx(tx, r.item, r.priority, r.jobID); err != nil {
+		// A queue this client cannot reach (opened later, or by another
+		// client) gets an outbox row, in either layout: the push waits
+		if h, ok := s.qs.handleOf(r.queueID); ok && s.single {
+			switch err = h.queue().enqueueTx(tx, r.item, r.priority, r.jobID); {
+			case err == nil:
+				if !slices.Contains(ids, r.queueID) {
+					ids = append(ids, r.queueID)
+				}
+				continue
+			case errors.Is(err, errJobIDTaken):
+				s.warnOnce(r.jobID, "job id is held by another job; the push stays in the outbox")
+			default:
 				return 0, nil, err
 			}
-			if !slices.Contains(ids, r.queueID) {
-				ids = append(ids, r.queueID)
-			}
-			continue
 		}
 		res, err := tx.ExecContext(ctx, `INSERT INTO `+wfOutbox+
 			` (workflow_id, queue_id, job_id, item, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -611,17 +713,24 @@ func (s *WorkflowStore) release(ctx context.Context, tx *sql.Tx, w *wfFlow, fx [
 }
 
 // drain pushes the outbox rows matching where into their queues and deletes
-// each pushed one. A queue this client did not open, or a closed one, keeps
-// its rows for the next recovery. It returns the queue IDs pushed into.
+// each pushed one. Only rows of queues open in this process are read; a
+// closed queue keeps its rows for the next recovery. It returns the queue IDs pushed into.
 func (s *WorkflowStore) drain(ctx context.Context, where string, args ...any) []string {
-	if s.single {
+	open := s.openIDs()
+	if len(open) == 0 {
 		return nil
 	}
+	in := strings.TrimSuffix(strings.Repeat("?,", len(open)), ",")
 	var ids []string
-	after := int64(0)
+	after, total := int64(0), 0
 	for {
+		qargs := []any{after}
+		qargs = append(qargs, args...)
+		for _, id := range open {
+			qargs = append(qargs, id)
+		}
 		rows, err := s.f.db.QueryContext(ctx, `SELECT seq, queue_id, job_id, item, priority FROM `+wfOutbox+
-			` WHERE seq > ? AND (`+where+`) ORDER BY seq LIMIT `+fmt.Sprint(drainBatch), append([]any{after}, args...)...)
+			` WHERE seq > ? AND (`+where+`) AND queue_id IN (`+in+`) ORDER BY seq LIMIT `+fmt.Sprint(drainBatch), qargs...)
 		if err != nil {
 			log.Printf("sqliteq: reading workflow outbox: %v", err)
 			return ids
@@ -644,10 +753,17 @@ func (s *WorkflowStore) drain(ctx context.Context, where string, args ...any) []
 			return ids
 		}
 
+		total += len(batch)
 		for _, r := range batch {
 			after = r.seq
-			h, ok := s.qs.handleOf(r.queueID)
-			if !ok || !pushRow(h, r.outRow) {
+			h, ok := s.lookup(r.queueID)
+			if !ok {
+				continue
+			}
+			if err := pushRow(h, r.outRow); err != nil {
+				if errors.Is(err, errJobIDTaken) {
+					s.warnOnce(r.jobID, "job id is held by another job; the row stays")
+				}
 				continue
 			}
 			s.f.mu.Lock()
@@ -661,23 +777,63 @@ func (s *WorkflowStore) drain(ctx context.Context, where string, args ...any) []
 				ids = append(ids, r.queueID)
 			}
 		}
-		if len(batch) < drainBatch {
+		if len(batch) < drainBatch || total >= drainCap {
 			return ids
 		}
 	}
 }
 
 // pushRow adds the row's item to its queue once per job ID.
-func pushRow(h *handle, r outRow) bool {
-	if h.pq != nil {
-		return h.pq.EnqueueOnce(r.item, r.priority, r.jobID)
+func pushRow(h *handle, r outRow) error {
+	return h.queue().pushWorkflow(r.item, r.priority, r.jobID)
+}
+
+// warnOnce logs msg for key once per store.
+func (s *WorkflowStore) warnOnce(key, msg string) {
+	if _, seen := s.warned.LoadOrStore(key, struct{}{}); !seen {
+		log.Printf("sqliteq: workflow outbox %s: %s", key, msg)
 	}
-	return h.q.EnqueueOnce(r.item, r.jobID)
 }
 
 // recoverOutbox pushes outbox rows at least minAge old.
 func (s *WorkflowStore) recoverOutbox(minAge time.Duration) {
+	s.logUnreachable()
+	s.applyIntents(minAge)
 	s.drain(context.Background(), `created_at <= ?`, s.now().Add(-minAge).UnixMilli())
+}
+
+// dropExpired deletes workflow id when it ended more than the retention ago
+// and no sweep has run yet, so a Submit of the ID starts a new workflow.
+func (s *WorkflowStore) dropExpired(ctx context.Context, tx *sql.Tx, id string) error {
+	cut := s.now().Add(-s.cfg.retention).UnixMilli()
+	for _, t := range []string{wfTasks, wfOutbox} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+t+` WHERE workflow_id = ? AND EXISTS
+			(SELECT 1 FROM `+wfWorkflows+` WHERE id = ? AND finished_at IS NOT NULL AND finished_at <= ?)`, id, id, cut); err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM `+wfWorkflows+` WHERE id = ? AND finished_at IS NOT NULL AND finished_at <= ?`, id, cut)
+	return err
+}
+
+// logUnreachable names, once each, the queues of outbox rows that no client in
+// this process has open.
+func (s *WorkflowStore) logUnreachable() {
+	open := map[string]bool{}
+	for _, id := range s.openIDs() {
+		open[id] = true
+	}
+	rows, err := s.f.db.Query(`SELECT DISTINCT queue_id FROM ` + wfOutbox)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil && !open[id] {
+			s.warnOnce(id, "queue is not open in this process; its rows wait")
+		}
+	}
 }
 
 // sweep drops workflows ended more than the retention ago, with their tasks
@@ -840,6 +996,7 @@ func (s *WorkflowStore) Cancel(ctx context.Context, id string, undo *bool) error
 	if !validWorkflowID(id) {
 		return s.notFound(id)
 	}
+	s.preResolve(ctx, id)
 	var minSeq int64
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		w, err := s.load(ctx, tx, id)

@@ -415,12 +415,12 @@ func TestSingleFileAndFolderOneEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create queue: %v", err)
 	}
-	b, err := single.NewQueue("JOBS")
-	if err != nil {
-		t.Fatalf("Failed to create queue: %v", err)
+	// One file under two roots would have two scopes: refused
+	if _, err := single.NewQueue("JOBS"); err == nil || a == nil {
+		t.Errorf("Expected an error for a file open under another scope, got %v", err)
 	}
-	if a != b {
-		t.Error("Expected the folder and single-file stores to share the handle")
+	if _, err := New(filepath.Join(dir, workflowsFile), WithSingleFile()); err == nil {
+		t.Error("Expected the workflow file name refused for WithSingleFile")
 	}
 }
 
@@ -655,7 +655,7 @@ func TestSymlinkedFileOneEntry(t *testing.T) {
 	for _, store := range []struct {
 		path string
 		opts []StoreOption
-	}{{real, []StoreOption{WithSingleFile()}}, {link, []StoreOption{WithSingleFile()}}, {folder, nil}} {
+	}{{real, []StoreOption{WithSingleFile()}}, {link, []StoreOption{WithSingleFile()}}} {
 		qs := mustNew(t, store.path, store.opts...)
 		defer qs.Close()
 		q, err := qs.NewQueue("jobs")
@@ -669,6 +669,13 @@ func TestSymlinkedFileOneEntry(t *testing.T) {
 		if q.f != got[0].f {
 			t.Errorf("Path %d reached a different file entry", i+1)
 		}
+	}
+
+	// The same file under a folder root would have another scope: refused
+	qs := mustNew(t, folder)
+	defer qs.Close()
+	if _, err := qs.NewQueue("jobs"); err == nil {
+		t.Error("Expected a folder symlinking to an open single file refused")
 	}
 }
 
@@ -744,7 +751,7 @@ func TestScopeThroughSymlinks(t *testing.T) {
 	if got, ok := contract.LookupWorkflowStore(a.ScopeID()); !ok || got != contract.WorkflowStore(st) {
 		t.Error("Expected the queue's scope to find the store")
 	}
-	plan := wfPlan("w1", planTask("w1", "x", a), planTask("w1", "y", b, "x"))
+	plan := planWF("w1", planTask("w1", "x", a), planTask("w1", "y", b, "x"))
 	if err := st.Submit(context.Background(), plan); err != nil {
 		t.Fatalf("Expected Submit across the symlinked queues to succeed, got %v", err)
 	}

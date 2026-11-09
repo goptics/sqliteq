@@ -259,7 +259,7 @@ Both queue types implement VarMQ's `QueuePauser` and `PauseNotifier`. So VarMQ's
 
 A workflow is a graph of VarMQ tasks. A task runs after the tasks it depends on. sqliteq keeps the workflow state in SQLite, so a workflow survives a restart and spans several queues of one store.
 
-Create the store once, after the queues, and keep it open while workers run. `NewWorkflowStore` registers the store for the scope of its queues. VarMQ finds it from there. A process that only runs workers needs this one call too.
+Create the store once and keep it open while workers run. The order of the store and the queues does not matter. `NewWorkflowStore` registers the store for the scope of its queues. VarMQ finds it from there. A process that only runs workers needs this one call too.
 
 ```go
 qs, _ := sqliteq.New("./data")
@@ -290,7 +290,7 @@ Options of `NewWorkflowStore`:
 - `WithWorkflowResultLimit(n)` caps a task result at `n` bytes. The default is 64 KiB. A bigger result fails the task with `ErrResultTooLarge`.
 - `WithWorkflowRetention(d)` sets how long an ended workflow is kept. The default is 7 days. A running workflow is kept until it ends.
 
-Every queue of a workflow must have the same scope. The scope of a queue is `ScopeID()`: `sqliteq:` and the absolute path of the store folder, or of the file under `WithSingleFile`. One process holds one store for each scope. A second `NewWorkflowStore` for the same scope returns `contract.ErrScopeRegistered`.
+Every queue of a workflow must have the same scope. The scope of a queue is `ScopeID()`: `sqliteq:` and the absolute path of the store folder, or of the file under `WithSingleFile`, with symlinks resolved. A file already open under one scope cannot be opened under another, for example as a single file and as a queue file of a folder. `NewQueue` returns an error then. `WithSingleFile` refuses the file name `__sqliteq_workflows.db`. One process holds one store for each scope. A second `NewWorkflowStore` for the same scope returns `contract.ErrScopeRegistered`.
 
 The store implements `contract.WorkflowStore`, `WorkflowInspector` and `WorkflowKeyLister`. So VarMQ's REST API lists and cancels sqliteq workflows.
 
@@ -302,16 +302,17 @@ The store implements `contract.WorkflowStore`, `WorkflowInspector` and `Workflow
 2. Each outbox row is pushed into its queue with `EnqueueOnce` and the job ID `wf:<id>:<task>`. Then the row is deleted.
 3. The job is acknowledged in its queue.
 
-A recovery loop pushes leftover outbox rows when the store opens and every second while it is open. A crash between the steps is safe. A row pushed twice stores one job. A job that was redelivered finds its task already ended: the pre-run check (`Runnable`) skips it. Under `WithSingleFile` all three steps are one transaction.
+A recovery loop pushes leftover outbox rows when the store opens and every second while it is open. A crash between the steps is safe. A row pushed twice stores one job while the first job is still in the queue. Once a worker has finished and removed that job, a second push would queue it again. The pre-run check (`Runnable`) then skips it, because its task already ended. A job that was redelivered is skipped the same way. Under `WithSingleFile` the end, the pushes and the ack are one transaction. A push into a queue that no client in the process has open becomes an outbox row in that transaction, and the loop pushes it later.
 
 **Limits.**
 
 - The recovery loop cannot wake the workers of a process. A task pushed by the loop starts when a worker next polls its queue.
-- The recovery loop pushes only into queues that this `Queues` created, or that a submitted plan named.
-- A crash inside `Purge` of a queue with workflow tasks, after the delete and before the workflow update, leaves those tasks pending with no job. Cancel the workflow to end it.
+- The loop pushes only into queues that some client in this process has open. Rows for other queues wait, and the store logs each such queue once.
+- A job ID that starts with `wf:` is for workflow items. A plain job cannot take one. If an older row already holds the ID, the push stays in the outbox and the store logs it once.
 - The stored items of waiting tasks and the undo items stay in the workflow file until the task is pushed or the workflow expires.
+- Folder layout: `Purge` stores an intent in the workflow file before it deletes the rows. If the process crashes between them, the recovery loop ends the purged tasks later.
 
-A valid workflow item is never dropped by a cancel mark: the workflow decides how its task ends. A `Purge` of a queue ends each purged workflow task as cancelled with the reason `queue purged`. The workflow goes on. An item whose JSON has keys that differ only in case, such as `WF` next to `wf`, is a plain job.
+A valid workflow item is never dropped by a cancel mark: the workflow decides how its task ends. A `Purge` of a queue ends each purged workflow task as cancelled with the reason `queue purged`. The workflow goes on. This works also when no store is open in the process, as long as the workflow tables exist. Under `WithSingleFile` the delete and the ends are one transaction. An item whose JSON has keys that differ only in case, such as `WF` next to `wf`, is a plain job.
 
 ### Storage
 
