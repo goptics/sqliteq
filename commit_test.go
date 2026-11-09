@@ -491,3 +491,53 @@ func TestGroupCommitAfterClose(t *testing.T) {
 	}
 	waitAll(t, &wg, 10*time.Second)
 }
+
+// Finishes that share a round write their outcomes in its transaction,
+// and again each in its own when a bad call fails the round.
+func TestGroupFinishOutcomes(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "shared", true: "fallback"}[fail], func(t *testing.T) {
+			q, qs := openQueue(t)
+			defer qs.Close()
+			for _, id := range []string{"a", "b", "c", "d"} {
+				q.Enqueue(job(id))
+			}
+			items, acks := make([]any, 4), make([]string, 4)
+			if n, _, err := q.DequeueBatchWithAckIds(items, acks); err != nil || n != 4 {
+				t.Fatalf("got %d %v", n, err)
+			}
+			rest := []func() bool{
+				func() bool { return q.Reject(acks[1], "r") },
+				func() bool { return q.AcknowledgeResult(acks[2], []byte(`1`)) },
+				func() bool { return q.AcknowledgeCancelled(acks[3], "c") },
+			}
+			if fail {
+				rest = append(rest, func() bool { return q.Enqueue(nil) })
+			}
+			got := oneRound(t, q.f, func() bool { return q.Acknowledge(acks[0]) }, rest)
+			for i, ok := range got[:4] {
+				if !ok {
+					t.Errorf("finish %d failed", i)
+				}
+			}
+			want := map[string]string{"a": "completed||", "b": "failed|r|", "c": "completed||1", "d": "cancelled|c|"}
+			rows, err := q.f.db.Query("SELECT job_id, state, COALESCE(error, ''), COALESCE(CAST(result AS TEXT), '') FROM " + q.jobs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			n := 0
+			for rows.Next() {
+				var id, state, e, r string
+				rows.Scan(&id, &state, &e, &r)
+				if g := state + "|" + e + "|" + r; g != want[id] {
+					t.Errorf("%s: got %s, want %s", id, g, want[id])
+				}
+				n++
+			}
+			if n != 4 {
+				t.Errorf("Expected 4 records, got %d", n)
+			}
+		})
+	}
+}

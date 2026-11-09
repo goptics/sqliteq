@@ -1,14 +1,20 @@
 package sqliteq
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goptics/varmq"
+	"github.com/goptics/varmq/contract"
 )
 
 func TestSQLiteQueue(t *testing.T) {
@@ -844,6 +850,9 @@ func TestWritesTakeFileMutex(t *testing.T) {
 		{"DequeueWithAckId", func() { q.DequeueWithAckId() }},
 		{"DequeueBatchWithAckIds", func() { q.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2)) }},
 		{"Acknowledge", func() { q.Acknowledge(ack1) }},
+		{"CancelJob", func() { q.CancelJob("x") }},
+		{"gated DequeueWithAckId", func() { q.DequeueWithAckId() }},
+		{"gated Dequeue", func() { q.Dequeue() }},
 		{"requeueNoAck", func() { q.requeueNoAck() }},
 		{"Purge", func() { q.Purge() }},
 	}
@@ -892,5 +901,779 @@ func TestWritesTakeFileMutex(t *testing.T) {
 				t.Fatalf("%s waited for the write mutex", r.name)
 			}
 		})
+	}
+}
+
+// otherProcess opens q's table again on a pool of its own, as a second
+// process on the same database file would.
+func otherProcess(t *testing.T, q *Queue) *Queue {
+	t.Helper()
+	db, err := sql.Open(driverName(q.f.pages), dsn(q.f.key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &file{key: q.f.key, db: db, pages: q.f.pages, refs: 1, handles: map[string]*handle{}, recovered: map[string]bool{}}
+	f.b = &batcher{commit: f.commitRound}
+	q2, err := newQueue(f, q.name, q.priority, WithRemoveOnComplete(q.removeOnComplete))
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		q2.Close()
+		db.Close()
+	})
+	return q2
+}
+
+// job is a varmq-style envelope with Job ID id.
+func job(id string) []byte { return []byte(`{"id":"` + id + `","data":1}`) }
+
+// watch starts a watch of id on q; the channel gets its one outcome.
+func watch(q *Queue, id string) <-chan contract.JobOutcome {
+	ch := make(chan contract.JobOutcome, 2)
+	q.WatchOutcome(id, func(o contract.JobOutcome) { ch <- o })
+	return ch
+}
+
+func waitOutcome(t *testing.T, ch <-chan contract.JobOutcome) contract.JobOutcome {
+	t.Helper()
+	select {
+	case o := <-ch:
+		return o
+	case <-time.After(5 * time.Second):
+		t.Fatal("no outcome")
+		return contract.JobOutcome{}
+	}
+}
+
+func noOutcome(t *testing.T, ch <-chan contract.JobOutcome) {
+	t.Helper()
+	select {
+	case o := <-ch:
+		t.Fatalf("unexpected outcome %+v", o)
+	case <-time.After(4 * pollEvery):
+	}
+}
+
+// pop hands out the next item and its ack id, failing on none.
+func pop(t *testing.T, q *Queue) (string, string) {
+	t.Helper()
+	v, ok, ack := q.DequeueWithAckId()
+	if !ok {
+		t.Fatal("DequeueWithAckId found nothing")
+	}
+	return string(v.([]byte)), ack
+}
+
+// A watch reports each way a job ends: Acknowledge, Reject with its reason,
+// AcknowledgeResult with its JSON; a job without a Job ID writes nothing.
+func TestWatchOutcome(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	cases := []struct {
+		id     string
+		finish func(ack string) bool
+		want   contract.JobOutcome
+	}{
+		{"ack", q.Acknowledge, contract.JobOutcome{ID: "ack", State: contract.JobCompleted}},
+		{"rej", func(a string) bool { return q.Reject(a, "boom") }, contract.JobOutcome{ID: "rej", State: contract.JobFailed, Error: "boom"}},
+		{"res", func(a string) bool { return q.AcknowledgeResult(a, []byte(`{"n":42}`)) },
+			contract.JobOutcome{ID: "res", State: contract.JobCompleted, Result: []byte(`{"n":42}`)}},
+	}
+	for _, c := range cases {
+		ch := watch(q, c.id)
+		q.Enqueue(job(c.id))
+		_, ack := pop(t, q)
+		noOutcome(t, ch)
+		if !c.finish(ack) {
+			t.Fatalf("%s: finish failed", c.id)
+		}
+		got := waitOutcome(t, ch)
+		if got.ID != c.want.ID || got.State != c.want.State || got.Error != c.want.Error || string(got.Result) != string(c.want.Result) {
+			t.Errorf("%s: got %+v, want %+v", c.id, got, c.want)
+		}
+		noOutcome(t, ch) // once
+	}
+
+	q.Enqueue([]byte("plain"))
+	_, ack := pop(t, q)
+	q.Acknowledge(ack)
+	if n := countJobs(t, q); n != 3 {
+		t.Errorf("Expected 3 outcome records, got %d", n)
+	}
+}
+
+func countJobs(t *testing.T, q *Queue) int {
+	t.Helper()
+	var n int
+	if err := q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.jobs).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// AcknowledgeResult with invalid JSON fails and changes nothing.
+func TestAcknowledgeResultInvalid(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Enqueue(job("a"))
+	_, ack := pop(t, q)
+	if q.AcknowledgeResult(ack, []byte(`{nope`)) {
+		t.Fatal("Expected invalid JSON to fail")
+	}
+	if n := countRows(t, q.f.db, "status = 'processing'"); n != 1 {
+		t.Errorf("Expected the row still processing, got %d", n)
+	}
+	if !q.Acknowledge(ack) {
+		t.Error("Expected Acknowledge to finish it")
+	}
+}
+
+// A job that ended before the watch is reported from its record; cancel
+// stops a watch; a closed queue watches nothing.
+func TestWatchEndedBeforeAndCancel(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Enqueue(job("early"))
+	_, ack := pop(t, q)
+	q.Reject(ack, "late watcher")
+	if got := waitOutcome(t, watch(q, "early")); got.State != contract.JobFailed || got.Error != "late watcher" {
+		t.Errorf("got %+v", got)
+	}
+
+	ch := make(chan contract.JobOutcome, 1)
+	stop := q.WatchOutcome("never", func(o contract.JobOutcome) { ch <- o })
+	stop()
+	stop()
+	q.Enqueue(job("never"))
+	_, ack = pop(t, q)
+	q.Acknowledge(ack)
+	noOutcome(t, ch)
+
+	q.Close()
+	q.WatchOutcome("early", func(o contract.JobOutcome) { ch <- o })
+	noOutcome(t, ch)
+	if err := q.CancelJob("x"); !errors.Is(err, errClosed) {
+		t.Errorf("CancelJob on a closed queue: got %v, want errClosed", err)
+	}
+}
+
+// Two queue objects on one file, as two processes: each learns of jobs the
+// other finishes, and a cancel reaches the other's pops and OnCancel.
+func TestOutcomeAcrossProcesses(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q2 := otherProcess(t, q)
+
+	ch := watch(q, "x")
+	q.Enqueue(job("x"))
+	_, ack := pop(t, q2)
+	q2.Acknowledge(ack)
+	if got := waitOutcome(t, ch); got.ID != "x" || got.State != contract.JobCompleted {
+		t.Errorf("got %+v", got)
+	}
+
+	ids := make(chan string, 4)
+	defer q2.OnCancel(func(id string) { ids <- id })()
+	q2.Enqueue(job("run"))
+	_, ack = pop(t, q2)
+	ch = watch(q2, "run")
+	if err := q.CancelJob("run"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-ids:
+		if id != "run" {
+			t.Errorf("OnCancel got %q", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnCancel did not fire")
+	}
+	if !q2.AcknowledgeCancelled(ack, "stopped") {
+		t.Fatal("AcknowledgeCancelled failed")
+	}
+	if got := waitOutcome(t, ch); got.State != contract.JobCancelled || got.Error != "stopped" {
+		t.Errorf("got %+v", got)
+	}
+	var marks int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.cancelled).Scan(&marks)
+	if marks != 0 {
+		t.Errorf("Expected the finish to clear the mark, %d left", marks)
+	}
+	if err := q.CancelJob("run"); !errors.Is(err, contract.ErrJobEnded) {
+		t.Errorf("CancelJob of an ended job: got %v, want ErrJobEnded", err)
+	}
+}
+
+// A marked waiting job is never handed out, by any pop: it is dropped with
+// outcome cancelled and the pop goes on with the next item.
+func TestCancelWaiting(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		q.Enqueue(job(id))
+	}
+	q.EnqueueOnce([]byte("raw"), "f") // a Job ID from EnqueueOnce, not JSON
+	q.Enqueue([]byte("g"))
+	chA, chF := watch(q, "a"), watch(q, "f")
+	for _, id := range []string{"a", "c", "d", "f"} {
+		if err := q.CancelJob(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if v, _ := pop(t, q); v != string(job("b")) {
+		t.Errorf("DequeueWithAckId: got %s, want b", v)
+	}
+	items, acks := make([]any, 2), make([]string, 2)
+	n, _, err := q.DequeueBatchWithAckIds(items, acks)
+	if err != nil || n != 2 || string(items[0].([]byte)) != string(job("e")) || string(items[1].([]byte)) != "g" {
+		t.Errorf("DequeueBatchWithAckIds: got %d %v %v", n, err, items[:n])
+	}
+	if got := waitOutcome(t, chA); got.State != contract.JobCancelled || got.Error != "cancelled" {
+		t.Errorf("got %+v", got)
+	}
+	if got := waitOutcome(t, chF); got.State != contract.JobCancelled {
+		t.Errorf("got %+v", got)
+	}
+	if n := countRows(t, q.f.db, "status = 'cancelled'"); n != 4 {
+		t.Errorf("Expected 4 kept cancelled rows, got %d", n)
+	}
+	if _, ok, _ := q.DequeueWithAckId(); ok {
+		t.Error("Expected nothing left")
+	}
+
+	// Dequeue without ack drops too
+	q.Enqueue(job("h"))
+	q.Enqueue(job("i"))
+	q.CancelJob("h")
+	if v, ok := q.Dequeue(); !ok || string(v.([]byte)) != string(job("i")) {
+		t.Errorf("Dequeue: got %v %v, want i", v, ok)
+	}
+	if got := waitOutcome(t, watch(q, "h")); got.State != contract.JobCancelled {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// EnqueueOnce that stores an id drops its old outcome and its cancel mark
+// (spec 6.13, 6.14 Re-add); a dedupe hit changes neither.
+func TestReaddClearsOutcomeAndMark(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	q.EnqueueOnce(job("r"), "r")
+	_, ack := pop(t, q)
+	q.Acknowledge(ack)
+	if countJobs(t, q) != 1 {
+		t.Fatal("Expected a record")
+	}
+	q.EnqueueOnce(job("r"), "r")
+	if countJobs(t, q) != 0 {
+		t.Error("Expected the re-add to drop the old record")
+	}
+	ch := watch(q, "r")
+	noOutcome(t, ch) // the earlier run is not reported
+
+	if err := q.CancelJob("r"); err != nil {
+		t.Fatal(err)
+	}
+	q.EnqueueOnce(job("r"), "r") // dedupe hit: the row is still there
+	if _, ok, _ := q.DequeueWithAckId(); ok {
+		t.Fatal("Expected the marked job dropped")
+	}
+	if got := waitOutcome(t, ch); got.State != contract.JobCancelled {
+		t.Errorf("got %+v", got)
+	}
+
+	q.CancelJob("s") // unknown id: marked
+	q.EnqueueOnce(job("s"), "s")
+	if v, _ := pop(t, q); v != string(job("s")) {
+		t.Errorf("Expected the re-added job handed out, got %s", v)
+	}
+}
+
+// Purge drops outcome records and cancel marks with the items.
+func TestPurgeClearsOutcomesAndMarks(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Enqueue(job("done"))
+	_, ack := pop(t, q)
+	q.Acknowledge(ack)
+	q.CancelJob("later")
+	q.Purge()
+	var marks int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.cancelled).Scan(&marks)
+	if countJobs(t, q) != 0 || marks != 0 {
+		t.Errorf("Expected Purge to clear records and marks, got %d and %d", countJobs(t, q), marks)
+	}
+	q.Enqueue(job("later"))
+	if v, _ := pop(t, q); v != string(job("later")) {
+		t.Errorf("Expected the purged mark gone, got %s", v)
+	}
+}
+
+// OnCancel reports marks made after it, not before; stop ends it; an
+// expired mark neither reaches hooks nor drops items.
+func TestOnCancel(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.CancelJob("old")
+	ids := make(chan string, 4)
+	stop := q.OnCancel(func(id string) { ids <- id })
+	q.CancelJob("new")
+	select {
+	case id := <-ids:
+		if id != "new" {
+			t.Errorf("got %q, want new", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnCancel did not fire")
+	}
+	stop()
+	q.CancelJob("after")
+	select {
+	case id := <-ids:
+		t.Errorf("got %q after stop", id)
+	case <-time.After(4 * pollEvery):
+	}
+
+	q.f.db.Exec("UPDATE "+q.cancelled+" SET expires_at = ? WHERE job_id = 'old'", time.Now().Add(-time.Second).UnixMilli())
+	q.Enqueue(job("old"))
+	if v, _ := pop(t, q); v != string(job("old")) {
+		t.Errorf("Expected an expired mark to drop nothing, got %s", v)
+	}
+	if err := q.CancelJob(""); err == nil {
+		t.Error("Expected an empty id to fail")
+	}
+}
+
+// Retention trims each state group by age and count; the count limit
+// spares records younger than trimFloor; a queue object's first record
+// trims.
+func TestOutcomeRetention(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	now := time.Now()
+	insert := func(tx *sql.Tx, prefix string, n int, at time.Time) {
+		for i := range n {
+			if _, err := tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES (?, 'completed', ?)", prefix+strconv.Itoa(i), at.UnixMilli()+int64(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	tx, _ := q.f.db.Begin()
+	insert(tx, "fresh", keepCompleted+5, now)
+	if err := q.trim(tx, now); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+	if n := countJobs(t, q); n != keepCompleted+5 {
+		t.Fatalf("Expected records younger than trimFloor kept, got %d", n)
+	}
+	q.f.db.Exec("DELETE FROM " + q.jobs)
+
+	tx, _ = q.f.db.Begin()
+	insert(tx, "c", keepCompleted+5, now.Add(-2*trimFloor))
+	tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES ('old', 'failed', ?)", now.Add(-keepFailedAge).UnixMilli())
+	tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES ('new', 'cancelled', ?)", now.UnixMilli())
+	if err := q.trim(tx, now); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+	if n := countJobs(t, q); n != keepCompleted+1 {
+		t.Errorf("Expected %d records, got %d", keepCompleted+1, n)
+	}
+	var oldest string
+	q.f.db.QueryRow("SELECT job_id FROM " + q.jobs + " WHERE state = 'completed' ORDER BY finished_at LIMIT 1").Scan(&oldest)
+	if oldest != "c5" {
+		t.Errorf("Expected the 5 oldest completed trimmed, oldest left %s", oldest)
+	}
+
+	q2 := otherProcess(t, q) // records counter at 0
+	q2.f.db.Exec("UPDATE "+q.jobs+" SET finished_at = ? WHERE job_id = 'c5'", now.Add(-keepCompletedAge).UnixMilli())
+	q2.Enqueue(job("one"))
+	_, ack := pop(t, q2)
+	q2.Acknowledge(ack)
+	var n int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.jobs + " WHERE job_id = 'c5'").Scan(&n)
+	if n != 0 {
+		t.Error("Expected a queue object's first record to trim")
+	}
+}
+
+// varmq end to end: a result job added on one queue object runs on a
+// worker bound to another (another process), and its handle gets the
+// result; Cancel stops a running job and drops a waiting one.
+func TestVarmqRemoteResultAndCancel(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q2 := otherProcess(t, q)
+
+	started := make(chan struct{})
+	ran := make(chan int, 8)
+	w := varmq.NewResultWorker(func(j varmq.Job[int]) (int, error) {
+		ran <- j.Data()
+		if j.Data() < 0 {
+			close(started)
+			<-j.Context().Done()
+			return 0, j.Context().Err()
+		}
+		return j.Data() * 2, nil
+	})
+	defer w.Stop()
+
+	p := varmq.NewResultQueue[int, int](q)
+	waiting, ok := p.Add(7) // no worker yet
+	if !ok {
+		t.Fatal("Add failed")
+	}
+	if err := waiting.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	w.WithQueue(q2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	j, _ := p.Add(21)
+	if err := j.WaitContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := j.Result(); err != nil || r != 42 {
+		t.Errorf("Result: got %d %v, want 42", r, err)
+	}
+	if err := waiting.WaitContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := waiting.Result(); !errors.Is(err, varmq.ErrJobCancelled) {
+		t.Errorf("waiting job: got %v, want ErrJobCancelled", err)
+	}
+
+	running, _ := p.Add(-1)
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("job did not start")
+	}
+	if err := running.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	if err := running.WaitContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := running.Result(); !errors.Is(err, varmq.ErrJobCancelled) {
+		t.Errorf("running job: got %v, want ErrJobCancelled", err)
+	}
+	close(ran)
+	for v := range ran {
+		if v == 7 {
+			t.Error("The cancelled waiting job ran")
+		}
+	}
+}
+
+// A pop drops at most maxDrops marked items; at the cap it reports items
+// left, and the next pop goes on.
+func TestCancelDropCap(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	for i := range maxDrops {
+		id := "m" + strconv.Itoa(i)
+		q.Enqueue(job(id))
+		q.CancelJob(id)
+	}
+	q.Enqueue([]byte("plain"))
+
+	items, acks := make([]any, 1), make([]string, 1)
+	if n, left, err := q.DequeueBatchWithAckIds(items, acks); err != nil || n != 0 || left != 1 {
+		t.Fatalf("at the cap: got n=%d left=%d err=%v, want 0, 1", n, left, err)
+	}
+	if v, _ := pop(t, q); v != "plain" {
+		t.Errorf("got %s, want plain", v)
+	}
+	if n := countJobs(t, q); n != maxDrops {
+		t.Errorf("Expected %d cancelled records, got %d", maxDrops, n)
+	}
+
+	// Single-item pops can't report items left: past the cap they pop again
+	for _, p := range []struct {
+		name string
+		pop  func() (any, bool)
+	}{
+		{"DequeueWithAckId", func() (any, bool) { v, ok, _ := q.DequeueWithAckId(); return v, ok }},
+		{"Dequeue", q.Dequeue},
+	} {
+		for i := range maxDrops + 1 {
+			id := p.name + strconv.Itoa(i)
+			q.Enqueue(job(id))
+			q.CancelJob(id)
+		}
+		q.Enqueue([]byte("plain"))
+		if v, ok := p.pop(); !ok || string(v.([]byte)) != "plain" {
+			t.Errorf("%s past the cap: got %v %v, want plain", p.name, v, ok)
+		}
+	}
+}
+
+// sweep trims records past their age and drops expired marks.
+func TestSweep(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	old := time.Now().Add(-keepFailedAge).UnixMilli()
+	q.f.db.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES ('old', 'failed', ?)", old)
+	q.f.db.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES ('new', 'failed', ?)", time.Now().UnixMilli())
+	q.f.db.Exec("INSERT INTO "+q.cancelled+" (job_id, expires_at) VALUES ('gone', ?)", old)
+	q.CancelJob("live")
+	q.sweep()
+	var marks int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.cancelled).Scan(&marks)
+	if countJobs(t, q) != 1 || marks != 1 {
+		t.Errorf("Expected 1 record and 1 mark left, got %d and %d", countJobs(t, q), marks)
+	}
+}
+
+// Queues.Close stops polls and drops live watches and hooks without
+// calling them.
+func TestCloseDropsWatchesAndHooks(t *testing.T) {
+	q, qs := openQueue(t)
+	q2 := otherProcess(t, q)
+	ch := watch(q, "w")
+	ids := make(chan string, 1)
+	q.OnCancel(func(id string) { ids <- id })
+	if err := qs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-q.w.stop:
+	default:
+		t.Fatal("Expected Close to stop the poll")
+	}
+	q2.Enqueue(job("w"))
+	_, ack := pop(t, q2)
+	q2.Acknowledge(ack)
+	q2.CancelJob("c")
+	noOutcome(t, ch)
+	select {
+	case id := <-ids:
+		t.Errorf("hook called after Close with %q", id)
+	default:
+	}
+	if stop := q.OnCancel(func(string) { t.Error("hook on a closed queue") }); stop == nil {
+		t.Error("Expected a stop func")
+	}
+}
+
+// A hook added while a poll reads gets the marks made after its call; a
+// stopped hook gets none; a mark whose job finished (stale) reaches nobody.
+func TestOnCancelHooksDuringPoll(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	a, b := make(chan string, 4), make(chan string, 4)
+	stopA := q.OnCancel(func(id string) { a <- id })
+	q.w.mu.Lock()
+	seq := q.w.lastSeq // a poll's snapshot, taken before B
+	q.w.mu.Unlock()
+	q.CancelJob("before-b")
+	stopB := q.OnCancel(func(id string) { b <- id })
+	q.CancelJob("x")
+	q.pollCancels(seq)
+
+	// The queue's own poll may report a mark too: compare distinct ids
+	got := func(ch chan string) []string {
+		var ids []string
+		for {
+			select {
+			case id := <-ch:
+				ids = append(ids, id)
+			case <-time.After(4 * pollEvery):
+				slices.Sort(ids)
+				return slices.Compact(ids)
+			}
+		}
+	}
+	if ids := got(a); !slices.Equal(ids, []string{"before-b", "x"}) {
+		t.Errorf("hook A: got %v", ids)
+	}
+	if ids := got(b); !slices.Equal(ids, []string{"x"}) {
+		t.Errorf("hook B: got %v, want only the mark after its call", ids)
+	}
+
+	var xSeq int64
+	q.f.db.QueryRow("SELECT seq FROM " + q.cancelled + " WHERE job_id = 'x'").Scan(&xSeq)
+	stopA()
+	q.Enqueue(job("y"))
+	_, ack := pop(t, q)
+	q.CancelJob("y")
+	q.Acknowledge(ack) // the finish drops the mark: stale
+	q.CancelJob("z")
+	q.pollCancels(xSeq)
+	if ids := got(a); len(ids) != 0 {
+		t.Errorf("stopped hook got %v", ids)
+	}
+	if ids := got(b); !slices.Equal(ids, []string{"z"}) {
+		t.Errorf("hook B: got %v, want z only (y is stale)", ids)
+	}
+	stopB()
+}
+
+// A repeat CancelJob gets a new seq and expiry, so hooks hear it again.
+func TestCancelRepeatRenotifies(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	ids := make(chan string, 4)
+	defer q.OnCancel(func(id string) { ids <- id })()
+	read := func() (seq, exp int64) {
+		q.f.db.QueryRow("SELECT seq, expires_at FROM "+q.cancelled+" WHERE job_id = 'x'").Scan(&seq, &exp)
+		return
+	}
+	for i := range 2 {
+		q.CancelJob("x")
+		select {
+		case <-ids:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("cancel %d not reported", i+1)
+		}
+		if i == 0 {
+			s1, e1 := read()
+			time.Sleep(2 * time.Millisecond)
+			defer func() {
+				if s2, e2 := read(); s2 <= s1 || e2 <= e1 {
+					t.Errorf("Expected a new seq and expiry: %d,%d -> %d,%d", s1, e1, s2, e2)
+				}
+			}()
+		}
+	}
+}
+
+// A gated Dequeue that drops the last item returns empty and keeps the
+// drop; the mark is gone after it.
+func TestDequeueGatedEmpty(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Enqueue(job("x"))
+	q.CancelJob("x")
+	ch := watch(q, "x")
+	if v, ok := q.Dequeue(); ok {
+		t.Fatalf("got %v", v)
+	}
+	if got := waitOutcome(t, ch); got.State != contract.JobCancelled {
+		t.Errorf("got %+v", got)
+	}
+	var marks int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.cancelled).Scan(&marks)
+	if q.Len() != 0 || marks != 0 {
+		t.Errorf("Expected no item and no mark, got %d and %d", q.Len(), marks)
+	}
+}
+
+// With WithRemoveOnComplete(false) each end keeps its row with its status,
+// and the record keeps the result.
+func TestKeptRowEnds(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+	q.Enqueue(job("r"))
+	q.Enqueue(job("c"))
+	_, ackR := pop(t, q)
+	_, ackC := pop(t, q)
+	if !q.AcknowledgeResult(ackR, []byte(`"ok"`)) || !q.AcknowledgeCancelled(ackC, "stop") {
+		t.Fatal("finish failed")
+	}
+	if countRows(t, q.f.db, "status = 'completed'") != 1 || countRows(t, q.f.db, "status = 'cancelled'") != 1 {
+		t.Error("Expected one completed and one cancelled row")
+	}
+	if got := waitOutcome(t, watch(q, "r")); string(got.Result) != `"ok"` {
+		t.Errorf("got %+v", got)
+	}
+	if got := waitOutcome(t, watch(q, "c")); got.State != contract.JobCancelled || got.Error != "stop" {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// A read reaches only watches started before it: an earlier run's record,
+// read before a re-add, never ends a watch made after.
+func TestDeliverSkipsNewerWatches(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	ch := watch(q, "x")
+	q.w.mu.Lock()
+	gen := q.w.gen
+	q.w.mu.Unlock()
+	q.deliver(contract.JobOutcome{ID: "x", State: contract.JobCompleted}, gen-1)
+	noOutcome(t, ch)
+	q.deliver(contract.JobOutcome{ID: "x", State: contract.JobCompleted}, gen)
+	waitOutcome(t, ch)
+}
+
+// Every watch fires when far more jobs end between two polls than
+// retention keeps, and more ids are watched than one read used to take.
+func TestWatchBurst(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q2 := otherProcess(t, q)
+	const n = 3 * keepCompleted
+	var fired atomic.Int64
+	done := make(chan struct{})
+	for i := range n {
+		id := "b" + strconv.Itoa(i)
+		q.WatchOutcome(id, func(contract.JobOutcome) {
+			if fired.Add(1) == n {
+				close(done)
+			}
+		})
+		q.Enqueue(job(id))
+	}
+	items, acks := make([]any, 500), make([]string, 500)
+	for {
+		k, _, err := q2.DequeueBatchWithAckIds(items, acks)
+		if err != nil || k == 0 {
+			break
+		}
+		for _, a := range acks[:k] {
+			q2.Acknowledge(a)
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("%d of %d watches fired", fired.Load(), n)
+	}
+}
+
+// Queue names may not hold __sqliteq_, which names a queue's own tables.
+func TestReservedQueueName(t *testing.T) {
+	qs := mustNew(t, filepath.Join(t.TempDir(), "one.db"), WithSingleFile())
+	defer qs.Close()
+	if _, err := qs.NewQueue("orders__sqliteq_jobs"); err == nil {
+		t.Error("Expected a reserved name to fail")
+	}
+}
+
+// An item whose envelope does not decode to a string id is a plain job:
+// with a live mark (gated pops) it is handed out, finishes as usual, and
+// writes no record.
+func TestUndecodableEnvelopeIsPlainJob(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.CancelJob("other") // keeps the pops gated
+	bad := []string{`{bad`, `{"id":5}`, `{"id":null}`, `{"id":""}`, `[1]`, "plain", `{"id":"x"`}
+	for _, b := range bad {
+		q.Enqueue([]byte(b))
+	}
+	for i, b := range bad {
+		v, ack := pop(t, q)
+		if v != b {
+			t.Fatalf("pop %d: got %q, want %q", i, v, b)
+		}
+		if i%2 == 0 {
+			q.Acknowledge(ack)
+		} else {
+			q.Reject(ack, "r")
+		}
+	}
+	if n := countJobs(t, q); n != 0 {
+		t.Errorf("Expected no records, got %d", n)
 	}
 }

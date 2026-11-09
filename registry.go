@@ -62,8 +62,11 @@ func driverName(pages int) string {
 
 // dsn returns the connection string for a database file: WAL, relaxed
 // fsync (safe under WAL) and a busy timeout so writers wait for each other.
+// Transactions begin IMMEDIATE: one that reads before it writes (CancelJob,
+// a gated pop) would otherwise fail with SQLITE_BUSY, not wait, when another
+// process wrote in between.
 func dsn(path string) string {
-	return path + "?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000"
+	return path + "?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_txlock=immediate"
 }
 
 // registry holds every open file in the process, keyed by resolved path.
@@ -121,6 +124,10 @@ func (f *file) release() error {
 	if registry.files[f.key] == f {
 		delete(registry.files, f.key)
 	}
+	// Stop the queues' polls before the pool closes under them
+	for _, h := range f.handles {
+		h.queue().Close()
+	}
 	registry.mu.Unlock()
 
 	// Close waits for running queries, so it runs outside the lock
@@ -143,6 +150,10 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 	}
 
 	key := foldName(name)
+	// A queue's indexes, sidecar tables and trigger are named <name>__sqliteq_*
+	if strings.Contains(key, "__sqliteq_") {
+		return nil, fmt.Errorf("sqliteq: queue name %q must not contain __sqliteq_", name)
+	}
 	if h, ok := f.handles[key]; ok {
 		if (h.pq != nil) != priority {
 			return nil, fmt.Errorf("sqliteq: %q is already open as a %s", name, h.kind())

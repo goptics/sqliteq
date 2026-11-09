@@ -10,7 +10,7 @@ import (
 // code (such as a driver.Valuer): a panic there would strand the round and
 // leave its transaction open. Convert user values before building it.
 type op struct {
-	run  func(tx *sql.Tx) (bool, error) // one caller's statement(s); a nil tx means autocommit
+	run  func(tx *sql.Tx) (bool, error) // one caller's statement(s); a nil tx means autocommit, or a tx of its own
 	done chan result                    // buffered 2: one lead wake-up and the outcome
 }
 
@@ -97,6 +97,7 @@ func (b *batcher) lead() {
 // transaction of its own, so one bad call fails alone. A round of one op runs
 // with a nil tx, as one autocommit statement: a database/sql Tx costs a
 // context and a goroutine, which a round with nothing to share does not repay.
+// An op of several statements (a finish) opens its own tx then.
 func (f *file) commitRound(ops []*op) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
