@@ -12,6 +12,7 @@ type queues struct {
 	cfg    storeConfig
 	root   string             // folder, or the resolved file under WithSingleFile
 	files  map[*file]struct{} // one reference held per file
+	byID   map[string]*handle // queues this client opened, by QueueID: FinishTask's lookup
 	closed bool
 	mu     sync.Mutex
 }
@@ -48,6 +49,7 @@ func New(path string, opts ...StoreOption) (Queues, error) {
 		cfg:   cfg,
 		root:  root,
 		files: map[*file]struct{}{},
+		byID:  map[string]*handle{},
 	}, nil
 }
 
@@ -98,6 +100,23 @@ func (qs *queues) filePath(name string) (string, error) {
 	return resolve(filepath.Join(qs.root, foldName(name)+".db"))
 }
 
+// rootOf is the scope root of a database file path: the file under
+// WithSingleFile, else its folder, resolved.
+func (qs *queues) rootOf(path string) string {
+	if qs.cfg.singleFile {
+		return path
+	}
+	return filepath.Dir(path)
+}
+
+// handleOf returns the queue this client opened under id.
+func (qs *queues) handleOf(id string) (*handle, bool) {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+	h, ok := qs.byID[id]
+	return h, ok
+}
+
 // open finds or creates the handle for name, taking a reference on its file
 // the first time this Queues reaches that file.
 func (qs *queues) open(name string, priority bool, opts []Option) (*handle, error) {
@@ -123,7 +142,7 @@ func (qs *queues) open(name string, priority bool, opts []Option) (*handle, erro
 
 	fresh := f == nil
 	if fresh {
-		if f, err = acquire(path, qs.cfg.checkpointPages); err != nil {
+		if f, err = acquire(path, qs.rootOf(path), qs.cfg.checkpointPages); err != nil {
 			return nil, err
 		}
 	}
@@ -137,6 +156,7 @@ func (qs *queues) open(name string, priority bool, opts []Option) (*handle, erro
 	}
 
 	qs.files[f] = struct{}{}
+	qs.byID[h.queue().id] = h
 	return h, nil
 }
 
@@ -172,5 +192,6 @@ func (qs *queues) Close() error {
 		errs = append(errs, f.release())
 	}
 	qs.files = nil
+	qs.byID = nil
 	return errors.Join(errs...)
 }

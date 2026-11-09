@@ -332,6 +332,13 @@ func parseAckID(s string) (int64, bool) {
 	return id, err == nil && id > 0
 }
 
+// ScopeID implements contract.Scoped: "sqliteq:" + the store root, the
+// folder (or the file under WithSingleFile). Queues of one root share a
+// workflow store.
+func (q *Queue) ScopeID() string {
+	return q.f.scope
+}
+
 // Enqueue adds an item to the queue
 // Returns true if the operation was successful
 func (q *Queue) Enqueue(item any) bool {
@@ -383,6 +390,19 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 		// A repeat id changes no row and is no error: it succeeds
 		return err == nil, err
 	})
+}
+
+// enqueueTx is enqueue in the caller's tx, which holds the file's write
+// mutex: one pending row under id, none when a row with that id exists.
+func (q *Queue) enqueueTx(tx *sql.Tx, item []byte, priority int, id string) error {
+	now := time.Now().UTC()
+	insert := tx.Stmt(q.insert)
+	if q.priority {
+		_, err := insert.Exec(item, now, now, id, priority)
+		return err
+	}
+	_, err := insert.Exec(item, now, now, id)
+	return err
 }
 
 // claimN moves up to n pending rows to processing in one statement and
@@ -452,7 +472,7 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 		}
 		for _, c := range rows {
 			id := jobIDOf(c.once, c.data)
-			drop, err := marked(isMarked, id, now)
+			drop, err := markedDrop(isMarked, id, c.data, now)
 			if err != nil {
 				return nil, false, false, err
 			}
@@ -567,7 +587,7 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 			return nil, false, false, err
 		}
 		id := jobIDOf(once, data)
-		drop, err := marked(isMarked, id, now)
+		drop, err := markedDrop(isMarked, id, data, now)
 		if err != nil {
 			return nil, false, false, err
 		}
@@ -682,18 +702,23 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 				ok = ok && err == nil
 			}()
 		}
-		// No row is an outcome, not an error: it must not fail the round
-		if ok, err = q.end(tx, id, "", state, reason, result, now); !ok || err != nil {
-			return ok, err
-		}
-		// Totals: cancelled counts as failed (spec 6.14)
-		total := "failed"
-		if state == contract.JobCompleted {
-			total = "completed"
-		}
-		_, err = tx.Stmt(q.tally).Exec(total)
-		return err == nil, err
+		return q.finishTx(tx, id, state, reason, result, now)
 	})
+}
+
+// finishTx is finish in the caller's tx, with the row id parsed.
+func (q *Queue) finishTx(tx *sql.Tx, id int64, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
+	// No row is an outcome, not an error: it must not fail the round
+	if ok, err := q.end(tx, id, "", state, reason, result, now); !ok || err != nil {
+		return ok, err
+	}
+	// Totals: cancelled counts as failed (spec 6.14)
+	total := "failed"
+	if state == contract.JobCompleted {
+		total = "completed"
+	}
+	_, err := tx.Stmt(q.tally).Exec(total)
+	return err == nil, err
 }
 
 // end finishes processing row id with state, in tx: the row is deleted or
@@ -759,25 +784,70 @@ func (q *Queue) Values() []any {
 }
 
 // Purge removes all items from the queue, with its outcome records, cancel
-// marks and totals; a pause stays (spec 6.6, 6.7, 6.14)
+// marks and totals; a pause stays (spec 6.6, 6.7, 6.14). A purged workflow
+// task or undo ends cancelled (reason "queue purged"), so its workflow goes
+// on: dependents follow their policy, and what that releases is pushed after
+// the delete. Without a workflow store for the queue's scope, no workflow
+// ends.
 func (q *Queue) Purge() {
+	store, _ := contract.LookupWorkflowStore(q.f.scope)
+	ws, _ := store.(*WorkflowStore)
+	if tags := q.purge(ws != nil); ws != nil {
+		ws.endPurged(q, tags)
+	}
+}
+
+// purge deletes the rows under the write mutex; with workflows it first
+// reads the tags of the pending and processing workflow items.
+func (q *Queue) purge(workflows bool) (tags []wfItemTag) {
 	q.f.mu.Lock()
 	defer q.f.mu.Unlock()
 
 	tx, err := q.f.db.Begin()
 	if err != nil {
-		return
+		return nil
 	}
 	defer tx.Rollback()
+	if workflows {
+		if tags, err = q.workflowTags(tx); err != nil {
+			return nil
+		}
+	}
 	for _, t := range []string{q.table, q.jobs, q.cancelled} {
 		if _, err := tx.Exec("DELETE FROM " + t); err != nil {
-			return
+			return nil
 		}
 	}
 	if _, err := tx.Exec("UPDATE " + q.meta + " SET value = 0 WHERE key <> 'paused_at'"); err != nil {
-		return
+		return nil
 	}
-	tx.Commit()
+	if tx.Commit() != nil {
+		return nil
+	}
+	return tags
+}
+
+// workflowTags reads the tags of the queued and running workflow items, in
+// queue order.
+func (q *Queue) workflowTags(tx *sql.Tx) ([]wfItemTag, error) {
+	rows, err := tx.Query(fmt.Sprintf(`SELECT data FROM %s WHERE status IN ('pending', 'processing')
+		AND (instr(CAST(data AS TEXT), '"wf"') > 0 OR instr(CAST(data AS TEXT), char(92)) > 0) ORDER BY %s`, q.table, q.order))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tags []wfItemTag
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		if tag, ok := workflowTag(data); ok {
+			tags = append(tags, tag)
+		}
+	}
+	return tags, rows.Err()
 }
 
 // Close closes the queue and drops its outcome watches and OnCancel hooks
