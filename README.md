@@ -310,7 +310,7 @@ A recovery loop pushes leftover outbox rows when the store opens and every secon
 - The loop pushes only into queues that some client in this process has open. Rows for other queues wait, and the store logs each such queue once.
 - A job ID that starts with `wf:` is for workflow items. A plain job cannot take one. If an older row already holds the ID, the push stays in the outbox and the store logs it once.
 - The stored items of waiting tasks and the undo items stay in the workflow file until the task is pushed or the workflow expires.
-- Folder layout: `Purge` stores an intent in the workflow file before it deletes the rows. If the process crashes between them, the recovery loop ends the purged tasks later.
+- Folder layout: `Purge` stores an intent in the workflow file before it deletes the rows. If the process crashes between them, the recovery loop ends the purged tasks later. It applies an intent only once the job's row is gone from its queue, so a slow or aborted purge never cancels a live task.
 
 A valid workflow item is never dropped by a cancel mark: the workflow decides how its task ends. A `Purge` of a queue ends each purged workflow task as cancelled with the reason `queue purged`. The workflow goes on. This works also when no store is open in the process, as long as the workflow tables exist. Under `WithSingleFile` the delete and the ends are one transaction. An item whose JSON has keys that differ only in case, such as `WF` next to `wf`, is a plain job.
 

@@ -798,7 +798,7 @@ func (s *WorkflowStore) warnOnce(key, msg string) {
 // recoverOutbox pushes outbox rows at least minAge old.
 func (s *WorkflowStore) recoverOutbox(minAge time.Duration) {
 	s.logUnreachable()
-	s.applyIntents(minAge)
+	s.applyIntents()
 	s.drain(context.Background(), `created_at <= ?`, s.now().Add(-minAge).UnixMilli())
 }
 

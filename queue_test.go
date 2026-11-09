@@ -3256,3 +3256,44 @@ func TestWorkflowWithVarmqWorkers(t *testing.T) {
 		}
 	})
 }
+
+// The loop applies a purge intent only once the job row is gone from its
+// queue: a purge slower than the tick waits, and an aborted purge whose job
+// then ran leaves the task alone.
+func TestWorkflowPurgeIntentWaitsForDelete(t *testing.T) {
+	e := newWFEnv(t, false)
+	ctx := context.Background()
+	if err := e.st.Submit(ctx, planWF("w1", planTask("w1", "a", e.a), planTask("w1", "b", e.b, "a"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.Submit(ctx, planWF("w2", planTask("w2", "a", e.a))); err != nil {
+		t.Fatal(err)
+	}
+	intents := func() int {
+		var n int
+		e.st.f.db.QueryRow(`SELECT COUNT(*) FROM ` + wfPurged).Scan(&n)
+		return n
+	}
+	e.st.recordPurge(ctx, e.a, []wfItemTag{{wf: "w1", task: "a"}, {wf: "w2", task: "a"}})
+
+	// The purge is still running: its delete has not committed
+	e.st.recoverOutbox(0)
+	if got := taskStates(e.state(t, "w1")); got != "a=pending b=waiting" || intents() != 2 {
+		t.Fatalf("Expected the intents to wait, got %s, %d intents", got, intents())
+	}
+
+	// w2's purge aborted and its job ran; w1's delete commits
+	e.a.f.db.Exec(`DELETE FROM "a" WHERE job_id = 'wf:w1:a'`)
+	_, ack := take(t, e.a)
+	e.finish(t, e.a, ack, done("w2", "a", ""))
+	e.st.recoverOutbox(0)
+	if got := taskStates(e.state(t, "w1")); got != "a=cancelled b=cancelled" {
+		t.Errorf("Expected the delete's intent applied, got %s", got)
+	}
+	if r := e.state(t, "w2"); r.State != contract.WorkflowCompleted {
+		t.Errorf("Expected the aborted purge's task left alone, got %s", r.State)
+	}
+	if intents() != 0 {
+		t.Errorf("Expected every intent cleared, got %d", intents())
+	}
+}

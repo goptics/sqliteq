@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -220,10 +221,13 @@ func (s *WorkflowStore) applyIntent(ctx context.Context, in purgeIntent) {
 	}
 }
 
-// applyIntents applies the intents at least minAge old.
-func (s *WorkflowStore) applyIntents(minAge time.Duration) {
-	rows, err := s.f.db.Query(`SELECT seq, queue_id, workflow_id, task, undo FROM `+wfPurged+` WHERE created_at <= ? ORDER BY seq LIMIT ?`,
-		s.now().Add(-minAge).UnixMilli(), drainBatch)
+// applyIntents applies the stored intents whose job row is gone from its
+// queue: the purge's delete has committed. While the row is still there the
+// delete has not committed yet, or the purge aborted and the job lives on;
+// the intent waits. Once that job ends normally, its task has ended, and
+// applying the intent changes nothing but deleting it.
+func (s *WorkflowStore) applyIntents() {
+	rows, err := s.f.db.Query(`SELECT seq, queue_id, workflow_id, task, undo FROM `+wfPurged+` ORDER BY seq LIMIT ?`, drainBatch)
 	if err != nil {
 		return
 	}
@@ -238,6 +242,17 @@ func (s *WorkflowStore) applyIntents(minAge time.Duration) {
 	}
 	rows.Close()
 	for _, in := range list {
+		h, ok := s.lookup(in.queueID)
+		if !ok {
+			continue
+		}
+		q := h.queue()
+		var n int
+		err := q.f.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE job_id = ? AND status IN ('pending', 'processing')", q.table),
+			in.tag.jobID()).Scan(&n)
+		if err != nil || n > 0 {
+			continue
+		}
 		s.applyIntent(context.Background(), in)
 	}
 }
