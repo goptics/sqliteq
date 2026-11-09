@@ -15,6 +15,7 @@ import (
 // process that reaches it.
 type file struct {
 	key       string // resolved path, the registry key
+	scope     string // "sqliteq:" + store root: the folder, or the file under WithSingleFile
 	db        *sql.DB
 	pages     int                // checkpoint pages it was opened with
 	refs      int                // Queues values holding it; under registry.mu
@@ -72,6 +73,8 @@ func dsn(path string) string {
 // registry holds every open file in the process, keyed by resolved path.
 // Lock order is queues.mu, then registry.mu, then file.mu. A file's
 // batcher.mu is never held across a commit, so never together with file.mu.
+// A workflow store's write transaction holds file.mu, so it never takes
+// queues.mu: queues.handleOf reads an atomic copy-on-write map.
 var registry = struct {
 	mu    sync.Mutex
 	files map[string]*file
@@ -79,11 +82,14 @@ var registry = struct {
 
 // acquire returns the registry entry for the resolved path, opening the pool
 // on first use, and takes one reference on it.
-func acquire(path string, pages int) (*file, error) {
+func acquire(path, root string, pages int) (*file, error) {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 
 	if f, ok := registry.files[path]; ok {
+		if f.scope != "sqliteq:"+root {
+			return nil, fmt.Errorf("sqliteq: %s is already open under scope %s, not sqliteq:%s", path, f.scope, root)
+		}
 		if f.pages != pages {
 			return nil, fmt.Errorf("sqliteq: %s is already open with checkpoint pages %d, not %d", path, f.pages, pages)
 		}
@@ -102,6 +108,7 @@ func acquire(path string, pages int) (*file, error) {
 
 	f := &file{
 		key:       path,
+		scope:     "sqliteq:" + root,
 		db:        db,
 		pages:     pages,
 		refs:      1,

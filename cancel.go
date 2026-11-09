@@ -14,7 +14,8 @@ import (
 // Every pop drops a marked waiting job with outcome cancelled; OnCancel
 // learns of marks by polling seq; AcknowledgeCancelled finishes a running
 // job that stopped for it. Any finish, and an EnqueueOnce that stores the
-// id, clears the mark. sqliteq has no workflow store, so no item is exempt.
+// id, clears the mark. A valid workflow item (workflowTag) whose job ID is its tag's is never dropped: the
+// workflow decides its end, and its mark stays.
 
 var (
 	_ contract.JobCanceller          = (*Queue)(nil)
@@ -189,4 +190,14 @@ func marked(isMarked *sql.Stmt, id string, now time.Time) (bool, error) {
 	var n int
 	err := isMarked.QueryRow(id, now.UnixMilli()).Scan(&n)
 	return n == 1, err
+}
+
+// markedDrop is marked for a pop: a valid workflow item is never dropped.
+func markedDrop(isMarked *sql.Stmt, id string, data []byte, now time.Time) (bool, error) {
+	drop, err := marked(isMarked, id, now)
+	if err != nil || !drop {
+		return false, err
+	}
+	tag, ok := workflowTag(data)
+	return !(ok && id == tag.jobID()), nil
 }
