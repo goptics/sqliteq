@@ -192,6 +192,16 @@ queue := worker.WithPersistentQueue(q)
 queue.Add("hello")
 ```
 
+### Inspection and pause
+
+Both queue types implement varmq's `QueueInspector`, `QueuePauser` and `PauseNotifier`, so a bound queue shows up in varmq's REST API (`GET /queues`, `GET /queues/{id}/jobs`, `PATCH /queues/{id}/actions/pause|resume`) and in vartop, as a redisq queue does.
+
+- **Queue ID**: `sqliteq:<h>:fifo:<name>` or `sqliteq:<h>:prio:<name>`. `<h>` is the first 8 hex digits of the SHA-256 of the database file's resolved path, so every process on the file agrees, two files with one queue name never collide, and no path shows. `<name>` is in lower case. sqliteq has no in-memory mode, so every queue has a file. A file reached through two different paths (another mount, say) gets two IDs.
+- **Counts**: rows per `status`, read in one statement. Cancelled rows count as failed. Completed and failed rows exist only with `WithRemoveOnComplete(false)`; by default they are deleted, so those counts are 0. Kept rows have no retention.
+- **Totals**: `submitted` counts stored adds (a repeat `EnqueueOnce` is not one), `completed` and `failed` count finishes (`AcknowledgeCancelled` counts as failed; a waiting job dropped for a cancel counts as neither). They live in `<name>__sqliteq_meta`, start from the rows an older table holds when this version first opens it, and `Purge` resets them. Seeded totals count the rows the table holds then, so jobs deleted before the upgrade (the default `WithRemoveOnComplete(true)`) are missing from them.
+- **Jobs**: pending in hand-out order, processing by ack id, completed, failed (with cancelled, `state` `cancelled`) and cancelled newest finish first. `payload` is the varmq envelope's `data`, or the stored item itself (as a JSON string when it is not JSON). A job without an id shows its ack id once handed out. sqliteq does not count attempts: they read 0 while pending and 1 after. A kept row loses its start time when it ends. A failed job's `errors` holds its reason when the job has an id and its outcome record is still kept.
+- **Pause**: `Pause()` stores a `paused_at` row in `<name>__sqliteq_meta`. Every pop selects nothing while it exists, so the pause reaches every process on the file at once, outlives restarts, and survives `Purge`; only `Resume()` ends it. Adds, acks and rejects go on. `Paused()` is this object's cache: a pop refused for the pause sets it, and while it is set the queue polls the row every 50 ms, so a `Resume` from another process wakes this one's workers within that time.
+
 sqliteq does not import varmq. Batch pops and `EnqueueOnce` need varmq ≥ v1.10.0. From that release, a worker whose only source is the sqliteq queue claims several jobs in one statement through `DequeueBatchWithAckIds` (a worker bound to several queues claims one job per call), and a job added with an id (`WithJobId`, or one from `WithJobIdGenerator`) goes through `EnqueueOnce`. An older varmq calls neither: it claims one job per call and adds every job with `Enqueue`, which still works.
 
 ## Storage
@@ -228,11 +238,11 @@ In the folder layout the queue name becomes a file name, so it may only contain 
 
 Names are case-insensitive in both layouts: `Jobs` and `jobs` are the same queue, stored in `jobs.db` in the folder layout.
 
-### One process per file
+### Processes and files
 
-Run one process per database file. sqliteq keeps a registry in the process, keyed by the file's real path (made absolute, with symlinks resolved). Every `New` in the process that reaches the same file shares one connection pool and one write lock, so two `New` calls on one path never write through two competing pools. Two `Queues` values can therefore hold the same queue, and you get the same handle from both. The file closes when the last `Queues` using it is closed.
+sqliteq keeps a registry in the process, keyed by the file's real path (made absolute, with symlinks resolved). Every `New` in the process that reaches the same file shares one connection pool and one write lock, so two `New` calls on one path never write through two competing pools. Two `Queues` values can therefore hold the same queue, and you get the same handle from both. The file closes when the last `Queues` using it is closed.
 
-Another process is not coordinated with this one. The first time a process opens a queue, it puts every item still marked as processing back to pending, so a second process opening a file that is in use would rerun the first process's running jobs. sqliteq does not take an OS lock to stop that.
+Other processes can open the same file. SQLite's lock orders their writes, and what lives in the file reaches every process: a pause stops every process's pops at once, and a `Resume`, a cancel or a job outcome reaches the others within 50 ms (they poll). Recovery is the limit. Every process that opens a queue runs recovery on its first open of that queue, whatever it does with it: consumers, producers, observers (a process that only serves the REST API) and `Pause`/`Resume` callers alike. Recovery puts every item still marked as processing back to pending, so a process that opens the queue while another one runs its jobs makes those jobs run again. sqliteq does not take an OS lock to stop that. Sharing a file is safe only when every process opens the queue before any of them takes jobs, and no process opens it, or opens it again after a restart, later.
 
 On macOS, spell a path the same way every time: the registry key keeps the letter case you pass, so `Data` and `data` would be two entries for one folder. On Windows, Go resolves existing folders and files to their on-disk letter case, so different spellings of them share one entry.
 
@@ -290,7 +300,7 @@ Each queue is a table with these columns:
 - `id`: autoincrement primary key. Items come out in `id` order, and a priority queue's in `priority`, then `id` order. The ack id `DequeueWithAckId` returns is this id in decimal.
 - `priority`: priority queues only; a lower number comes out first. Opening an older table as a priority queue adds it.
 - `data`: the stored item.
-- `status`: `pending`, `processing` or `completed`.
+- `status`: `pending`, `processing`, or on a kept row `completed`, `failed` or `cancelled`.
 - `ack`: 0 when an item is added, 1 once it is acknowledged or rejected and kept with `WithRemoveOnComplete(false)` (`status` `completed` or `failed`). On open, only `processing` rows with `ack` 0 go back to pending.
 - `ack_id`: kept from v0.2 so old tables need no rebuild; no longer used.
 - `job_id`: the id an item was added with through `EnqueueOnce`, unique among the rows that have one; NULL for `Enqueue`. Opening an older table adds it.
@@ -299,7 +309,8 @@ Each queue is a table with these columns:
 On top of that table:
 
 - Two partial indexes: one covers the pending items in queue order, and a unique one covers `job_id` on the rows that have one, which `EnqueueOnce` relies on.
-- A claim or a pop is one `UPDATE ... RETURNING` or `DELETE ... RETURNING` statement.
+- A claim or a pop is one `UPDATE ... RETURNING` or `DELETE ... RETURNING` statement. It selects nothing while the queue is paused.
+- `<name>__sqliteq_meta` holds the totals and the pause; a trigger counts each stored add.
 - Writes to one file (adds, claims, acks, purges) take one lock in the process, so they wait for each other in Go rather than in SQLite's busy handler. `Len` and `Values` do not take it.
 - Concurrent `Enqueue` and `Acknowledge` calls on one file are committed together in one transaction. Each call still gets its own result, and if the shared transaction fails, each call is retried on its own so one bad call fails alone.
 

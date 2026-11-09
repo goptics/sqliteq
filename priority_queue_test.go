@@ -3,6 +3,7 @@ package sqliteq
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -695,5 +696,41 @@ func TestPriorityOutcomeAndCancel(t *testing.T) {
 	pq.EnqueueOnce(job("again"), 0, "again")
 	if v, _ := pop(t, pq.Queue); v != string(job("again")) {
 		t.Errorf("Expected the re-added job first, got %s", v)
+	}
+}
+
+// A priority queue lists pending jobs in hand-out order (priority, then
+// insert), counts as Queue does, and pauses every pop.
+func TestPriorityInspectAndPause(t *testing.T) {
+	qs := mustNew(t, t.TempDir())
+	defer qs.Close()
+	pq, err := qs.NewPriorityQueue("pq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pq.Enqueue(job("low"), 5)
+	pq.Enqueue(job("high"), 1)
+	pq.EnqueueOnce(job("mid"), 3, "mid")
+	pq.Enqueue(job("high2"), 1)
+
+	if got := ids(jobs(t, pq.Queue, contract.JobPending, 0, 10)); !slices.Equal(got, []string{"high", "high2", "mid", "low"}) {
+		t.Errorf("pending: got %q", got)
+	}
+	if got := ids(jobs(t, pq.Queue, contract.JobPending, 1, 2)); !slices.Equal(got, []string{"high2", "mid"}) {
+		t.Errorf("page: got %q", got)
+	}
+	if s := stats(t, pq.Queue); s.Counts.Pending != 4 || s.Totals.Submitted != 4 {
+		t.Errorf("stats: got %+v", s)
+	}
+
+	if err := pq.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	refusedPops(t, pq.Queue)
+	if err := pq.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := pop(t, pq.Queue); v != string(job("high")) {
+		t.Errorf("got %s, want high", v)
 	}
 }

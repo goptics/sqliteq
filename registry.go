@@ -184,8 +184,13 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 		h.q = q
 	}
 
+	// ponytail: recovery runs on every process's first open, also one that
+	// never takes jobs (a producer, observer or pauser), and requeues jobs
+	// another process is running. Upgrade path: owner ids plus heartbeats
+	// on processing rows, requeueing only rows of dead owners (redisq's model).
 	if !f.recovered[key] {
 		if err := h.queue().requeueNoAck(); err != nil {
+			h.queue().Close() // stops a pause poll
 			return nil, fmt.Errorf("failed to requeue unacknowledged rows: %w", err)
 		}
 		f.recovered[key] = true

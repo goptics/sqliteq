@@ -2,12 +2,15 @@ package sqliteq
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1675,5 +1678,606 @@ func TestUndecodableEnvelopeIsPlainJob(t *testing.T) {
 	}
 	if n := countJobs(t, q); n != 0 {
 		t.Errorf("Expected no records, got %d", n)
+	}
+}
+
+// QueueID is sqliteq:<8 hex of the file's path>:fifo|prio:<name in lower
+// case>: one file agrees in every process, two files never collide.
+func TestQueueID(t *testing.T) {
+	dir := t.TempDir()
+	qs := mustNew(t, dir)
+	defer qs.Close()
+	q, _ := qs.NewQueue("Jobs")
+	pq, _ := qs.NewPriorityQueue("Prio")
+	sum := sha256.Sum256([]byte(q.f.key))
+	if want := "sqliteq:" + hex.EncodeToString(sum[:4]) + ":fifo:jobs"; q.QueueID() != want {
+		t.Errorf("got %q, want %q", q.QueueID(), want)
+	}
+	if id := pq.QueueID(); !strings.HasPrefix(id, "sqliteq:") || !strings.HasSuffix(id, ":prio:prio") {
+		t.Errorf("priority queue id %q", id)
+	}
+	if otherProcess(t, q).QueueID() != q.QueueID() {
+		t.Error("Expected one id for one file in every process")
+	}
+
+	// Same table name, other file
+	single := mustNew(t, filepath.Join(dir, "single.db"), WithSingleFile())
+	defer single.Close()
+	q2, _ := single.NewQueue("jobs")
+	if q2.QueueID() == q.QueueID() {
+		t.Error("Expected two files to have two ids")
+	}
+	if strings.Contains(q2.QueueID(), dir) {
+		t.Error("Expected no path in the id")
+	}
+}
+
+// stats reads QueueStats, failing on an error.
+func stats(t *testing.T, q *Queue) contract.QueueStats {
+	t.Helper()
+	s, err := q.QueueStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// QueueStats counts rows per state (cancelled under failed), totals every
+// add and finish, and survives no Purge; the default deletes ended rows.
+func TestQueueStats(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keep=%t", keep), func(t *testing.T) {
+			q, qs := openQueue(t, WithRemoveOnComplete(!keep))
+			defer qs.Close()
+			for _, id := range []string{"a", "b", "c", "d", "e"} {
+				q.Enqueue(job(id))
+			}
+			q.EnqueueOnce(job("f"), "f")
+			q.EnqueueOnce(job("f"), "f") // repeat: not submitted
+			q.CancelJob("d")
+
+			_, a := pop(t, q)
+			_, b := pop(t, q)
+			_, c := pop(t, q)
+			pop(t, q) // drops d (cancelled, in no total), hands out e
+			q.Acknowledge(a)
+			q.Reject(b, "boom")
+			q.AcknowledgeCancelled(c, "stop")
+
+			kept := int64(0)
+			if keep {
+				kept = 1
+			}
+			want := contract.QueueStats{
+				Counts: contract.JobCounts{Pending: 1, Processing: 1, Completed: kept, Failed: 3 * kept},
+				Totals: contract.JobTotals{Submitted: 6, Completed: 1, Failed: 2},
+			}
+			if got := stats(t, q); got != want {
+				t.Errorf("got %+v, want %+v", got, want)
+			}
+			if got := stats(t, otherProcess(t, q)); got != want {
+				t.Errorf("other process: got %+v, want %+v", got, want)
+			}
+
+			q.Purge()
+			if got := stats(t, q); got != (contract.QueueStats{}) {
+				t.Errorf("after Purge: got %+v", got)
+			}
+		})
+	}
+}
+
+// jobs reads one page of Jobs, failing on an error.
+func jobs(t *testing.T, q *Queue, state contract.JobState, offset, limit int) []contract.JobRecord {
+	t.Helper()
+	j, err := q.Jobs(context.Background(), state, offset, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+func ids(js []contract.JobRecord) []string {
+	out := make([]string, len(js))
+	for i, j := range js {
+		out[i] = j.ID
+	}
+	return out
+}
+
+// Jobs pages each state: pending in hand-out order, processing by ack id,
+// completed and failed (with cancelled) newest first; payload is the
+// envelope's data, verbatim.
+func TestJobs(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+	before := time.Now().UnixMilli()
+	q.Enqueue([]byte(`{"id":"a","status":"Created","data":{"n":1.000000000000001},"enqueued_at":7}`))
+	q.Enqueue([]byte("plain"))
+	q.Enqueue([]byte(`[1,2]`))
+	for _, id := range []string{"b", "c", "d", "e", "f"} {
+		q.Enqueue(job(id))
+	}
+	if got := ids(jobs(t, q, contract.JobPending, 0, 100)); !slices.Equal(got, []string{"a", "", "", "b", "c", "d", "e", "f"}) {
+		t.Fatalf("pending: got %q", got)
+	}
+	page := jobs(t, q, contract.JobPending, 0, 3)
+	if string(page[0].Payload) != `{"n":1.000000000000001}` || page[0].EnqueuedAt != 7 || page[0].Attempts != 0 || page[0].StartedAt != 0 {
+		t.Errorf("envelope: got %+v", page[0])
+	}
+	if string(page[1].Payload) != `"plain"` || page[1].EnqueuedAt < before {
+		t.Errorf("plain bytes: got %+v (enqueued_at from the row)", page[1])
+	}
+	if string(page[2].Payload) != `[1,2]` {
+		t.Errorf("JSON item: got %s", page[2].Payload)
+	}
+	if got := ids(jobs(t, q, contract.JobPending, 6, 5)); !slices.Equal(got, []string{"e", "f"}) {
+		t.Errorf("offset 6: got %q", got)
+	}
+
+	acks := map[string]string{}
+	for range 7 {
+		v, ack := pop(t, q)
+		acks[v] = ack
+	}
+	plainAck := acks["plain"]
+	q.Acknowledge(acks[`{"id":"a","status":"Created","data":{"n":1.000000000000001},"enqueued_at":7}`])
+	q.Reject(acks["plain"], "no id")
+	q.Reject(acks[string(job("b"))], "boom")
+	q.AcknowledgeCancelled(acks[string(job("c"))], "stopped")
+	q.Acknowledge(acks[string(job("d"))])
+
+	// A running job without an id shows its ack id
+	proc := jobs(t, q, contract.JobProcessing, 0, 10)
+	if got := ids(proc); !slices.Equal(got, []string{acks["[1,2]"], "e"}) {
+		t.Errorf("processing: got %q", got)
+	}
+	for _, j := range proc {
+		if j.State != contract.JobProcessing || j.Attempts != 1 || j.StartedAt < before || j.FinishedAt != 0 {
+			t.Errorf("processing job: got %+v", j)
+		}
+	}
+
+	if got := ids(jobs(t, q, contract.JobCompleted, 0, 10)); !slices.Equal(got, []string{"d", "a"}) {
+		t.Errorf("completed: got %q", got)
+	}
+	failed := jobs(t, q, contract.JobFailed, 0, 10)
+	if got := ids(failed); !slices.Equal(got, []string{"c", "b", plainAck}) {
+		t.Fatalf("failed: got %q", got)
+	}
+	if failed[0].State != contract.JobCancelled || len(failed[0].Errors) != 1 || failed[0].Errors[0].Error != "stopped" {
+		t.Errorf("cancelled: got %+v", failed[0])
+	}
+	if b := failed[1]; b.State != contract.JobFailed || b.FinishedAt < before || b.Attempts != 1 ||
+		!slices.Equal(b.Errors, []contract.JobError{{Attempt: 1, At: b.FinishedAt, Error: "boom"}}) {
+		t.Errorf("failed: got %+v", b)
+	}
+	if len(failed[2].Errors) != 0 {
+		t.Errorf("Expected no errors without an outcome record, got %+v", failed[2].Errors)
+	}
+	if got := ids(jobs(t, q, contract.JobFailed, 1, 1)); !slices.Equal(got, []string{"b"}) {
+		t.Errorf("failed page 2: got %q", got)
+	}
+
+	if j := jobs(t, q, contract.JobPending, 0, 0); j == nil || len(j) != 0 {
+		t.Errorf("limit 0: got %#v", j)
+	}
+	if j := jobs(t, q, contract.JobPending, 0, -1); j == nil || len(j) != 0 {
+		t.Errorf("limit -1: got %#v", j)
+	}
+	if _, err := q.Jobs(context.Background(), "bogus", 0, 10); err == nil {
+		t.Error("Expected an unknown state to fail")
+	}
+}
+
+// With the default WithRemoveOnComplete(true) ended jobs are not kept, so
+// their pages are empty.
+func TestJobsRemoveOnComplete(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Enqueue(job("a"))
+	_, ack := pop(t, q)
+	q.Acknowledge(ack)
+	if j := jobs(t, q, contract.JobCompleted, 0, 10); len(j) != 0 {
+		t.Errorf("got %+v", j)
+	}
+}
+
+// A closed queue answers stats and jobs with an error, as varmq lists it.
+func TestInspectClosed(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	q.Close()
+	if _, err := q.QueueStats(context.Background()); err == nil {
+		t.Error("Expected QueueStats to fail on a closed queue")
+	}
+	if _, err := q.Jobs(context.Background(), contract.JobPending, 0, 1); err == nil {
+		t.Error("Expected Jobs to fail on a closed queue")
+	}
+}
+
+func TestImplementsPause(t *testing.T) {
+	var (
+		_ varmq.QueuePauser   = (*Queue)(nil)
+		_ varmq.QueuePauser   = (*PriorityQueue)(nil)
+		_ varmq.PauseNotifier = (*Queue)(nil)
+		_ varmq.PauseNotifier = (*PriorityQueue)(nil)
+	)
+}
+
+// refusedPops checks that every pop kind hands out nothing and reports a
+// pause.
+func refusedPops(t *testing.T, q *Queue) {
+	t.Helper()
+	before := q.PauseRefusals()
+	if _, ok := q.Dequeue(); ok {
+		t.Error("Dequeue handed out an item while paused")
+	}
+	if _, ok, _ := q.DequeueWithAckId(); ok {
+		t.Error("DequeueWithAckId handed out an item while paused")
+	}
+	items, acks := make([]any, 4), make([]string, 4)
+	if n, rem, err := q.DequeueBatchWithAckIds(items, acks); n != 0 || rem != 0 || err != nil {
+		t.Errorf("batch pop while paused: got %d %d %v", n, rem, err)
+	}
+	if got := q.PauseRefusals() - before; got != 3 {
+		t.Errorf("Expected 3 refusals, got %d", got)
+	}
+	if !q.Paused() {
+		t.Error("Expected a refused pop to leave Paused true")
+	}
+}
+
+// Pause stops every pop, keeps its first time, and is kept in the file;
+// Resume lets pops go on. Hooks hear each change once.
+func TestPause(t *testing.T) {
+	for _, marked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("marked=%t", marked), func(t *testing.T) {
+			q, qs := openQueue(t)
+			defer qs.Close()
+			if marked {
+				q.CancelJob("other") // gated pops
+			}
+			var calls []bool
+			var mu sync.Mutex
+			stop := q.OnPauseChange(func(p bool) {
+				mu.Lock()
+				calls = append(calls, p)
+				mu.Unlock()
+			})
+			defer stop()
+			enqueueN(t, q, 3)
+
+			if q.Paused() {
+				t.Fatal("Expected a new queue to run")
+			}
+			if err := q.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			first := stats(t, q)
+			if !q.Paused() || !first.Paused || first.PausedAt == 0 {
+				t.Fatalf("after Pause: Paused %t, stats %+v", q.Paused(), first)
+			}
+			time.Sleep(2 * time.Millisecond)
+			if err := q.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			if s := stats(t, q); s.PausedAt != first.PausedAt {
+				t.Errorf("Expected a second Pause to keep %d, got %d", first.PausedAt, s.PausedAt)
+			}
+			refusedPops(t, q)
+			if !q.Enqueue([]byte("added while paused")) || q.Len() != 4 {
+				t.Error("Expected adds to land while paused")
+			}
+
+			if err := q.Resume(); err != nil {
+				t.Fatal(err)
+			}
+			if err := q.Resume(); err != nil {
+				t.Fatal(err)
+			}
+			if q.Paused() || stats(t, q).Paused {
+				t.Error("Expected Resume to clear the pause")
+			}
+			if _, ok := q.Dequeue(); !ok {
+				t.Error("Expected pops to go on after Resume")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(calls, []bool{true, false}) {
+				t.Errorf("hooks: got %v", calls)
+			}
+		})
+	}
+}
+
+// waitPaused waits for q.Paused to become want.
+func waitPaused(t *testing.T, q *Queue, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for q.Paused() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("Paused stayed %t", !want)
+		}
+		time.Sleep(pollEvery / 5)
+	}
+}
+
+// A pause from another process stops this one's pops at once; its Resume
+// reaches this object's Paused and hooks by the poll.
+func TestPauseAcrossProcesses(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	other := otherProcess(t, q)
+	resumed := make(chan struct{}, 1)
+	defer q.OnPauseChange(func(p bool) {
+		if !p {
+			resumed <- struct{}{}
+		}
+	})()
+	enqueueN(t, q, 2)
+
+	if err := other.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	if q.Paused() {
+		t.Fatal("Expected the cache to wait for a pop or the poll")
+	}
+	if !stats(t, q).Paused {
+		t.Error("Expected QueueStats to read the pause from the file")
+	}
+	refusedPops(t, q)
+
+	if err := other.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	waitPaused(t, q, false)
+	select {
+	case <-resumed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no resume hook")
+	}
+	if _, ok := q.Dequeue(); !ok {
+		t.Error("Expected pops to go on after the other process resumed")
+	}
+}
+
+// A pause is kept in the file: it outlives the process, and Purge keeps it.
+func TestPauseSurvivesReopenAndPurge(t *testing.T) {
+	dir := t.TempDir()
+	qs := mustNew(t, dir)
+	q, _ := qs.NewQueue("q")
+	q.Enqueue([]byte("x"))
+	if err := q.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	at := stats(t, q).PausedAt
+	q.Purge()
+	if s := stats(t, q); s.PausedAt != at || s.Totals != (contract.JobTotals{}) {
+		t.Errorf("after Purge: got %+v, want paused_at %d and no totals", s, at)
+	}
+	q.Enqueue([]byte("y"))
+	qs.Close()
+
+	qs = mustNew(t, dir)
+	defer qs.Close()
+	q, _ = qs.NewQueue("q")
+	if !q.Paused() || !stats(t, q).Paused {
+		t.Fatal("Expected the pause to outlive the process")
+	}
+	refusedPops(t, q)
+	q.Resume()
+	if v, ok := q.Dequeue(); !ok || string(v.([]byte)) != "y" {
+		t.Errorf("got %v %t, want y", v, ok)
+	}
+	q.Close()
+	if q.Pause() == nil || q.Resume() == nil {
+		t.Error("Expected Pause and Resume on a closed queue to fail")
+	}
+}
+
+// varmq: a paused queue holds the worker in every process; a Resume from
+// another process wakes it.
+func TestVarmqPause(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	other := otherProcess(t, q)
+
+	ran := make(chan int, 4)
+	w := varmq.NewWorker(func(j varmq.Job[int]) { ran <- j.Data() })
+	defer w.Stop()
+	handle := w.WithPersistentQueue(q)
+	if err := handle.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	if !handle.IsPaused() {
+		t.Fatal("Expected the handle to report the pause")
+	}
+	handle.Add(1)
+	select {
+	case v := <-ran:
+		t.Fatalf("job %d ran while paused", v)
+	case <-time.After(10 * pollEvery):
+	}
+	if err := other.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("job did not run after the other process resumed")
+	}
+}
+
+// An older table's totals start from the rows it holds.
+func TestTotalsSeededFromRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	writeV023File(t, path, "q", false)
+	qs := mustNew(t, path, WithSingleFile())
+	defer qs.Close()
+	q, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows int64
+	q.f.db.QueryRow(`SELECT COUNT(*) FROM "q"`).Scan(&rows)
+	if s := stats(t, q); rows == 0 || s.Totals.Submitted != uint64(rows) {
+		t.Errorf("got %+v, want submitted %d", s.Totals, rows)
+	}
+}
+
+// A stopped hook gets no calls; a refusal read before this object's own
+// Resume does not undo it.
+func TestPauseHookStopAndStaleRefusal(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	var calls []bool
+	var mu sync.Mutex
+	defer q.OnPauseChange(func(p bool) {
+		mu.Lock()
+		calls = append(calls, p)
+		mu.Unlock()
+	})()
+	q.OnPauseChange(func(bool) { t.Error("A stopped hook was called") })()
+
+	q.Pause()
+	g := q.pz.gen.Load()
+	q.Resume()
+	q.refused(g)
+	if q.Paused() {
+		t.Error("Expected a stale refusal to leave the Resume")
+	}
+	mu.Lock()
+	if !slices.Equal(calls, []bool{true, false}) {
+		t.Errorf("hooks: got %v", calls)
+	}
+	mu.Unlock()
+
+	// Racing: a refusal whose gen check passes must not apply after a
+	// whole Resume ran
+	q2, qs2 := openQueue(t)
+	defer qs2.Close()
+	for i := range 20000 {
+		q2.Pause()
+		g := q2.pz.gen.Load()
+		done := make(chan struct{})
+		go func() {
+			q2.refused(g)
+			close(done)
+		}()
+		q2.Resume()
+		<-done
+		if q2.Paused() {
+			t.Fatalf("round %d: a stale refusal undid the Resume", i)
+		}
+	}
+}
+
+// A Resume from another process between an empty pop and its read of the
+// pause row is not a failed pop: the pop goes again and hands out the item.
+func TestResumeBetweenPopAndRead(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	other := otherProcess(t, q)
+	t.Cleanup(func() { afterEmptyPop = func() {} })
+	pops := []struct {
+		name string
+		pop  func() bool
+	}{
+		{"Dequeue", func() bool { _, ok := q.Dequeue(); return ok }},
+		{"DequeueWithAckId", func() bool { _, ok, _ := q.DequeueWithAckId(); return ok }},
+		{"DequeueBatchWithAckIds", func() bool {
+			n, _, _ := q.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2))
+			return n == 1
+		}},
+	}
+	for _, p := range pops {
+		q.Enqueue([]byte(p.name))
+		if err := other.Pause(); err != nil {
+			t.Fatal(err)
+		}
+		afterEmptyPop = func() {
+			afterEmptyPop = func() {}
+			if err := other.Resume(); err != nil {
+				t.Error(err)
+			}
+		}
+		if !p.pop() {
+			t.Errorf("%s: Expected the item after the Resume", p.name)
+		}
+	}
+}
+
+// Completed, failed and cancelled pages sort by finish, not by add.
+func TestJobsNewestFinishFirst(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+	for _, id := range []string{"a", "b", "c", "d", "e", "f"} {
+		q.Enqueue(job(id))
+	}
+	acks := make([]string, 6)
+	for i := range acks {
+		_, acks[i] = pop(t, q)
+	}
+	q.Acknowledge(acks[1])
+	q.Acknowledge(acks[0])
+	q.Reject(acks[3], "x")
+	q.Reject(acks[2], "x")
+	q.AcknowledgeCancelled(acks[5], "x")
+	q.AcknowledgeCancelled(acks[4], "y")
+	if got := ids(jobs(t, q, contract.JobCompleted, 0, 10)); !slices.Equal(got, []string{"a", "b"}) {
+		t.Errorf("completed: got %q", got)
+	}
+	if got := ids(jobs(t, q, contract.JobFailed, 0, 10)); !slices.Equal(got, []string{"e", "f", "c", "d"}) {
+		t.Errorf("failed: got %q", got)
+	}
+	cancelled := jobs(t, q, contract.JobCancelled, 0, 10)
+	if got := ids(cancelled); !slices.Equal(got, []string{"e", "f"}) {
+		t.Fatalf("cancelled: got %q", got)
+	}
+	if e := cancelled[0]; e.State != contract.JobCancelled || len(e.Errors) != 1 || e.Errors[0].Error != "y" {
+		t.Errorf("cancelled job: got %+v", e)
+	}
+}
+
+// Seeding counts kept ended rows too: cancelled as failed.
+func TestTotalsSeededFromEndedRows(t *testing.T) {
+	q, qs := openQueue(t, WithRemoveOnComplete(false))
+	defer qs.Close()
+	enqueueN(t, q, 4)
+	_, a := pop(t, q)
+	_, b := pop(t, q)
+	_, c := pop(t, q)
+	q.Acknowledge(a)
+	q.Reject(b, "boom")
+	q.AcknowledgeCancelled(c, "stop")
+	if _, err := q.f.db.Exec("DROP TABLE " + q.meta); err != nil {
+		t.Fatal(err)
+	}
+	want := contract.JobTotals{Submitted: 4, Completed: 1, Failed: 2}
+	if got := stats(t, otherProcess(t, q)).Totals; got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+// A finish that ends no row (repeat, stale or unknown ack) counts nothing.
+func TestTotalsIgnoreNoopFinish(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keep=%t", keep), func(t *testing.T) {
+			q, qs := openQueue(t, WithRemoveOnComplete(!keep))
+			defer qs.Close()
+			q.Enqueue(job("a"))
+			_, ack := pop(t, q)
+			if !q.Acknowledge(ack) {
+				t.Fatal("Acknowledge failed")
+			}
+			if q.Acknowledge(ack) || q.Reject(ack, "x") || q.AcknowledgeCancelled(ack, "x") ||
+				q.Acknowledge("garbage") || q.Reject("999", "x") {
+				t.Error("Expected a finish of no processing row to return false")
+			}
+			if got, want := stats(t, q).Totals, (contract.JobTotals{Submitted: 1, Completed: 1}); got != want {
+				t.Errorf("got %+v, want %+v", got, want)
+			}
+		})
 	}
 }
