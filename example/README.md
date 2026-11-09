@@ -18,6 +18,11 @@ The example program provides two demonstrations:
    - Adding items with different priorities (lower number = higher priority)
    - Observing how items are dequeued in priority order
 
+3. **Workflow Example** - Runs a two-step VarMQ workflow over two queues:
+   - Creating a workflow store with `NewWorkflowStore`
+   - Adding tasks to queues and ordering them with `After`
+   - Waiting for the workflow to complete
+
 ## Running the Examples
 
 To run the examples:
@@ -34,6 +39,7 @@ SQLiteQ Examples
 ---------------
 1. Regular Queue Example
 2. Priority Queue Example
+3. Workflow Example
 Choose an example (default is 1):
 ```
 

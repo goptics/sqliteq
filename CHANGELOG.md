@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Workflows (VarMQ spec 6.9 to 6.12): `NewWorkflowStore(qs, ...WorkflowOption)` returns the `contract.WorkflowStore` of a store root. (#NN)
+- The store registers with `contract.RegisterWorkflowStore`; `Close` unregisters it and releases its file. (#NN)
+- `WithWorkflowResultLimit` (default 64 KiB, `ErrResultTooLarge`) and `WithWorkflowRetention` (default 7 days). (#NN)
+- `ScopeID()` on `Queue` and `PriorityQueue`: `sqliteq:` and the absolute store folder, or the file under `WithSingleFile`. (#NN)
+- Folder layout: the store keeps its tables in `__sqliteq_workflows.db`. `WithSingleFile`: tables in the same file. (#NN)
+- Tables `__sqliteq_wf_workflows`, `__sqliteq_wf_tasks`, `__sqliteq_wf_outbox`. (#NN)
+- `FinishTask` in three steps in the folder layout: record the end and write the outbox, push each row with `EnqueueOnce`, acknowledge the job. (#NN)
+- A recovery loop pushes leftover outbox rows at open and every second. (#NN)
+- `WithSingleFile`: the end, the pushes and the ack are one transaction. (#NN)
+- A duplicate push or a redelivered job is safe: the pre-run check skips a task that already ended. (#NN)
+- `Workflows` (`contract.WorkflowInspector`) and `WorkflowKeys` (`contract.WorkflowKeyLister`) list workflows newest first. (#NN)
+- A cancel mark never drops a valid workflow item; the workflow decides its end. (#NN)
+- Task JSON whose keys differ only in case (`WF` next to `wf`) is a plain job. (#NN)
+- `Purge` ends each purged workflow task as cancelled, reason `queue purged`; its workflow goes on. (#NN)
 - `Reject(ackID, reason)` on `Queue` and `PriorityQueue`, for VarMQ's `IAcknowledgeable` (varmq#173). (#21)
 - `Reject` finishes an item that failed for good: never requeued. (#21)
 - Rejected item deleted like an ack; with `WithRemoveOnComplete(false)` kept with `status` `failed`. (#21)

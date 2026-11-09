@@ -90,6 +90,7 @@ func main() {
 	fmt.Println("---------------")
 	fmt.Println("1. Regular Queue Example")
 	fmt.Println("2. Priority Queue Example")
+	fmt.Println("3. Workflow Example")
 
 	// Default to regular queue example
 	var choice string
@@ -101,6 +102,8 @@ func main() {
 	switch choice {
 	case "2":
 		priorityQueueExample()
+	case "3":
+		workflowExample()
 	default:
 		regularQueueExample()
 	}
