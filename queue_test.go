@@ -2148,9 +2148,28 @@ func TestPauseHookStopAndStaleRefusal(t *testing.T) {
 		t.Error("Expected a stale refusal to leave the Resume")
 	}
 	mu.Lock()
-	defer mu.Unlock()
 	if !slices.Equal(calls, []bool{true, false}) {
 		t.Errorf("hooks: got %v", calls)
+	}
+	mu.Unlock()
+
+	// Racing: a refusal whose gen check passes must not apply after a
+	// whole Resume ran
+	q2, qs2 := openQueue(t)
+	defer qs2.Close()
+	for i := range 20000 {
+		q2.Pause()
+		g := q2.pz.gen.Load()
+		done := make(chan struct{})
+		go func() {
+			q2.refused(g)
+			close(done)
+		}()
+		q2.Resume()
+		<-done
+		if q2.Paused() {
+			t.Fatalf("round %d: a stale refusal undid the Resume", i)
+		}
 	}
 }
 
@@ -2243,18 +2262,22 @@ func TestTotalsSeededFromEndedRows(t *testing.T) {
 
 // A finish that ends no row (repeat, stale or unknown ack) counts nothing.
 func TestTotalsIgnoreNoopFinish(t *testing.T) {
-	q, qs := openQueue(t)
-	defer qs.Close()
-	q.Enqueue(job("a"))
-	_, ack := pop(t, q)
-	if !q.Acknowledge(ack) {
-		t.Fatal("Acknowledge failed")
-	}
-	if q.Acknowledge(ack) || q.Reject(ack, "x") || q.AcknowledgeCancelled(ack, "x") ||
-		q.Acknowledge("garbage") || q.Reject("999", "x") {
-		t.Error("Expected a finish of no processing row to return false")
-	}
-	if got, want := stats(t, q).Totals, (contract.JobTotals{Submitted: 1, Completed: 1}); got != want {
-		t.Errorf("got %+v, want %+v", got, want)
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keep=%t", keep), func(t *testing.T) {
+			q, qs := openQueue(t, WithRemoveOnComplete(!keep))
+			defer qs.Close()
+			q.Enqueue(job("a"))
+			_, ack := pop(t, q)
+			if !q.Acknowledge(ack) {
+				t.Fatal("Acknowledge failed")
+			}
+			if q.Acknowledge(ack) || q.Reject(ack, "x") || q.AcknowledgeCancelled(ack, "x") ||
+				q.Acknowledge("garbage") || q.Reject("999", "x") {
+				t.Error("Expected a finish of no processing row to return false")
+			}
+			if got, want := stats(t, q).Totals, (contract.JobTotals{Submitted: 1, Completed: 1}); got != want {
+				t.Errorf("got %+v, want %+v", got, want)
+			}
+		})
 	}
 }
