@@ -1,6 +1,6 @@
-# SQLiteQ Examples
+# sqliteq examples
 
-This directory contains example code demonstrating how to use the SQLiteQ library.
+This directory contains example code demonstrating how to use the sqliteq library.
 
 ## Available Examples
 
