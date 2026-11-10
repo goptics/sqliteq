@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WithSingleFile`: the end, the pushes and the ack are one transaction. (#25)
 - A redelivered job, or a push repeated after the job was removed, is safe: the pre-run check skips a task that already ended. (#25)
 - `Workflows` (`contract.WorkflowInspector`) and `WorkflowKeys` (`contract.WorkflowKeyLister`) list workflows newest first. (#25)
+- `WorkflowCounts` (`contract.WorkflowCounter`, contract v0.9.0): stored workflows per state, same rows as `WorkflowKeys`.
+- Task times on `TaskRecord` and its `Undo`: `EnqueuedAt` at push, `StartedAt` when `Runnable` last answered true, `FinishedAt` at end. Unix ms, store clock.
+- `Runnable` is one write transaction: check, then stamp on a true answer. Unknown workflow: `ErrWorkflowNotFound`, no row made.
+- `__sqliteq_wf_tasks` columns `enqueued_at`, `started_at`, `finished_at`, `undo_enqueued_at`, `undo_started_at`, `undo_finished_at` (INTEGER, default 0). Added at open to older tables; old rows read 0.
+- Index `__sqliteq_wf_workflows_state` on `(state, created_at DESC, id)`.
 - A cancel mark never drops a valid workflow item; the workflow decides its end. (#25)
 - Task JSON whose keys differ only in case (`WF` next to `wf`) is a plain job. (#25)
 - `Purge` ends each purged workflow task as cancelled, reason `queue purged`; its workflow goes on. (#25)

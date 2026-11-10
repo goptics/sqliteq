@@ -293,7 +293,7 @@ Options of `NewWorkflowStore`:
 
 Every queue of a workflow must have the same scope. The scope of a queue is `ScopeID()`: `sqliteq:` and the absolute path of the store folder, or of the file under `WithSingleFile`, with symlinks resolved. A file already open under one scope cannot be opened under another, for example as a single file and as a queue file of a folder. `NewQueue` returns an error then. `WithSingleFile` refuses the file name `__sqliteq_workflows.db`. One process holds one store for each scope. A second `NewWorkflowStore` for the same scope returns `contract.ErrScopeRegistered`.
 
-The store implements `contract.WorkflowStore`, `WorkflowInspector` and `WorkflowKeyLister`. So VarMQ's REST API lists and cancels sqliteq workflows.
+The store implements `contract.WorkflowStore`, `WorkflowInspector`, `WorkflowKeyLister` and `WorkflowCounter`. So VarMQ's REST API lists, counts and cancels sqliteq workflows. Each task record carries its times: enqueued, started, finished (Unix ms, 0 when not reached).
 
 **Where the state lives.** In the folder layout the store uses its own file, `__sqliteq_workflows.db`. Under `WithSingleFile` it uses three tables of the store file. The tables are `__sqliteq_wf_workflows`, `__sqliteq_wf_tasks` and `__sqliteq_wf_outbox`. A queue name must not contain `__sqliteq_`, so a queue never takes these names.
 

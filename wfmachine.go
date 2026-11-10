@@ -27,6 +27,11 @@ type wfTask struct {
 	undoState  contract.JobState
 	undoOpen   int // undos of completed descendants not ended yet
 	undoReason string
+
+	// Unix ms, 0 when not reached (TaskRecord). The machine stamps the
+	// finishes; the store stamps pushes and starts.
+	enqueued, started, finished             int64
+	undoEnqueued, undoStarted, undoFinished int64
 }
 
 // wfUndo is a task's compensation job.
@@ -37,6 +42,7 @@ type wfFlow struct {
 	state        contract.WorkflowState
 	created      int64
 	finished     int64
+	at           int64 // now, Unix ms: the store sets it before finish and cancel
 	failFast     bool
 	undoOnCancel bool
 	failed       bool // an unabsorbed failure happened before any cancel
@@ -77,7 +83,7 @@ func (s *wfFlow) finish(e contract.TaskEnd) ([]wfEffect, error) {
 		return nil, nil
 	}
 
-	t.reason, t.result = e.Reason, e.Result
+	t.reason, t.result, t.finished = e.Reason, e.Result, s.at
 	push := map[string]bool{}
 	if e.Outcome == contract.OutcomeCompleted {
 		t.state = contract.JobCompleted
@@ -110,7 +116,7 @@ func (s *wfFlow) cancel(undo bool) []wfEffect {
 	s.cancelled, s.undoOnCancel = true, undo
 	for _, name := range s.order {
 		if t := s.tasks[name]; t.state == contract.JobWaiting {
-			t.state = contract.JobCancelled
+			t.state, t.finished = contract.JobCancelled, s.at
 		}
 	}
 	return s.settle(nil)
@@ -133,7 +139,7 @@ func (s *wfFlow) finishUndo(t *wfTask, e contract.TaskEnd) []wfEffect {
 	if s.state != contract.WorkflowCompensating || !active(t.undoState) {
 		return nil
 	}
-	t.undoState, t.undoReason = contract.JobFailed, e.Reason
+	t.undoState, t.undoReason, t.undoFinished = contract.JobFailed, e.Reason, s.at
 	if e.Outcome == contract.OutcomeCompleted {
 		t.undoState, t.undoReason = contract.JobCompleted, ""
 	}
@@ -191,7 +197,7 @@ func (s *wfFlow) drop(name string, push map[string]bool) {
 			s.release(d, push)
 			continue
 		}
-		t.state = contract.JobCancelled
+		t.state, t.finished = contract.JobCancelled, s.at
 		s.drop(d, push)
 	}
 }
@@ -212,7 +218,7 @@ func (s *wfFlow) failFast0(failed string, push map[string]bool) {
 	var cancelled []string
 	for _, name := range s.order {
 		if t := s.tasks[name]; t.state == contract.JobWaiting && !keep[name] {
-			t.state = contract.JobCancelled
+			t.state, t.finished = contract.JobCancelled, s.at
 			cancelled = append(cancelled, name)
 		}
 	}

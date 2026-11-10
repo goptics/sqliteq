@@ -36,6 +36,7 @@ var (
 	_ contract.WorkflowStore     = (*WorkflowStore)(nil)
 	_ contract.WorkflowInspector = (*WorkflowStore)(nil)
 	_ contract.WorkflowKeyLister = (*WorkflowStore)(nil)
+	_ contract.WorkflowCounter   = (*WorkflowStore)(nil)
 )
 
 const (
@@ -61,6 +62,11 @@ const (
 	// purgeReason is the reason of a task its queue's Purge ended.
 	purgeReason = "queue purged"
 )
+
+// taskTimeCols are the task time columns (contract v0.9.0), Unix ms, 0 when
+// not reached. init adds them to a table made before them.
+var taskTimeCols = [...]string{"enqueued_at", "started_at", "finished_at",
+	"undo_enqueued_at", "undo_started_at", "undo_finished_at"}
 
 // recoverEvery is how often the recovery loop pushes leftover outbox rows;
 // those younger than it are left to the writer that is about to push them.
@@ -174,7 +180,8 @@ func NewWorkflowStore(qs Queues, opts ...WorkflowOption) (*WorkflowStore, error)
 	return s, nil
 }
 
-// init creates the tables under the write mutex.
+// init creates the tables under the write mutex, and adds the task time
+// columns to a tasks table made before them.
 func (s *WorkflowStore) init() error {
 	s.f.mu.Lock()
 	defer s.f.mu.Unlock()
@@ -193,6 +200,8 @@ func (s *WorkflowStore) init() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS "__sqliteq_wf_workflows_created" ON ` + wfWorkflows + ` (created_at DESC, id)`,
 		`CREATE INDEX IF NOT EXISTS "__sqliteq_wf_workflows_finished" ON ` + wfWorkflows + ` (finished_at) WHERE finished_at IS NOT NULL`,
+		// state filter of the listing in order, and the counts
+		`CREATE INDEX IF NOT EXISTS "__sqliteq_wf_workflows_state" ON ` + wfWorkflows + ` (state, created_at DESC, id)`,
 		`CREATE TABLE IF NOT EXISTS ` + wfTasks + ` (
 			workflow_id TEXT NOT NULL,
 			name TEXT NOT NULL,
@@ -214,6 +223,12 @@ func (s *WorkflowStore) init() error {
 			undo_state TEXT NOT NULL DEFAULT '',
 			undo_open INTEGER NOT NULL DEFAULT 0,
 			undo_reason TEXT NOT NULL DEFAULT '',
+			enqueued_at INTEGER NOT NULL DEFAULT 0,
+			started_at INTEGER NOT NULL DEFAULT 0,
+			finished_at INTEGER NOT NULL DEFAULT 0,
+			undo_enqueued_at INTEGER NOT NULL DEFAULT 0,
+			undo_started_at INTEGER NOT NULL DEFAULT 0,
+			undo_finished_at INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (workflow_id, name)
 		) WITHOUT ROWID`,
 		`CREATE TABLE IF NOT EXISTS ` + wfOutbox + ` (
@@ -237,6 +252,15 @@ func (s *WorkflowStore) init() error {
 	} {
 		if _, err := s.f.db.Exec(stmt); err != nil {
 			return fmt.Errorf("sqliteq: failed to create workflow tables: %w", err)
+		}
+	}
+	for _, col := range taskTimeCols {
+		exists, err := hasColumn(s.f.db, strings.Trim(wfTasks, `"`), col)
+		if err == nil && !exists {
+			_, err = s.f.db.Exec(`ALTER TABLE ` + wfTasks + ` ADD COLUMN ` + col + ` INTEGER NOT NULL DEFAULT 0`)
+		}
+		if err != nil {
+			return fmt.Errorf("sqliteq: failed to add workflow task column %s: %w", col, err)
 		}
 	}
 	return nil
@@ -651,20 +675,21 @@ func (s *WorkflowStore) stamp(w *wfFlow, fx []wfEffect) {
 }
 
 // release turns the pushes of fx into rows (reading and clearing each task's
-// stored item) and delivers them in tx.
+// stored item, stamping its enqueue time) and delivers them in tx.
 // Folder layout: outbox rows, minSeq the first one's seq (0 when none).
 // Single file: straight into the queues (ids), except those this client
 // cannot reach, which get outbox rows.
 func (s *WorkflowStore) release(ctx context.Context, tx *sql.Tx, w *wfFlow, fx []wfEffect) (minSeq int64, ids []string, err error) {
 	var rows []outRow
+	now := s.now().UnixMilli()
 	for _, e := range fx {
 		if e.push == "" {
 			continue
 		}
 		t := w.tasks[e.push]
-		col, row := "item", outRow{queueID: t.queueID, jobID: t.jobID, priority: t.priority}
+		col, set, row := "item", "item = NULL, enqueued_at = ?", outRow{queueID: t.queueID, jobID: t.jobID, priority: t.priority}
 		if e.undo {
-			col, row = "undo_item", outRow{queueID: t.undo.queueID, jobID: t.undo.jobID}
+			col, set, row = "undo_item", "undo_enqueued_at = ?", outRow{queueID: t.undo.queueID, jobID: t.undo.jobID}
 		}
 		where := ` WHERE workflow_id = ? AND name = ?`
 		if err = tx.QueryRowContext(ctx, `SELECT `+col+` FROM `+wfTasks+where, w.id, e.push).Scan(&row.item); err != nil {
@@ -673,10 +698,8 @@ func (s *WorkflowStore) release(ctx context.Context, tx *sql.Tx, w *wfFlow, fx [
 		if row.item == nil {
 			continue
 		}
-		if !e.undo {
-			if _, err = tx.ExecContext(ctx, `UPDATE `+wfTasks+` SET item = NULL`+where, w.id, e.push); err != nil {
-				return 0, nil, err
-			}
+		if _, err = tx.ExecContext(ctx, `UPDATE `+wfTasks+` SET `+set+where, now, w.id, e.push); err != nil {
+			return 0, nil, err
 		}
 		rows = append(rows, row)
 	}
@@ -699,7 +722,7 @@ func (s *WorkflowStore) release(ctx context.Context, tx *sql.Tx, w *wfFlow, fx [
 		}
 		res, err := tx.ExecContext(ctx, `INSERT INTO `+wfOutbox+
 			` (workflow_id, queue_id, job_id, item, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-			w.id, r.queueID, r.jobID, r.item, r.priority, s.now().UnixMilli())
+			w.id, r.queueID, r.jobID, r.item, r.priority, now)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -870,7 +893,8 @@ func (s *WorkflowStore) load(ctx context.Context, q querier, id string) (*wfFlow
 	w.failFast, w.undoOnCancel, w.failed, w.cancelled = ff == 1, uoc == 1, f == 1, cn == 1
 
 	rows, err := q.QueryContext(ctx, `SELECT name, state, reason, open, deps, always, queue_id, job_id, priority, COALESCE(length(result), 0),
-		has_undo, undo_queue_id, undo_job_id, undo_state, undo_open, undo_reason
+		has_undo, undo_queue_id, undo_job_id, undo_state, undo_open, undo_reason,
+		enqueued_at, started_at, finished_at, undo_enqueued_at, undo_started_at, undo_finished_at
 		FROM `+wfTasks+` WHERE workflow_id = ? ORDER BY ord`, id)
 	if err != nil {
 		return nil, err
@@ -887,7 +911,8 @@ func (s *WorkflowStore) load(ctx context.Context, q querier, id string) (*wfFlow
 			u       wfUndo
 		)
 		if err := rows.Scan(&t.name, &t.state, &t.reason, &t.open, &deps, &always, &t.queueID, &t.jobID, &t.priority, &t.resultSize,
-			&hasUndo, &u.queueID, &u.jobID, &t.undoState, &t.undoOpen, &t.undoReason); err != nil {
+			&hasUndo, &u.queueID, &u.jobID, &t.undoState, &t.undoOpen, &t.undoReason,
+			&t.enqueued, &t.started, &t.finished, &t.undoEnqueued, &t.undoStarted, &t.undoFinished); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(deps), &t.deps); err != nil {
@@ -940,7 +965,8 @@ func (w *wfFlow) dirty(orig map[string]mut) (tasks []string, flow bool) {
 	return tasks, orig[""] != mut{wfState: w.state, failed: w.failed, cancelled: w.cancelled, undoCancel: w.undoOnCancel}
 }
 
-// save writes what changed since orig; result is the finishing task's
+// save writes what changed since orig, with the finish times the machine
+// stamped (an end always changes the state); result is the finishing task's
 // result, written when that task is task.
 func (s *WorkflowStore) save(ctx context.Context, tx *sql.Tx, w *wfFlow, orig map[string]mut, task string, result []byte) error {
 	tasks, flow := w.dirty(orig)
@@ -956,9 +982,9 @@ func (s *WorkflowStore) save(ctx context.Context, tx *sql.Tx, w *wfFlow, orig ma
 	}
 	for _, name := range tasks {
 		t := w.tasks[name]
-		if _, err := tx.ExecContext(ctx, `UPDATE `+wfTasks+` SET state = ?, open = ?, reason = ?, undo_state = ?, undo_open = ?, undo_reason = ?
-			WHERE workflow_id = ? AND name = ?`,
-			string(t.state), t.open, t.reason, string(t.undoState), t.undoOpen, t.undoReason, w.id, name); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE `+wfTasks+` SET state = ?, open = ?, reason = ?, finished_at = ?,
+			undo_state = ?, undo_open = ?, undo_reason = ?, undo_finished_at = ? WHERE workflow_id = ? AND name = ?`,
+			string(t.state), t.open, t.reason, t.finished, string(t.undoState), t.undoOpen, t.undoReason, t.undoFinished, w.id, name); err != nil {
 			return err
 		}
 		if name == task && len(result) > 0 && t.state == contract.JobCompleted {
@@ -1008,6 +1034,7 @@ func (s *WorkflowStore) Cancel(ctx context.Context, id string, undo *bool) error
 			on = *undo
 		}
 		orig := w.snapshot()
+		w.at = s.now().UnixMilli()
 		fx := w.cancel(on)
 		s.stamp(w, fx)
 		if err := s.save(ctx, tx, w, orig, "", nil); err != nil {
@@ -1025,34 +1052,48 @@ func (s *WorkflowStore) Cancel(ctx context.Context, id string, undo *bool) error
 	return nil
 }
 
-// Runnable is the pre-run check (spec 6.12).
+// Runnable is the pre-run check (spec 6.12). A yes stamps the start time of
+// the task (undo: of its undo) in the same transaction: the job runs next.
 func (s *WorkflowStore) Runnable(ctx context.Context, workflowID, task string, undo bool) (bool, error) {
 	if !validWorkflowID(workflowID) {
 		return false, s.notFound(workflowID)
 	}
-	var (
-		state                      contract.WorkflowState
-		ff, failed, cancelled      int
-		tstate, ustate             contract.JobState
-		always, hasUndo, taskFound int
-	)
-	err := s.f.db.QueryRowContext(ctx, `SELECT w.state, w.fail_fast, w.failed, w.cancelled,
-		COALESCE(t.state, ''), COALESCE(t.undo_state, ''), COALESCE(t.always, 0), COALESCE(t.has_undo, 0), t.name IS NOT NULL
-		FROM `+wfWorkflows+` w LEFT JOIN `+wfTasks+` t ON t.workflow_id = w.id AND t.name = ? WHERE w.id = ?`, task, workflowID).
-		Scan(&state, &ff, &failed, &cancelled, &tstate, &ustate, &always, &hasUndo, &taskFound)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, s.notFound(workflowID)
-	case err != nil:
-		return false, err
-	case taskFound == 0:
-		return false, nil
-	}
-	if undo {
-		return state == contract.WorkflowCompensating && hasUndo == 1 && ustate == contract.JobPending, nil
-	}
-	stopped := ff == 1 && failed == 1 && always == 0
-	return state == contract.WorkflowRunning && cancelled == 0 && !stopped && tstate == contract.JobPending, nil
+	var ok bool
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		var (
+			state                      contract.WorkflowState
+			ff, failed, cancelled      int
+			tstate, ustate             contract.JobState
+			always, hasUndo, taskFound int
+		)
+		err := tx.QueryRowContext(ctx, `SELECT w.state, w.fail_fast, w.failed, w.cancelled,
+			COALESCE(t.state, ''), COALESCE(t.undo_state, ''), COALESCE(t.always, 0), COALESCE(t.has_undo, 0), t.name IS NOT NULL
+			FROM `+wfWorkflows+` w LEFT JOIN `+wfTasks+` t ON t.workflow_id = w.id AND t.name = ? WHERE w.id = ?`, task, workflowID).
+			Scan(&state, &ff, &failed, &cancelled, &tstate, &ustate, &always, &hasUndo, &taskFound)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return s.notFound(workflowID)
+		case err != nil:
+			return err
+		case taskFound == 0:
+			return nil
+		}
+		col := "started_at"
+		if undo {
+			col = "undo_started_at"
+			ok = state == contract.WorkflowCompensating && hasUndo == 1 && ustate == contract.JobPending
+		} else {
+			stopped := ff == 1 && failed == 1 && always == 0
+			ok = state == contract.WorkflowRunning && cancelled == 0 && !stopped && tstate == contract.JobPending
+		}
+		if !ok {
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE `+wfTasks+` SET `+col+` = ? WHERE workflow_id = ? AND name = ?`,
+			s.now().UnixMilli(), workflowID, task)
+		return err
+	})
+	return ok && err == nil, err
 }
 
 // DepResult returns task's stored result: ErrDepFailed when it failed or was
@@ -1104,13 +1145,15 @@ func (w *wfFlow) record() contract.WorkflowRecord {
 	for _, name := range w.order {
 		t := w.tasks[name]
 		tr := contract.TaskRecord{Name: name, State: t.state, Deps: slices.Clone(t.deps), QueueID: t.queueID,
-			JobID: t.jobID, Always: t.always, Reason: t.reason, ResultSize: t.resultSize}
+			JobID: t.jobID, Always: t.always, Reason: t.reason, ResultSize: t.resultSize,
+			EnqueuedAt: t.enqueued, StartedAt: t.started, FinishedAt: t.finished}
 		if t.undo != nil {
 			st := t.undoState
 			if st == "" {
 				st = contract.JobWaiting
 			}
-			tr.Undo = &contract.TaskRecord{Name: name, State: st, QueueID: t.undo.queueID, JobID: t.undo.jobID, Reason: t.undoReason}
+			tr.Undo = &contract.TaskRecord{Name: name, State: st, QueueID: t.undo.queueID, JobID: t.undo.jobID, Reason: t.undoReason,
+				EnqueuedAt: t.undoEnqueued, StartedAt: t.undoStarted, FinishedAt: t.undoFinished}
 		}
 		r.Tasks = append(r.Tasks, tr)
 	}
@@ -1162,6 +1205,30 @@ func (s *WorkflowStore) WorkflowKeys(ctx context.Context, state contract.Workflo
 			return nil, err
 		}
 		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// WorkflowCounts counts the stored workflows per state: the rows Workflows
+// lists. A state with none is absent.
+// ponytail: scans the state index; a counter row per state if stores get huge.
+func (s *WorkflowStore) WorkflowCounts(ctx context.Context) (map[contract.WorkflowState]int64, error) {
+	rows, err := s.f.db.QueryContext(ctx, `SELECT state, COUNT(*) FROM `+wfWorkflows+` GROUP BY state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[contract.WorkflowState]int64{}
+	for rows.Next() {
+		var (
+			state contract.WorkflowState
+			n     int64
+		)
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, err
+		}
+		out[state] = n
 	}
 	return out, rows.Err()
 }

@@ -137,6 +137,7 @@ func (s *WorkflowStore) endTx(ctx context.Context, tx *sql.Tx, queueID string, e
 	}
 
 	orig := w.snapshot()
+	w.at = s.now().UnixMilli()
 	fx, err := w.finish(e)
 	if err != nil {
 		return r, err
@@ -287,5 +288,12 @@ func (f *file) purgeStore() (ws *WorkflowStore, done func()) {
 	}
 	qs := &queues{cfg: storeConfig{singleFile: single, checkpointPages: f.pages}, root: root, files: map[*file]struct{}{}}
 	qs.byID.Store(&map[string]*handle{})
-	return &WorkflowStore{qs: qs, f: wf, single: single, scope: f.scope, cfg: workflowConfig{resultLimit: defaultResultLimit, retention: defaultRetention}}, release
+	ws = &WorkflowStore{qs: qs, f: wf, single: single, scope: f.scope, cfg: workflowConfig{resultLimit: defaultResultLimit, retention: defaultRetention}}
+	// tables of an older version get the columns this one reads
+	if err := ws.init(); err != nil {
+		log.Printf("sqliteq: purge: %v", err)
+		release()
+		return nil, func() {}
+	}
+	return ws, release
 }
