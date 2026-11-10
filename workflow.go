@@ -37,6 +37,7 @@ var (
 	_ contract.WorkflowInspector = (*WorkflowStore)(nil)
 	_ contract.WorkflowKeyLister = (*WorkflowStore)(nil)
 	_ contract.WorkflowCounter   = (*WorkflowStore)(nil)
+	_ contract.HostLocal         = (*WorkflowStore)(nil)
 )
 
 const (
@@ -255,9 +256,15 @@ func (s *WorkflowStore) init() error {
 		}
 	}
 	for _, col := range taskTimeCols {
-		exists, err := hasColumn(s.f.db, strings.Trim(wfTasks, `"`), col)
+		table := strings.Trim(wfTasks, `"`)
+		exists, err := hasColumn(s.f.db, table, col)
 		if err == nil && !exists {
-			_, err = s.f.db.Exec(`ALTER TABLE ` + wfTasks + ` ADD COLUMN ` + col + ` INTEGER NOT NULL DEFAULT 0`)
+			if _, err = s.f.db.Exec(`ALTER TABLE ` + wfTasks + ` ADD COLUMN ` + col + ` INTEGER NOT NULL DEFAULT 0`); err != nil {
+				// Other process added it between check and ALTER: fine.
+				if added, _ := hasColumn(s.f.db, table, col); added {
+					err = nil
+				}
+			}
 		}
 		if err != nil {
 			return fmt.Errorf("sqliteq: failed to add workflow task column %s: %w", col, err)
@@ -275,6 +282,10 @@ func (s *WorkflowStore) now() time.Time {
 
 // ScopeID implements contract.Scoped.
 func (s *WorkflowStore) ScopeID() string { return s.scope }
+
+// HostLocal implements contract.HostLocal: the scope is a path, so the same
+// path on another host is another store.
+func (s *WorkflowStore) HostLocal() {}
 
 // Close unregisters the store, stops its loop and releases its file. Queues
 // stay open. Calling it again does nothing.
@@ -679,6 +690,8 @@ func (s *WorkflowStore) stamp(w *wfFlow, fx []wfEffect) {
 // Folder layout: outbox rows, minSeq the first one's seq (0 when none).
 // Single file: straight into the queues (ids), except those this client
 // cannot reach, which get outbox rows.
+// enqueued_at is this release time, when the push is written (queue or
+// outbox): a push that waits in the outbox keeps it, no restamp at drain.
 func (s *WorkflowStore) release(ctx context.Context, tx *sql.Tx, w *wfFlow, fx []wfEffect) (minSeq int64, ids []string, err error) {
 	var rows []outRow
 	now := s.now().UnixMilli()
@@ -1052,48 +1065,55 @@ func (s *WorkflowStore) Cancel(ctx context.Context, id string, undo *bool) error
 	return nil
 }
 
-// Runnable is the pre-run check (spec 6.12). A yes stamps the start time of
-// the task (undo: of its undo) in the same transaction: the job runs next.
+// Runnable is the pre-run check (spec 6.12). Answer: lock-free read, so a
+// foreign write lock cannot turn it into an error. A yes then stamps the
+// start time of the task (undo: of its undo), only while it is still
+// pending: an ended task gets no stamp. A failed stamp is logged, the answer
+// stays yes: the time is display data, the run must not depend on it.
 func (s *WorkflowStore) Runnable(ctx context.Context, workflowID, task string, undo bool) (bool, error) {
 	if !validWorkflowID(workflowID) {
 		return false, s.notFound(workflowID)
 	}
+	var (
+		state                      contract.WorkflowState
+		ff, failed, cancelled      int
+		tstate, ustate             contract.JobState
+		always, hasUndo, taskFound int
+	)
+	err := s.f.db.QueryRowContext(ctx, `SELECT w.state, w.fail_fast, w.failed, w.cancelled,
+		COALESCE(t.state, ''), COALESCE(t.undo_state, ''), COALESCE(t.always, 0), COALESCE(t.has_undo, 0), t.name IS NOT NULL
+		FROM `+wfWorkflows+` w LEFT JOIN `+wfTasks+` t ON t.workflow_id = w.id AND t.name = ? WHERE w.id = ?`, task, workflowID).
+		Scan(&state, &ff, &failed, &cancelled, &tstate, &ustate, &always, &hasUndo, &taskFound)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, s.notFound(workflowID)
+	case err != nil:
+		return false, err
+	case taskFound == 0:
+		return false, nil
+	}
+	col, stateCol := "started_at", "state"
 	var ok bool
-	err := s.write(ctx, func(tx *sql.Tx) error {
-		var (
-			state                      contract.WorkflowState
-			ff, failed, cancelled      int
-			tstate, ustate             contract.JobState
-			always, hasUndo, taskFound int
-		)
-		err := tx.QueryRowContext(ctx, `SELECT w.state, w.fail_fast, w.failed, w.cancelled,
-			COALESCE(t.state, ''), COALESCE(t.undo_state, ''), COALESCE(t.always, 0), COALESCE(t.has_undo, 0), t.name IS NOT NULL
-			FROM `+wfWorkflows+` w LEFT JOIN `+wfTasks+` t ON t.workflow_id = w.id AND t.name = ? WHERE w.id = ?`, task, workflowID).
-			Scan(&state, &ff, &failed, &cancelled, &tstate, &ustate, &always, &hasUndo, &taskFound)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			return s.notFound(workflowID)
-		case err != nil:
-			return err
-		case taskFound == 0:
-			return nil
-		}
-		col := "started_at"
-		if undo {
-			col = "undo_started_at"
-			ok = state == contract.WorkflowCompensating && hasUndo == 1 && ustate == contract.JobPending
-		} else {
-			stopped := ff == 1 && failed == 1 && always == 0
-			ok = state == contract.WorkflowRunning && cancelled == 0 && !stopped && tstate == contract.JobPending
-		}
-		if !ok {
-			return nil
-		}
-		_, err = tx.ExecContext(ctx, `UPDATE `+wfTasks+` SET `+col+` = ? WHERE workflow_id = ? AND name = ?`,
-			s.now().UnixMilli(), workflowID, task)
+	if undo {
+		col, stateCol = "undo_started_at", "undo_state"
+		ok = state == contract.WorkflowCompensating && hasUndo == 1 && ustate == contract.JobPending
+	} else {
+		stopped := ff == 1 && failed == 1 && always == 0
+		ok = state == contract.WorkflowRunning && cancelled == 0 && !stopped && tstate == contract.JobPending
+	}
+	if !ok {
+		return false, nil
+	}
+	now := s.now().UnixMilli()
+	err = s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE `+wfTasks+` SET `+col+` = ? WHERE workflow_id = ? AND name = ? AND `+stateCol+` = ?`,
+			now, workflowID, task, contract.JobPending)
 		return err
 	})
-	return ok && err == nil, err
+	if err != nil {
+		log.Printf("sqliteq: stamping start of workflow %s task %s: %v", workflowID, task, err)
+	}
+	return true, nil
 }
 
 // DepResult returns task's stored result: ErrDepFailed when it failed or was

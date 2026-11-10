@@ -33,8 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A redelivered job, or a push repeated after the job was removed, is safe: the pre-run check skips a task that already ended. (#25)
 - `Workflows` (`contract.WorkflowInspector`) and `WorkflowKeys` (`contract.WorkflowKeyLister`) list workflows newest first. (#25)
 - `WorkflowCounts` (`contract.WorkflowCounter`, contract v0.9.0): stored workflows per state, same rows as `WorkflowKeys`.
-- Task times on `TaskRecord` and its `Undo`: `EnqueuedAt` at push, `StartedAt` when `Runnable` last answered true, `FinishedAt` at end. Unix ms, store clock.
-- `Runnable` is one write transaction: check, then stamp on a true answer. Unknown workflow: `ErrWorkflowNotFound`, no row made.
+- `HostLocal` marker (`contract.HostLocal`): VarMQ puts host name into the store's ID in `GET /workflow-counts`, so same path on two hosts = two stores.
+- Task times on `TaskRecord` and its `Undo`: `EnqueuedAt` at push (written to queue or outbox; a push that waits in the outbox keeps it), `StartedAt` when `Runnable` last answered true, `FinishedAt` at end. Unix ms, store clock.
+- `Runnable` answers from a lock-free read: a foreign write lock gives no error. A true answer then stamps `StartedAt`, only on a still-pending task; a failed stamp is logged, answer stays true. Unknown workflow: `ErrWorkflowNotFound`, no row made.
+- `Purge` keeps the jobs (logs the cause) when the file has workflow tables but no store is ready (check, open or init failed): no task vanishes under a workflow left `running`.
 - `__sqliteq_wf_tasks` columns `enqueued_at`, `started_at`, `finished_at`, `undo_enqueued_at`, `undo_started_at`, `undo_finished_at` (INTEGER, default 0). Added at open to older tables; old rows read 0.
 - Index `__sqliteq_wf_workflows_state` on `(state, created_at DESC, id)`.
 - A cancel mark never drops a valid workflow item; the workflow decides its end. (#25)

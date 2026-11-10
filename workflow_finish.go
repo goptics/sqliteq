@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -261,28 +262,39 @@ func (s *WorkflowStore) applyIntents() {
 // purgeStore returns the store whose workflows a Purge of the file must end:
 // the registered one, else one opened on demand when the file's workflow
 // tables exist (nil when they do not). done releases an on-demand store.
-func (f *file) purgeStore() (ws *WorkflowStore, done func()) {
+// err: tables may exist but no store is ready (check, open or init failed);
+// the Purge must keep the jobs, or their workflows stay running for ever.
+func (f *file) purgeStore() (ws *WorkflowStore, done func(), err error) {
+	none := func() {}
 	if st, ok := contract.LookupWorkflowStore(f.scope); ok {
 		if ws, ok := st.(*WorkflowStore); ok {
-			return ws, func() {}
+			return ws, none, nil
 		}
 	}
 	root := strings.TrimPrefix(f.scope, "sqliteq:")
 	single := root == f.key
-	wf, release := f, func() {}
+	wf, release := f, none
 	if single {
 		var n int
-		if f.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = '__sqliteq_wf_workflows'`).Scan(&n) != nil || n == 0 {
-			return nil, func() {}
+		if err := f.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = '__sqliteq_wf_workflows'`).Scan(&n); err != nil {
+			return nil, none, fmt.Errorf("checking for workflow tables: %w", err)
+		}
+		if n == 0 {
+			return nil, none, nil
 		}
 	} else {
 		path, err := resolve(filepath.Join(root, workflowsFile))
-		if _, serr := os.Stat(path); err != nil || serr != nil {
-			return nil, func() {}
+		if err == nil {
+			_, err = os.Stat(path)
+		}
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil, none, nil
+		case err != nil:
+			return nil, none, fmt.Errorf("checking for the workflow file: %w", err)
 		}
 		if wf, err = acquire(path, root, f.pages); err != nil {
-			log.Printf("sqliteq: purge: opening the workflow file: %v", err)
-			return nil, func() {}
+			return nil, none, fmt.Errorf("opening the workflow file: %w", err)
 		}
 		release = func() { wf.release() }
 	}
@@ -291,9 +303,8 @@ func (f *file) purgeStore() (ws *WorkflowStore, done func()) {
 	ws = &WorkflowStore{qs: qs, f: wf, single: single, scope: f.scope, cfg: workflowConfig{resultLimit: defaultResultLimit, retention: defaultRetention}}
 	// tables of an older version get the columns this one reads
 	if err := ws.init(); err != nil {
-		log.Printf("sqliteq: purge: %v", err)
 		release()
-		return nil, func() {}
+		return nil, none, err
 	}
-	return ws, release
+	return ws, release, nil
 }
