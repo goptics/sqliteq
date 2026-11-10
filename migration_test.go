@@ -1,11 +1,15 @@
 package sqliteq
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"sort"
 	"testing"
+
+	"github.com/goptics/varmq/contract"
 )
 
 // The v0.2.3 schema, pasted from tag v0.2.3's queue.go initTable and
@@ -246,4 +250,198 @@ func TestPendingIndexNameFreeForQueues(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The workflow tables as #25 (contract v0.8.0) made them: no task times, no
+// state index. Pasted from that commit's workflow.go init.
+const v08WorkflowTables = `
+	CREATE TABLE "__sqliteq_wf_workflows" (
+		id TEXT PRIMARY KEY,
+		hash TEXT NOT NULL,
+		state TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		finished_at INTEGER,
+		fail_fast INTEGER NOT NULL,
+		undo_on_cancel INTEGER NOT NULL,
+		failed INTEGER NOT NULL DEFAULT 0,
+		cancelled INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX "__sqliteq_wf_workflows_created" ON "__sqliteq_wf_workflows" (created_at DESC, id);
+	CREATE INDEX "__sqliteq_wf_workflows_finished" ON "__sqliteq_wf_workflows" (finished_at) WHERE finished_at IS NOT NULL;
+	CREATE TABLE "__sqliteq_wf_tasks" (
+		workflow_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		ord INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		reason TEXT NOT NULL DEFAULT '',
+		result BLOB,
+		open INTEGER NOT NULL DEFAULT 0,
+		deps TEXT NOT NULL,
+		always INTEGER NOT NULL,
+		queue_id TEXT NOT NULL,
+		job_id TEXT NOT NULL,
+		priority INTEGER NOT NULL DEFAULT 0,
+		item BLOB,
+		has_undo INTEGER NOT NULL DEFAULT 0,
+		undo_queue_id TEXT NOT NULL DEFAULT '',
+		undo_job_id TEXT NOT NULL DEFAULT '',
+		undo_item BLOB,
+		undo_state TEXT NOT NULL DEFAULT '',
+		undo_open INTEGER NOT NULL DEFAULT 0,
+		undo_reason TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (workflow_id, name)
+	) WITHOUT ROWID;
+	CREATE TABLE "__sqliteq_wf_outbox" (
+		seq INTEGER PRIMARY KEY AUTOINCREMENT,
+		workflow_id TEXT NOT NULL,
+		queue_id TEXT NOT NULL,
+		job_id TEXT NOT NULL,
+		item BLOB NOT NULL,
+		priority INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL
+	);
+	CREATE TABLE "__sqliteq_wf_purged" (
+		seq INTEGER PRIMARY KEY AUTOINCREMENT,
+		queue_id TEXT NOT NULL,
+		workflow_id TEXT NOT NULL,
+		task TEXT NOT NULL,
+		undo INTEGER NOT NULL,
+		created_at INTEGER NOT NULL
+	);
+	CREATE INDEX "__sqliteq_wf_outbox_workflow" ON "__sqliteq_wf_outbox" (workflow_id);
+`
+
+// writeV08Workflow builds the v0.8.0 workflow tables in the file at path,
+// with running workflow "old" on queue queueID: a completed, b pushed, c
+// waiting for b.
+func writeV08Workflow(t *testing.T, path, queueID string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(query, args...); err != nil {
+			t.Fatalf("Fixture statement failed: %v\n%s", err, query)
+		}
+	}
+	exec(v08WorkflowTables)
+	exec(`INSERT INTO "__sqliteq_wf_workflows" (id, hash, state, created_at, fail_fast, undo_on_cancel) VALUES ('old', 'h', 'running', 1000, 0, 0)`)
+	for i, r := range []struct {
+		name, state, deps string
+		open              int
+		item              []byte
+	}{
+		{"a", "completed", `[]`, 0, nil},
+		{"b", "pending", `["a"]`, 0, nil},
+		{"c", "waiting", `["b"]`, 1, wfItem("old", "c", false)},
+	} {
+		exec(`INSERT INTO "__sqliteq_wf_tasks" (workflow_id, name, ord, state, open, deps, always, queue_id, job_id, item)
+			VALUES ('old', ?, ?, ?, ?, ?, 0, ?, ?, ?)`, r.name, i, r.state, r.open, r.deps, queueID, "wf:old:"+r.name, r.item)
+	}
+}
+
+// Workflow tables of contract v0.8.0 open: the task time columns are added
+// once, old rows read 0, new pushes, starts and ends are stamped. A Purge
+// with no store open migrates the tables too.
+func TestMigrateWorkflowTaskTimes(t *testing.T) {
+	ctx := context.Background()
+	open := func(t *testing.T, single bool) (Queues, *Queue) {
+		t.Helper()
+		dir := t.TempDir()
+		root, wfPath, opts := dir, filepath.Join(dir, workflowsFile), []StoreOption(nil)
+		if single {
+			root = filepath.Join(dir, "all.db")
+			wfPath, opts = root, []StoreOption{WithSingleFile()}
+		}
+		qs := mustNew(t, root, opts...)
+		t.Cleanup(func() { qs.Close() })
+		a, err := qs.NewQueue("a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeV08Workflow(t, wfPath, a.QueueID())
+		if !a.EnqueueOnce(wfItem("old", "b", false), "wf:old:b") {
+			t.Fatal("Failed to queue the old workflow's task")
+		}
+		return qs, a
+	}
+	store := func(t *testing.T, qs Queues) *WorkflowStore {
+		t.Helper()
+		st, err := NewWorkflowStore(qs)
+		if err != nil {
+			t.Fatalf("Failed to open the v0.8.0 workflow tables: %v", err)
+		}
+		t.Cleanup(func() { st.Close() })
+		for _, col := range taskTimeCols {
+			if ok, err := hasColumn(st.f.db, "__sqliteq_wf_tasks", col); err != nil || !ok {
+				t.Errorf("Expected column %s, got %t %v", col, ok, err)
+			}
+		}
+		return st
+	}
+
+	t.Run("open", func(t *testing.T) {
+		eachLayout(t, func(t *testing.T, single bool) {
+			qs, a := open(t, single)
+			st := store(t, qs)
+			r, err := st.Record(ctx, "old")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := taskStates(r); got != "a=completed b=pending c=waiting" {
+				t.Errorf("got %s", got)
+			}
+			for _, tr := range r.Tasks {
+				if times(tr) != [3]int64{} {
+					t.Errorf("Expected no times on old task %s, got %v", tr.Name, times(tr))
+				}
+			}
+			counts, err := st.WorkflowCounts(ctx)
+			if err != nil || !maps.Equal(counts, map[contract.WorkflowState]int64{contract.WorkflowRunning: 1}) {
+				t.Errorf("counts %v %v", counts, err)
+			}
+			st.Close()
+
+			// Reopened: nothing to add; the old workflow goes on with times
+			st = store(t, qs)
+			if ok, err := st.Runnable(ctx, "old", "b", false); err != nil || !ok {
+				t.Fatalf("Runnable = %t %v", ok, err)
+			}
+			_, ack := take(t, a)
+			if _, ok := st.FinishTask(a.QueueID(), ack, done("old", "b", "")); !ok {
+				t.Fatal("FinishTask failed")
+			}
+			if r, err = st.Record(ctx, "old"); err != nil {
+				t.Fatal(err)
+			}
+			ta, tb, tc := r.Tasks[0], r.Tasks[1], r.Tasks[2]
+			if times(ta) != [3]int64{} || tb.EnqueuedAt != 0 || tb.StartedAt == 0 || tb.FinishedAt == 0 || tc.EnqueuedAt == 0 {
+				t.Errorf("Expected old times 0 and new ones set, got a %v b %v c %v", times(ta), times(tb), times(tc))
+			}
+			if got := taskStates(r); got != "a=completed b=completed c=pending" || a.Len() != 1 {
+				t.Errorf("got %s, a %d", got, a.Len())
+			}
+		})
+	})
+
+	t.Run("purge", func(t *testing.T) {
+		eachLayout(t, func(t *testing.T, single bool) {
+			qs, a := open(t, single)
+			a.Purge() // no store open: the on-demand one works on the old tables
+			r, err := store(t, qs).Record(ctx, "old")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := taskStates(r); got != "a=completed b=cancelled c=cancelled" || r.State != contract.WorkflowFailed {
+				t.Errorf("got %s %s", got, r.State)
+			}
+			if r.Tasks[1].FinishedAt == 0 || r.Tasks[2].FinishedAt == 0 || r.Tasks[1].EnqueuedAt != 0 {
+				t.Errorf("Expected the purge's ends stamped, got b %v c %v", times(r.Tasks[1]), times(r.Tasks[2]))
+			}
+		})
+	})
 }

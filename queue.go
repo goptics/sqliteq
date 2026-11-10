@@ -867,9 +867,15 @@ func (q *Queue) Values() []any {
 // demand when the file has workflow tables. Under WithSingleFile the delete
 // and the ends are one transaction. Folder layout: an intent is stored in
 // the workflow file first, and the recovery loop applies one a crash left.
+// Workflow tables there but no store ready (check, open or init failed):
+// nothing is deleted, the cause is logged; a later Purge can retry.
 func (q *Queue) Purge() {
-	ws, done := q.f.purgeStore()
+	ws, done, err := q.f.purgeStore()
 	defer done()
+	if err != nil {
+		log.Printf("sqliteq: purge of %s: jobs kept, workflow store not ready: %v", q.name, err)
+		return
+	}
 	if ws == nil {
 		q.purge(nil)
 		return

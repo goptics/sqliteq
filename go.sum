@@ -1,9 +1,9 @@
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/goptics/varmq v1.10.1-0.20261109165008-c75ed52b3b0a h1:+UjHIuTdKROtu6zLVk8b/efeP6uTmQqIy7TgshIHx6U=
-github.com/goptics/varmq v1.10.1-0.20261109165008-c75ed52b3b0a/go.mod h1:4hso4XnUSTh5sjr/h2//MYh0FPGRvebLCx5AaoL4qII=
-github.com/goptics/varmq/contract v0.8.0 h1:U87RzQITqs3TPNuzNXLCl9Fp9ebUa6Eiw3cDNd2cb5Q=
-github.com/goptics/varmq/contract v0.8.0/go.mod h1:55tOUywUsZhBgyo8oJhNmKMknETVHL2OuMrITztanXg=
+github.com/goptics/varmq v1.10.1-0.20261110052717-8057d16e4b55 h1:aRBQi8UhqtTVfl20meNmvHq+v8SKGLc22wZTfhnh7p8=
+github.com/goptics/varmq v1.10.1-0.20261110052717-8057d16e4b55/go.mod h1:wYDkTj4w50s08bqsWnsEg/pooFyBQrPHGzht31CDkE0=
+github.com/goptics/varmq/contract v0.9.0 h1:Z/0pJNi6cviSIwavCyJn43fCK3ZLk19IXc3D7BQfBXE=
+github.com/goptics/varmq/contract v0.9.0/go.mod h1:55tOUywUsZhBgyo8oJhNmKMknETVHL2OuMrITztanXg=
 github.com/mattn/go-sqlite3 v1.14.28 h1:ThEiQrnbtumT+QMknw63Befp/ce/nUPgBPMlRFEum7A=
 github.com/mattn/go-sqlite3 v1.14.28/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=

@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -3296,4 +3297,391 @@ func TestWorkflowPurgeIntentWaitsForDelete(t *testing.T) {
 	if intents() != 0 {
 		t.Errorf("Expected every intent cleared, got %d", intents())
 	}
+}
+
+// WorkflowCounts counts the stored workflows per state, as the listing sees
+// them: an end moves a workflow, a purge fails it, the sweep drops it.
+func TestWorkflowCounts(t *testing.T) {
+	eachLayout(t, func(t *testing.T, single bool) {
+		e := newWFEnv(t, single, WithWorkflowRetention(time.Hour))
+		ctx := context.Background()
+		var clock atomic.Int64
+		clock.Store(time.Now().UnixMilli())
+		e.st.setClock(func() time.Time { return time.UnixMilli(clock.Load()) })
+		check := func(what string, want map[contract.WorkflowState]int64) {
+			t.Helper()
+			got, err := e.st.WorkflowCounts(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !maps.Equal(got, want) {
+				t.Errorf("%s: counts %v, want %v", what, got, want)
+			}
+			for _, state := range []contract.WorkflowState{contract.WorkflowRunning, contract.WorkflowCompleted, contract.WorkflowFailed,
+				contract.WorkflowCompensating, contract.WorkflowCompensated, contract.WorkflowCompensationFailed, contract.WorkflowCancelled} {
+				keys, err := e.st.WorkflowKeys(ctx, state, 0, 100)
+				if err != nil || int64(len(keys)) != got[state] {
+					t.Errorf("%s: %s lists %d (%v), counts %d", what, state, len(keys), err, got[state])
+				}
+			}
+		}
+		check("empty store", map[contract.WorkflowState]int64{})
+
+		for _, id := range []string{"run", "done", "done2", "fail", "cancel"} {
+			if err := e.st.Submit(ctx, planWF(id, planTask(id, "a", e.a))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := e.st.Submit(ctx, planWF("undo", withUndo(planTask("undo", "a", e.a), "undo", e.b), planTask("undo", "z", e.a, "a"))); err != nil {
+			t.Fatal(err)
+		}
+		check("submitted", map[contract.WorkflowState]int64{contract.WorkflowRunning: 6})
+
+		take(t, e.a) // run: taken, never finished
+		for _, end := range []contract.TaskEnd{
+			done("done", "a", ""),
+			done("done2", "a", ""),
+			{Workflow: "fail", Task: "a", Outcome: contract.OutcomeFailed},
+			{Workflow: "cancel", Task: "a", Outcome: contract.OutcomeCancelled},
+			done("undo", "a", ""),
+			{Workflow: "undo", Task: "z", Outcome: contract.OutcomeFailed},
+		} {
+			if end.Workflow == "cancel" {
+				if err := e.st.Cancel(ctx, "cancel", nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, ack := take(t, e.a)
+			e.finish(t, e.a, ack, end)
+		}
+		check("ended", map[contract.WorkflowState]int64{contract.WorkflowRunning: 1, contract.WorkflowCompleted: 2,
+			contract.WorkflowFailed: 1, contract.WorkflowCancelled: 1, contract.WorkflowCompensating: 1})
+
+		_, ack := take(t, e.b)
+		e.finish(t, e.b, ack, contract.TaskEnd{Workflow: "undo", Task: "a", Undo: true, Outcome: contract.OutcomeCompleted})
+		check("compensated", map[contract.WorkflowState]int64{contract.WorkflowRunning: 1, contract.WorkflowCompleted: 2,
+			contract.WorkflowFailed: 1, contract.WorkflowCancelled: 1, contract.WorkflowCompensated: 1})
+
+		e.a.Purge() // ends run's task cancelled: the workflow fails
+		check("purged", map[contract.WorkflowState]int64{contract.WorkflowCompleted: 2,
+			contract.WorkflowFailed: 2, contract.WorkflowCancelled: 1, contract.WorkflowCompensated: 1})
+
+		if err := e.st.Submit(ctx, planWF("late", planTask("late", "a", e.a))); err != nil {
+			t.Fatal(err)
+		}
+		clock.Add(2 * time.Hour.Milliseconds())
+		if err := e.st.sweep(ctx); err != nil {
+			t.Fatal(err)
+		}
+		check("swept", map[contract.WorkflowState]int64{contract.WorkflowRunning: 1})
+
+		// a failed count is an error, never a partial map
+		cctx, cancel := context.WithCancel(ctx)
+		cancel()
+		if got, err := e.st.WorkflowCounts(cctx); err == nil || got != nil {
+			t.Errorf("Expected an error and no counts from a cancelled count, got %v, %v", got, err)
+		}
+
+		// the scope is a path: a store on another host is another store
+		var hl contract.HostLocal = e.st
+		hl.HostLocal()
+
+		// the count is an index scan, not a table scan
+		rows, err := e.st.f.db.Query(`EXPLAIN QUERY PLAN SELECT state, COUNT(*) FROM ` + wfWorkflows + ` GROUP BY state`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			plan = append(plan, detail)
+		}
+		if !slices.ContainsFunc(plan, func(d string) bool { return strings.Contains(d, "__sqliteq_wf_workflows_state") }) {
+			t.Errorf("Expected the count to use index __sqliteq_wf_workflows_state, plan %q", plan)
+		}
+	})
+}
+
+// times is r's time fields: enqueued, started, finished.
+func times(r contract.TaskRecord) [3]int64 {
+	return [3]int64{r.EnqueuedAt, r.StartedAt, r.FinishedAt}
+}
+
+// A task record carries when it was pushed, when the pre-run check last let
+// it run and when it ended; so does its undo. A refused or unknown check
+// writes nothing.
+func TestWorkflowTaskTimes(t *testing.T) {
+	eachLayout(t, func(t *testing.T, single bool) {
+		e := newWFEnv(t, single)
+		ctx := context.Background()
+		var clock atomic.Int64
+		clock.Store(1_000_000)
+		e.st.setClock(func() time.Time { return time.UnixMilli(clock.Load()) })
+		tick := func() int64 { return clock.Add(1000) }
+		task := func(wf, name string) contract.TaskRecord {
+			t.Helper()
+			for _, tr := range e.state(t, wf).Tasks {
+				if tr.Name == name {
+					return tr
+				}
+			}
+			t.Fatalf("no task %s/%s", wf, name)
+			return contract.TaskRecord{}
+		}
+		want := func(what string, tr contract.TaskRecord, enqueued, started, finished int64) {
+			t.Helper()
+			if got, want := times(tr), [3]int64{enqueued, started, finished}; got != want {
+				t.Errorf("%s: times %v, want %v", what, got, want)
+			}
+		}
+		runnable := func(wf, name string, undo, want bool) {
+			t.Helper()
+			if ok, err := e.st.Runnable(ctx, wf, name, undo); err != nil || ok != want {
+				t.Fatalf("Runnable %s/%s undo %t = %t %v, want %t", wf, name, undo, ok, err, want)
+			}
+		}
+
+		t0 := clock.Load()
+		plan := planWF("w", withUndo(planTask("w", "a", e.a), "w", e.b), planTask("w", "b", e.a, "a"), planTask("w", "c", e.a, "b"))
+		if err := e.st.Submit(ctx, plan); err != nil {
+			t.Fatal(err)
+		}
+		want("root pushed at submit", task("w", "a"), t0, 0, 0)
+		want("waiting", task("w", "b"), 0, 0, 0)
+		want("undo not reached", *task("w", "a").Undo, 0, 0, 0)
+
+		tick()
+		runnable("w", "a", false, true)
+		t1 := tick()
+		runnable("w", "a", false, true)
+		runnable("w", "b", false, false)
+		want("last yes wins", task("w", "a"), t0, t1, 0)
+		want("a refused check stamps nothing", task("w", "b"), 0, 0, 0)
+
+		t2 := tick()
+		_, ack := take(t, e.a)
+		e.finish(t, e.a, ack, done("w", "a", ""))
+		want("completed", task("w", "a"), t0, t1, t2)
+		want("released by a's end", task("w", "b"), t2, 0, 0)
+
+		t3 := tick()
+		_, ack = take(t, e.a)
+		e.finish(t, e.a, ack, contract.TaskEnd{Workflow: "w", Task: "b", Outcome: contract.OutcomeFailed})
+		want("failed without a check", task("w", "b"), t2, 0, t3)
+		want("cancelled while waiting", task("w", "c"), 0, 0, t3)
+		want("undo pushed", *task("w", "a").Undo, t3, 0, 0)
+
+		t4 := tick()
+		runnable("w", "a", false, false)
+		runnable("w", "a", true, true)
+		t5 := tick()
+		_, ack = take(t, e.b)
+		e.finish(t, e.b, ack, contract.TaskEnd{Workflow: "w", Task: "a", Undo: true, Outcome: contract.OutcomeCompleted})
+		want("undo ended", *task("w", "a").Undo, t3, t4, t5)
+		want("the undo leaves the task's own times", task("w", "a"), t0, t1, t2)
+
+		// Cancel ends the waiting task now, the queued one at its finish
+		if err := e.st.Submit(ctx, planWF("x", planTask("x", "a", e.a), planTask("x", "b", e.a, "a"))); err != nil {
+			t.Fatal(err)
+		}
+		t6 := tick()
+		if err := e.st.Cancel(ctx, "x", nil); err != nil {
+			t.Fatal(err)
+		}
+		runnable("x", "a", false, false)
+		want("cancelled by Cancel", task("x", "b"), 0, 0, t6)
+		want("queued under a cancel", task("x", "a"), t5, 0, 0)
+		t7 := tick()
+		_, ack = take(t, e.a)
+		e.finish(t, e.a, ack, contract.TaskEnd{Workflow: "x", Task: "a", Outcome: contract.OutcomeCancelled})
+		want("cancelled at its pre-run check", task("x", "a"), t5, 0, t7)
+
+		// FailFast ends what waits; the queued task keeps only its push
+		ff := planWF("f", planTask("f", "a", e.a), planTask("f", "b", e.a), planTask("f", "c", e.a, "b"))
+		ff.FailFast = true
+		if err := e.st.Submit(ctx, ff); err != nil {
+			t.Fatal(err)
+		}
+		t8 := tick()
+		_, ack = take(t, e.a)
+		e.finish(t, e.a, ack, contract.TaskEnd{Workflow: "f", Task: "a", Outcome: contract.OutcomeFailed})
+		want("dropped by FailFast", task("f", "c"), 0, 0, t8)
+		want("queued, stopped", task("f", "b"), t7, 0, 0)
+
+		// A check of an unknown workflow or task creates no row
+		rows := func() (n int) {
+			t.Helper()
+			if err := e.st.f.db.QueryRow(`SELECT (SELECT COUNT(*) FROM ` + wfWorkflows + `) + (SELECT COUNT(*) FROM ` + wfTasks + `)`).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+		before := rows()
+		for _, undo := range []bool{false, true} {
+			if ok, err := e.st.Runnable(ctx, "ghost", "a", undo); ok || !errors.Is(err, contract.ErrWorkflowNotFound) {
+				t.Errorf("Expected ErrWorkflowNotFound for an unknown workflow, got %t %v", ok, err)
+			}
+			runnable("f", "ghost", undo, false)
+		}
+		if n := rows(); n != before {
+			t.Errorf("Expected no row made by a check, got %d rows, had %d", n, before)
+		}
+	})
+}
+
+// Another connection (as another process) holds the write lock: the check
+// still answers from a read, fast; a yes stays yes when its stamp cannot be
+// written.
+func TestRunnableUnderForeignLock(t *testing.T) {
+	eachLayout(t, func(t *testing.T, single bool) {
+		e := newWFEnv(t, single)
+		ctx := context.Background()
+		if err := e.st.Submit(ctx, planWF("x", planTask("x", "a", e.a), planTask("x", "b", e.a, "a"))); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.st.Cancel(ctx, "x", nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.st.Submit(ctx, planWF("y", planTask("y", "a", e.a))); err != nil {
+			t.Fatal(err)
+		}
+		other, err := sql.Open("sqlite3", e.st.f.key+"?_txlock=immediate&_busy_timeout=100")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer other.Close()
+		tx, err := other.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`UPDATE ` + wfWorkflows + ` SET hash = hash`); err != nil {
+			t.Fatal(err)
+		}
+
+		start := time.Now()
+		if ok, err := e.st.Runnable(ctx, "x", "a", false); ok || err != nil {
+			t.Errorf("Expected false, nil for a cancelled workflow's task, got %t %v", ok, err)
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("Expected a no without waiting for the lock, took %v", d)
+		}
+		// ctx ends between answer and stamp (else the stamp waits the 5s
+		// busy timeout): the stamp fails, the yes stays
+		yctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		e.st.setClock(func() time.Time {
+			if inRunnable() {
+				cancel()
+			}
+			return time.Now()
+		})
+		ok, err := e.st.Runnable(yctx, "y", "a", false)
+		e.st.setClock(time.Now)
+		if !ok || err != nil {
+			t.Errorf("Expected true, nil with the stamp failed, got %t %v", ok, err)
+		}
+	})
+}
+
+// inRunnable: the caller runs inside WorkflowStore.Runnable (a clock hook
+// that must not fire for the store's loop).
+func inRunnable() bool {
+	buf := make([]byte, 8<<10)
+	return strings.Contains(string(buf[:runtime.Stack(buf, false)]), "(*WorkflowStore).Runnable")
+}
+
+// A task that ends between the check's read and its stamp keeps no start
+// time; a later check answers no and stamps nothing.
+func TestRunnableStampGuard(t *testing.T) {
+	eachLayout(t, func(t *testing.T, single bool) {
+		e := newWFEnv(t, single)
+		ctx := context.Background()
+		if err := e.st.Submit(ctx, planWF("w", planTask("w", "a", e.a))); err != nil {
+			t.Fatal(err)
+		}
+		end := func() {
+			if _, err := e.st.f.db.Exec(`UPDATE ` + wfTasks + ` SET state = 'completed' WHERE workflow_id = 'w' AND name = 'a'`); err != nil {
+				t.Error(err)
+			}
+		}
+		started := func() (n int64) {
+			t.Helper()
+			if err := e.st.f.db.QueryRow(`SELECT started_at FROM ` + wfTasks + ` WHERE workflow_id = 'w' AND name = 'a'`).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+		// the clock is read after the answer, before the stamp: end the task there
+		e.st.setClock(func() time.Time {
+			if inRunnable() {
+				end()
+			}
+			return time.Now()
+		})
+		ok, err := e.st.Runnable(ctx, "w", "a", false)
+		e.st.setClock(time.Now)
+		if !ok || err != nil {
+			t.Fatalf("Expected true, nil from the read before the end, got %t %v", ok, err)
+		}
+		if n := started(); n != 0 {
+			t.Errorf("Expected no start time on an ended task, got %d", n)
+		}
+		if ok, err := e.st.Runnable(ctx, "w", "a", false); ok || err != nil {
+			t.Errorf("Expected false, nil after the end, got %t %v", ok, err)
+		}
+		if n := started(); n != 0 {
+			t.Errorf("Expected no start time from a late check, got %d", n)
+		}
+	})
+}
+
+// Folder layout, workflow file there but no store can open it: Purge keeps
+// the jobs (else their workflows stay running for ever). No workflow file,
+// or a single file with no workflow tables: a plain purge.
+func TestPurgeKeepsJobsWithoutStore(t *testing.T) {
+	t.Run("folder", func(t *testing.T) {
+		dir := t.TempDir()
+		qs := mustNew(t, dir)
+		defer qs.Close()
+		a, err := qs.NewQueue("a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.Enqueue("j1")
+		a.Enqueue("j2")
+		wfPath := filepath.Join(dir, workflowsFile)
+		if err := os.WriteFile(wfPath, []byte(strings.Repeat("not a database ", 512)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		a.Purge()
+		if n := a.Len(); n != 2 {
+			t.Errorf("Expected the jobs kept when the workflow file cannot open, got len %d", n)
+		}
+		if err := os.Remove(wfPath); err != nil {
+			t.Fatal(err)
+		}
+		a.Purge()
+		if n := a.Len(); n != 0 {
+			t.Errorf("Expected a plain purge with no workflow file, got len %d", n)
+		}
+	})
+	t.Run("single", func(t *testing.T) {
+		qs := mustNew(t, filepath.Join(t.TempDir(), "all.db"), WithSingleFile())
+		defer qs.Close()
+		a, err := qs.NewQueue("a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.Enqueue("j1")
+		a.Purge()
+		if n := a.Len(); n != 0 {
+			t.Errorf("Expected a plain purge with no workflow tables, got len %d", n)
+		}
+	})
 }
