@@ -3375,6 +3375,17 @@ func TestWorkflowCounts(t *testing.T) {
 		}
 		check("swept", map[contract.WorkflowState]int64{contract.WorkflowRunning: 1})
 
+		// a failed count is an error, never a partial map
+		cctx, cancel := context.WithCancel(ctx)
+		cancel()
+		if got, err := e.st.WorkflowCounts(cctx); err == nil || got != nil {
+			t.Errorf("Expected an error and no counts from a cancelled count, got %v, %v", got, err)
+		}
+
+		// the scope is a path: a store on another host is another store
+		var hl contract.HostLocal = e.st
+		hl.HostLocal()
+
 		// the count is an index scan, not a table scan
 		rows, err := e.st.f.db.Query(`EXPLAIN QUERY PLAN SELECT state, COUNT(*) FROM ` + wfWorkflows + ` GROUP BY state`)
 		if err != nil {
