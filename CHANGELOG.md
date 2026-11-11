@@ -94,9 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tables `__sqliteq_owners` (heartbeats) and `__sqliteq_clock` (last sweep), per database file. Index `<name>__sqliteq_processing`. (#28)
 - Only a process that claims writes a heartbeat. Producers, inspectors and pausers write none. (#28)
 - Sweep on a queue's first open and every sixth of the timeout, in every process with a queue open: requeues processing items whose owner has no live heartbeat. (#28)
-- A dead process's items return within one timeout, with no reopen; a bound VarMQ worker is woken. (#28)
-- `Close` of the last `Queues` on a file requeues its own unacknowledged items at once and deletes its heartbeat. (#28)
-- Clock-gap guard: a gap between sweeps above a third of the timeout, or a clock step back, moves every heartbeat by the gap. (#28)
+- A dead process's items return about one timeout after its last heartbeat, with no reopen. (#28)
+- Requeue count in `__sqliteq_clock`: each process wakes its bound VarMQ workers at its next sweep, whichever process requeued. (#28)
+- Last close of a file in the process (last `Queues`, and the `WorkflowStore` under `WithSingleFile`) requeues its own unacknowledged items at once and deletes its heartbeat. (#28)
+- Clock-gap guard: a gap between sweeps above a third of the timeout, or a clock step back, moves every heartbeat by the gap, once per heartbeat until its owner renews it. (#28)
 - `WithHeartbeatTimeout(d)` store option: default 30s, at least 5s. Must match for every `New` in the process on one file. (#28)
 
 ### Changed

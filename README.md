@@ -367,12 +367,12 @@ Recovery is by owner. Each process has a random owner id for each file, and ever
 
 - **Heartbeat.** A process that takes items keeps a row in `__sqliteq_owners` and renews it every sixth of the heartbeat timeout (`WithHeartbeatTimeout`, 30 s by default, at least 5 s). A process that only adds, inspects or pauses writes no row.
 - **Sweep.** Every process with a queue open sweeps that queue on its first open, and then every sixth of the timeout. A sweep puts back to pending the processing items whose owner has no live heartbeat. So a second process never takes the jobs of a live one, whatever it does with the queue.
-- **Dead process.** Its items come back about one heartbeat timeout after its last heartbeat, in any process that has the queue open. No reopen is needed. A VarMQ worker bound to the queue is woken.
+- **Dead process.** Its items come back about one heartbeat timeout after its last heartbeat, in any process that has the queue open. No reopen is needed. Each process sees the requeue at its next sweep and wakes the VarMQ workers bound to its queues, whichever process did the requeue.
 - **Restart after a crash.** The items of the crashed process also wait for its old heartbeat to run out: about one timeout after the restart, not at open. Lower the timeout for a faster return.
-- **Clean exit.** `Close` of the last `Queues` on a file puts the items of this process back to pending at once and deletes its heartbeat. A job that still runs then runs again.
+- **Clean exit.** When the process closes a file, it puts its own items back to pending at once and deletes its heartbeat. A file closes with the last `Queues` that holds it, and under `WithSingleFile` with the `WorkflowStore` too. A job that still runs then runs again.
 - **Lost item.** An ack or a reject from a process that lost an item returns false. One limit: when a process froze for longer than the timeout and then took the same item again, the ack of its first run ends the second run. sqliteq does not count attempts.
-- **Stalls and clock steps.** When no process swept for longer than a third of the timeout (a suspended host), or the clock went back, every heartbeat moves by that gap first. So a stall does not make every process look dead. Liveness uses the wall clock of the one host.
-- **Timeout.** A heartbeat renewal can wait up to 5 s behind a write of another process (the busy timeout). Keep the timeout well above that when other processes write to the file. Processes with different timeouts can share a file.
+- **Stalls and clock steps.** When no process swept for longer than a third of the timeout (a suspended host), or the clock went back, every heartbeat moves by that gap first. So a stall does not make every process look dead. A heartbeat moves once only until its process renews it, so the items of a dead process still come back when every later process is short-lived. Liveness uses the wall clock of the one host.
+- **Timeout.** A heartbeat renewal can wait up to 5 s behind a write of another process (the busy timeout). Keep the timeout well above that when other processes write to the file. Processes with different timeouts can share a file; a process with a short timeout that opens the file can delay the return of a dead process's items by one sweep gap.
 - **One version.** Upgrade every process of a file together. A process of an older version still puts every processing item back when it opens a queue, and its own items carry no owner.
 - **No wake across processes.** A worker does not wake when another process adds a job.
 
@@ -418,9 +418,9 @@ Each queue is a table with these columns:
 On top of that table:
 
 - Three partial indexes: one covers the pending items in queue order. A unique one covers `job_id` on the rows that have one, which `EnqueueOnce` relies on. One covers the processing items, so a sweep does not read the pending backlog.
-- `__sqliteq_owners` holds one heartbeat row per process that claims (`id`, `expires_at`), and `__sqliteq_clock` holds when any process last swept. Both are per database file.
+- `__sqliteq_owners` holds one heartbeat row per process that claims (`id`, `expires_at`, `shifted`). `__sqliteq_clock` holds when any process last swept and a count of the requeues. Both are per database file.
 - One sweep goroutine per open file, in every process with a queue open on it. Each sixth of the heartbeat timeout it renews the heartbeat, puts the processing items of dead owners back to pending and deletes expired heartbeats, in one transaction.
-- A claim stores the owner id, and a finish matches it (`AND owner = ?`). The first claim of a process, and a claim after a stall of two sweep intervals, writes the heartbeat first.
+- A claim stores the owner id, and a finish matches it (`AND owner = ?`). The first claim of a process, and a claim after a stall of two sweep intervals, runs a sweep transaction first, which writes the heartbeat.
 - A claim or a pop is one `UPDATE ... RETURNING` or `DELETE ... RETURNING` statement. It selects nothing while the queue is paused.
 - `<name>__sqliteq_meta` holds the totals and the pause; a trigger counts each stored add.
 - `<name>__sqliteq_jobs` holds one outcome record per job ID: `seq`, `job_id`, `state`, `error`, `result` and `finished_at`. `seq` is `AUTOINCREMENT`, so a poll that reads the records above its last `seq` sees every new one.
