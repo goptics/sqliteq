@@ -72,7 +72,8 @@ func (q *Queue) PauseRefusals() uint64 {
 
 // OnPauseChange implements varmq.PauseNotifier: fn gets the cache each time
 // this object sees it change (its own Pause or Resume, a refused pop, the
-// poll), until cancel. fn runs on the goroutine that saw the change, never
+// poll), until cancel. fn(false) also runs, with no change, when a sweep
+// puts a dead owner's rows back in an unpaused queue (see wake). fn runs on the goroutine that saw the change, never
 // under a lock of this package, and must not block; racing changes can
 // reach fn out of order, never with a value the cache did not hold.
 func (q *Queue) OnPauseChange(fn func(paused bool)) (cancel func()) {
@@ -121,6 +122,30 @@ func (q *Queue) setPaused(p bool, g uint64) {
 	}
 	for _, fn := range fns {
 		fn(p)
+	}
+}
+
+// wake tells the OnPauseChange hooks of an unpaused queue that it runs: a
+// sweep put rows back, and the hook is the one way to wake a VarMQ worker
+// that waits on an empty queue.
+// ponytail: borrows the pause hook, fn(false) with no change of the cache.
+// Upgrade path: a wake interface of its own in VarMQ's contract.
+func (q *Queue) wake() {
+	if q.closed.Load() {
+		return
+	}
+	q.pz.mu.Lock()
+	if q.pz.paused.Load() {
+		q.pz.mu.Unlock()
+		return
+	}
+	fns := make([]func(bool), 0, len(q.pz.hooks))
+	for h := range q.pz.hooks {
+		fns = append(fns, *h)
+	}
+	q.pz.mu.Unlock()
+	for _, fn := range fns {
+		fn(false)
 	}
 }
 

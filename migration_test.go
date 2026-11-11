@@ -129,11 +129,14 @@ func TestMigrateV02File(t *testing.T) {
 					dequeue, length, db = q.Dequeue, q.Len, q.f.db
 				}
 
-				want := []string{name + jobIDIndexSuffix, name + pendingIndexSuffix, "sqlite_autoindex_" + name + "_1"}
+				want := []string{name + jobIDIndexSuffix, name + pendingIndexSuffix, name + processingIndexSuffix, "sqlite_autoindex_" + name + "_1"}
 				if got := indexNames(t, db, name); fmt.Sprint(got) != fmt.Sprint(want) {
 					t.Errorf("Round %d: indexes = %v, want %v", round, got, want)
 				}
-				for _, side := range []string{name + jobsSuffix, name + cancelledSuffix, name + readdSuffix} {
+				if ok, err := hasColumn(db, name, "owner"); err != nil || !ok {
+					t.Errorf("Round %d: expected the owner column on the old table, got %t %v", round, ok, err)
+				}
+				for _, side := range []string{name + jobsSuffix, name + cancelledSuffix, name + readdSuffix, "__sqliteq_owners", "__sqliteq_clock"} {
 					var n int
 					if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name = ?", side).Scan(&n); err != nil || n != 1 {
 						t.Errorf("Round %d: expected %s on the old file, got %d %v", round, side, n, err)
