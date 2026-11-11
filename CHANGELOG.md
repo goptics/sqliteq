@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Requires Go 1.27 (was 1.24): `go.mod` requires VarMQ, which needs it. (#22)
 - Queue name must not contain `__sqliteq_`, in both layouts. (#22)
 - Reason: a queue's indexes, side tables and triggers use that part in their names. (#22)
+- Recovery is by owner and heartbeat, not on open. After a crash, unacknowledged items return one heartbeat timeout (default 30s) after the dead process's last heartbeat, also for a single process that restarts at once. (#28)
+- Mixed versions on one file are unsafe: an older process still requeues every processing item on open, and its items carry no owner. Upgrade all processes of a file together. (#28)
+- `OnPauseChange` hooks also get `false` when a sweep puts items back into an unpaused queue. (#28)
 
 ### Added
 
@@ -87,11 +90,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pause outlives restarts and `Purge`. (#23)
 - Refused pop sets `Paused`; while set, the queue object polls the row every 50 ms for a remote `Resume`. (#23)
 
+- Owner id per process and file; column `owner` on queue tables, set by a claim, NULL on pending rows. (#28)
+- Tables `__sqliteq_owners` (heartbeats) and `__sqliteq_clock` (last sweep), per database file. Index `<name>__sqliteq_processing`. (#28)
+- Only a process that claims writes a heartbeat. Producers, inspectors and pausers write none. (#28)
+- Sweep on a queue's first open and every sixth of the timeout, in every process with a queue open: requeues processing items whose owner has no live heartbeat. (#28)
+- A dead process's items return within one timeout, with no reopen; a bound VarMQ worker is woken. (#28)
+- `Close` of the last `Queues` on a file requeues its own unacknowledged items at once and deletes its heartbeat. (#28)
+- Clock-gap guard: a gap between sweeps above a third of the timeout, or a clock step back, moves every heartbeat by the gap. (#28)
+- `WithHeartbeatTimeout(d)` store option: default 30s, at least 5s. Must match for every `New` in the process on one file. (#28)
+
 ### Changed
 
+- `Acknowledge`, `Reject` and every other finish match the owner: one for an item another process took since returns false. (#28)
+- Known limit: a process that froze past the timeout and claimed the same item again can end the second run with the first run's ack. No attempt counter. (#28)
 - Transactions begin `IMMEDIATE`. (#22)
 - Finish (`Acknowledge`, `Reject`) always runs in a transaction. (#22)
 - Pop runs in a transaction while any cancel mark is live. (#22)
+
+### Fixed
+
+- A second process that opened a queue requeued the jobs another live process was running, so they ran twice. (#27, #28)
 
 ## [0.3.0] - 2026-10-23
 
