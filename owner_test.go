@@ -539,26 +539,53 @@ func TestHeartbeatOption(t *testing.T) {
 	}
 }
 
-// The sweep and the hand-back read the processing index, not the pending
-// backlog, and a finish stays a rowid lookup.
-func TestOwnerQueryPlans(t *testing.T) {
+// A finish stays a rowid lookup with the owner match.
+func TestFinishQueryPlan(t *testing.T) {
 	q, qs := openQueue(t)
 	defer qs.Close()
-	const set = `UPDATE "q" SET status = 'pending', owner = NULL WHERE status = 'processing' AND ack = 0 AND `
-	for query, want := range map[string]string{
-		set + "(owner IS NULL OR owner NOT IN (SELECT id FROM __sqliteq_owners WHERE expires_at > 0))":    "USING INDEX q__sqliteq_processing",
-		set + "owner IS NOT NULL AND owner NOT IN (SELECT id FROM __sqliteq_owners WHERE expires_at > 0)": "USING INDEX q__sqliteq_processing",
-		set + "owner = 'x'": "USING INDEX q__sqliteq_processing",
-		`DELETE FROM "q" WHERE id = 1 AND status = 'processing' AND owner = 'x' RETURNING job_id, data`: "USING INTEGER PRIMARY KEY (rowid=?)",
+	for _, query := range []string{
+		`DELETE FROM "q" WHERE id = 1 AND status = 'processing' AND owner = 'x' RETURNING job_id, data`,
+		`UPDATE "q" SET status = 'completed', ack = 1 WHERE id = 1 AND status = 'processing' AND owner = 'x' RETURNING job_id, data`,
 	} {
 		var id, parent, unused int
 		var detail string
 		if err := q.f.db.QueryRow("EXPLAIN QUERY PLAN "+query).Scan(&id, &parent, &unused, &detail); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(detail, want) {
-			t.Errorf("%s\n\tplan %q, want %q", query, detail, want)
+		if !strings.Contains(detail, "USING INTEGER PRIMARY KEY (rowid=?)") {
+			t.Errorf("%s\n\tplan %q", query, detail)
 		}
+	}
+}
+
+// A sweep with no dead owner reads no queue table, and a dead owner dropped
+// by one process makes every other process read its tables once.
+func TestSweepReadsTablesOnDeath(t *testing.T) {
+	a, qs := openQueue(t)
+	defer qs.Close()
+	sweep := func(q *Queue) {
+		t.Helper()
+		if _, err := q.f.sweep([]*Queue{q}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A row no live owner holds, with no owner row to drop: only a read of
+	// the table finds it
+	mustExec(t, a.f.db, `INSERT INTO "q" (data, status, ack, owner) VALUES (x'00', 'processing', 0, 'gone')`)
+	sweep(a)
+	if status, _ := rowOf(t, a.f.db); status != "processing" {
+		t.Fatalf("Expected a sweep with no dead owner to read no table, got %s", status)
+	}
+	// Another process drops a dead owner: it has the table open too, so
+	// take the row out of its reach by the count alone
+	b := otherProcess(t, a)
+	mustExec(t, a.f.db, `UPDATE "q" SET status = 'pending'`)
+	mustExec(t, a.f.db, "INSERT INTO __sqliteq_owners (id, expires_at) VALUES ('dead', 0)")
+	sweep(b)
+	mustExec(t, a.f.db, `UPDATE "q" SET status = 'processing', owner = 'gone'`)
+	sweep(a)
+	if status, _ := rowOf(t, a.f.db); status != "pending" {
+		t.Fatalf("Expected the count to make this process read its table, got %s", status)
 	}
 }
 

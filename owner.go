@@ -14,14 +14,20 @@ import (
 // has a random owner id, stored on every row it claims. An owner that
 // claims keeps a row in __sqliteq_owners, renewed by the sweep; a process
 // that never claims writes none. The sweep runs on a table's first open and
-// then every hb/6 for every table the process has open: it requeues the
+// then every hb/6: it drops the owner rows that ran out and requeues the
 // processing rows whose owner has no live row. SQLite has no presence
 // signal, so the heartbeat is the only liveness: a killed owner's rows come
 // back one timeout after its last beat.
 //
-// Times are the host's wall clock in Unix ms. __sqliteq_clock holds when
-// any process last swept (see sweepLocked for the gap guard) and a count of
-// the requeues, which tells every process to wake its queues.
+// Queue tables have no index on processing rows: a claim and an ack would
+// pay for it on every call. So a sweep reads a queue table only on its
+// first open, as recovery always did, and when an owner died: the sweep
+// that drops a dead owner's row moves the count in __sqliteq_clock, and
+// every process that sees the count move reads its open tables once and
+// wakes its queues.
+//
+// Times are the host's wall clock in Unix ms. __sqliteq_clock also holds
+// when any process last swept (see sweepLocked for the gap guard).
 
 const (
 	defaultHeartbeat = 30 * time.Second
@@ -29,8 +35,6 @@ const (
 	// 5s busy timeout behind another process's write, so on a file with
 	// writers in other processes the timeout must stay well above 5s.
 	minHeartbeat = 5 * time.Second
-
-	processingIndexSuffix = "__sqliteq_processing"
 
 	// A beat clears shifted: the owner is alive, so the next stall may
 	// move its heartbeat on again
@@ -59,7 +63,7 @@ func (f *file) initOwners() error {
 	for _, s := range []string{
 		// shifted: the gap guard moved the heartbeat on since the owner's last beat
 		`CREATE TABLE IF NOT EXISTS __sqliteq_owners (id TEXT PRIMARY KEY NOT NULL, expires_at INTEGER NOT NULL, shifted INTEGER NOT NULL DEFAULT 0)`,
-		// moved: requeues by any process, sweep or hand-back
+		// moved: counts the dead owners dropped and the requeues, by any process
 		`CREATE TABLE IF NOT EXISTS __sqliteq_clock (id INTEGER PRIMARY KEY CHECK (id = 1), swept_at INTEGER NOT NULL, moved INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err := f.db.Exec(s); err != nil {
@@ -69,9 +73,8 @@ func (f *file) initOwners() error {
 	return nil
 }
 
-// addOwner adds the owner column a claim fills, when it is missing, the
-// index the sweep reads, and the file's owner tables. Pending rows and rows
-// of older versions are NULL.
+// addOwner adds the owner column a claim fills, when it is missing, and the
+// file's owner tables. Pending rows and rows of older versions are NULL.
 func (q *Queue) addOwner() error {
 	exists, err := hasColumn(q.f.db, q.name, "owner")
 	if err != nil {
@@ -81,12 +84,6 @@ func (q *Queue) addOwner() error {
 		if _, err := q.f.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN owner TEXT", q.table)); err != nil {
 			return err
 		}
-	}
-	// Without it a sweep scans the whole table, pending backlog included.
-	// Keyed by id: the smallest entry for a claim and an ack to maintain.
-	if _, err := q.f.db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (id) WHERE status = 'processing'",
-		quoteIdent(q.name+processingIndexSuffix), q.table)); err != nil {
-		return err
 	}
 	return q.f.initOwners()
 }
@@ -106,7 +103,7 @@ func (f *file) beat() error {
 	}
 	first := !f.claimed
 	f.claimed = true
-	if _, err := f.sweepLocked(nil, false); err != nil {
+	if _, err := f.sweepLocked(nil, false, false); err != nil {
 		f.claimed = !first
 		return err
 	}
@@ -122,26 +119,33 @@ func (f *file) sweep(qs []*Queue, legacy bool) (wake bool, err error) {
 	if f.closing {
 		return false, errClosed
 	}
-	moved, err := f.sweepLocked(qs, legacy)
+	moved, err := f.sweepLocked(qs, legacy, f.seen)
 	if moved < 0 {
 		return false, err // nothing committed
 	}
 	// A first open has no one to wake for its own table, and must not use
-	// up a requeue the loop has not seen: the next tick wakes for it
+	// up a count the loop has not seen: the next tick reads the other
+	// tables and wakes for it
 	if legacy && f.seen {
 		return false, err
 	}
 	wake = f.seen && moved != f.seenMoved
-	f.seen, f.seenMoved = true, moved
+	if err == nil { // a table that failed is read again at the next tick
+		f.seen, f.seenMoved = true, moved
+	}
 	return wake, err
 }
 
 // sweepLocked is one write transaction: it moves the clock, renews this
-// process's owner row if it has one, and puts back to pending the
-// unacknowledged processing rows of qs whose owner has no live row; with
-// legacy also those without an owner, which an older version claimed. It
-// returns the file's requeue count, -1 when nothing was committed. A table
-// whose requeue fails does not stop the rest; its error is returned.
+// process's owner row if it has one and drops the owner rows that ran out.
+// It reads the tables of qs, a scan each, only when it has to: on a first
+// open (legacy), when it dropped an owner row, or when track is set and the
+// file's count moved since f.seenMoved (another process dropped one). The
+// read puts back to pending the unacknowledged processing rows whose owner
+// has no live row; with legacy also those without an owner, which an older
+// version claimed. It returns the file's count, -1 when nothing was
+// committed. A table whose requeue fails does not stop the rest; its error
+// is returned.
 //
 // Gap guard: a gap since the last sweep by any process longer than gapLimit
 // means no process could beat (a suspended host, a stopped process), and a
@@ -150,7 +154,7 @@ func (f *file) sweep(qs []*Queue, legacy bool) (wake bool, err error) {
 // moves once between two beats of its owner: a dead owner's time runs out
 // even when every process that opens the file is gone before its second
 // sweep. With no clock row yet, no owner is taken for dead.
-func (f *file) sweepLocked(qs []*Queue, legacy bool) (moved int64, err error) {
+func (f *file) sweepLocked(qs []*Queue, legacy, track bool) (moved int64, err error) {
 	tx, err := f.db.Begin()
 	if err != nil {
 		return -1, err
@@ -180,6 +184,18 @@ func (f *file) sweepLocked(qs []*Queue, legacy bool) (moved int64, err error) {
 		}
 	}
 
+	scan := legacy || track && moved != f.seenMoved
+	if reap {
+		res, err := tx.Exec("DELETE FROM __sqliteq_owners WHERE expires_at <= ?", now)
+		if err != nil {
+			return -1, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			scan = true
+			moved++ // the other processes read their tables too
+		}
+	}
+
 	// NULL NOT IN an empty set is true, so the ticker sweep names NOT NULL
 	const dead = "owner NOT IN (SELECT id FROM __sqliteq_owners WHERE expires_at > ?)"
 	var where string
@@ -193,7 +209,7 @@ func (f *file) sweepLocked(qs []*Queue, legacy bool) (moved int64, err error) {
 		where = "owner IS NULL"
 	}
 	var errs []error
-	if where != "" {
+	if where != "" && scan {
 		at, some := time.UnixMilli(now).UTC(), false
 		for _, q := range qs {
 			res, err := tx.Exec(fmt.Sprintf("UPDATE %s SET status = 'pending', owner = NULL, updated_at = ? WHERE status = 'processing' AND ack = 0 AND %s",
@@ -214,11 +230,6 @@ func (f *file) sweepLocked(qs []*Queue, legacy bool) (moved int64, err error) {
 		ON CONFLICT (id) DO UPDATE SET swept_at = excluded.swept_at, moved = excluded.moved`, now, moved); err != nil {
 		return -1, err
 	}
-	if reap {
-		if _, err := tx.Exec("DELETE FROM __sqliteq_owners WHERE expires_at <= ?", now); err != nil {
-			return -1, err
-		}
-	}
 	if err := tx.Commit(); err != nil {
 		return -1, err
 	}
@@ -228,9 +239,9 @@ func (f *file) sweepLocked(qs []*Queue, legacy bool) (moved int64, err error) {
 	return moved, errors.Join(errs...)
 }
 
-// sweepLoop sweeps every table the process has open on the file, every
-// sweepEvery until the last release, and wakes its queues when any process
-// requeued rows. It runs in every process with a queue open, also one that
+// sweepLoop sweeps the file every sweepEvery until the last release, for
+// every table the process has open on it, and wakes its queues when any
+// process dropped a dead owner or requeued rows. It runs in every process with a queue open, also one that
 // never claims: VarMQ pops only when Len is above 0, so a consumer that
 // waits on an empty queue would never start it, and a dead owner's rows
 // would stay. It takes no registry lock: an open of another file that waits
