@@ -269,6 +269,30 @@ func TestWakeAfterOthersRequeue(t *testing.T) {
 	}
 }
 
+// Opening another queue of the file does not use up a requeue the sweep
+// loop has not seen.
+func TestOpenKeepsWake(t *testing.T) {
+	qs := mustNew(t, filepath.Join(t.TempDir(), "one.db"), WithSingleFile())
+	defer qs.Close()
+	a, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer, dead := otherProcess(t, a), otherProcess(t, a)
+	claim1(t, dead)
+	kill(dead.f)
+	mustExec(t, a.f.db, "UPDATE __sqliteq_owners SET expires_at = 0")
+	if _, err := observer.f.sweep([]*Queue{observer}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := qs.NewQueue("y"); err != nil {
+		t.Fatal(err)
+	}
+	if wake, err := a.f.sweep([]*Queue{a}, false); err != nil || !wake {
+		t.Fatalf("Expected the next sweep to wake after an open in between, got %t %v", wake, err)
+	}
+}
+
 // After a crash the restarted process gets its old rows back one timeout
 // later, not at open.
 func TestOwnerRestart(t *testing.T) {

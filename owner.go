@@ -126,6 +126,11 @@ func (f *file) sweep(qs []*Queue, legacy bool) (wake bool, err error) {
 	if moved < 0 {
 		return false, err // nothing committed
 	}
+	// A first open has no one to wake for its own table, and must not use
+	// up a requeue the loop has not seen: the next tick wakes for it
+	if legacy && f.seen {
+		return false, err
+	}
 	wake = f.seen && moved != f.seenMoved
 	f.seen, f.seenMoved = true, moved
 	return wake, err
