@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -19,7 +20,8 @@ import (
 // back one timeout after its last beat.
 //
 // Times are the host's wall clock in Unix ms. __sqliteq_clock holds when
-// any process last swept; see sweep for the gap guard.
+// any process last swept (see sweepLocked for the gap guard) and a count of
+// the requeues, which tells every process to wake its queues.
 
 const (
 	defaultHeartbeat = 30 * time.Second
@@ -30,10 +32,10 @@ const (
 
 	processingIndexSuffix = "__sqliteq_processing"
 
-	// The time is read by SQLite once the statement holds the write lock,
-	// so a wait for another process does not shorten the heartbeat
+	// A beat clears shifted: the owner is alive, so the next stall may
+	// move its heartbeat on again
 	beatQuery = `INSERT INTO __sqliteq_owners (id, expires_at) VALUES (?, CAST(unixepoch('subsec') * 1000 AS INTEGER) + ?)
-		ON CONFLICT (id) DO UPDATE SET expires_at = excluded.expires_at`
+		ON CONFLICT (id) DO UPDATE SET expires_at = excluded.expires_at, shifted = 0`
 )
 
 func newOwnerID() string {
@@ -55,8 +57,10 @@ func (f *file) gapLimit() int64           { return (f.hb / 3).Milliseconds() }
 // the write mutex.
 func (f *file) initOwners() error {
 	for _, s := range []string{
-		`CREATE TABLE IF NOT EXISTS __sqliteq_owners (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS __sqliteq_clock (id INTEGER PRIMARY KEY CHECK (id = 1), swept_at INTEGER NOT NULL)`,
+		// shifted: the gap guard moved the heartbeat on since the owner's last beat
+		`CREATE TABLE IF NOT EXISTS __sqliteq_owners (id TEXT PRIMARY KEY NOT NULL, expires_at INTEGER NOT NULL, shifted INTEGER NOT NULL DEFAULT 0)`,
+		// moved: requeues by any process, sweep or hand-back
+		`CREATE TABLE IF NOT EXISTS __sqliteq_clock (id INTEGER PRIMARY KEY CHECK (id = 1), swept_at INTEGER NOT NULL, moved INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err := f.db.Exec(s); err != nil {
 			return err
@@ -87,10 +91,12 @@ func (q *Queue) addOwner() error {
 	return q.f.initOwners()
 }
 
-// beat writes this process's owner row before a claim when it has none, or
-// when its last write is older than two sweep intervals: a process that
-// froze must not hand out rows under an owner that already looks dead. The
-// caller holds the write mutex.
+// beat makes this process's owner row live before a claim when it has
+// none, or when its last write is older than two sweep intervals: a process
+// that froze must not hand out rows under an owner that already looks dead.
+// It is a sweep of no table, so the gap guard runs before the row is
+// written and a later sweep does not move a fresh heartbeat. The caller
+// holds the write mutex.
 func (f *file) beat() error {
 	if f.closing {
 		return errClosed
@@ -98,34 +104,51 @@ func (f *file) beat() error {
 	if f.claimed && time.Now().UnixMilli()-f.lastBeat <= 2*f.sweepEvery().Milliseconds() {
 		return nil
 	}
-	if _, err := f.db.Exec(beatQuery, f.owner, f.hb.Milliseconds()); err != nil {
+	first := !f.claimed
+	f.claimed = true
+	if _, err := f.sweepLocked(nil, false); err != nil {
+		f.claimed = !first
 		return err
 	}
-	f.claimed, f.lastBeat = true, time.Now().UnixMilli()
 	return nil
 }
 
-// sweep is one write transaction: it moves the clock, renews this process's
-// owner row if it has one, and puts back to pending the unacknowledged
-// processing rows of qs whose owner has no live row; with legacy also those
-// without an owner, which an older version claimed. It returns the queues
-// whose rows moved.
+// sweep runs sweepLocked under the write mutex. wake reports that some
+// process requeued rows in the file since this one last looked: its queues
+// may have pending rows no local add announced.
+func (f *file) sweep(qs []*Queue, legacy bool) (wake bool, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closing {
+		return false, errClosed
+	}
+	moved, err := f.sweepLocked(qs, legacy)
+	if moved < 0 {
+		return false, err // nothing committed
+	}
+	wake = f.seen && moved != f.seenMoved
+	f.seen, f.seenMoved = true, moved
+	return wake, err
+}
+
+// sweepLocked is one write transaction: it moves the clock, renews this
+// process's owner row if it has one, and puts back to pending the
+// unacknowledged processing rows of qs whose owner has no live row; with
+// legacy also those without an owner, which an older version claimed. It
+// returns the file's requeue count, -1 when nothing was committed. A table
+// whose requeue fails does not stop the rest; its error is returned.
 //
 // Gap guard: a gap since the last sweep by any process longer than gapLimit
 // means no process could beat (a suspended host, a stopped process), and a
 // gap below -gapLimit that the clock was set back. Every heartbeat moves on
-// by the gap first, so a stall takes no owner for dead at once. With no
-// clock row yet, no owner is taken for dead.
-func (f *file) sweep(qs []*Queue, legacy bool) (moved []*Queue, err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closing {
-		return nil, errClosed
-	}
-
+// by the gap first, so a stall takes no owner for dead at once. A heartbeat
+// moves once between two beats of its owner: a dead owner's time runs out
+// even when every process that opens the file is gone before its second
+// sweep. With no clock row yet, no owner is taken for dead.
+func (f *file) sweepLocked(qs []*Queue, legacy bool) (moved int64, err error) {
 	tx, err := f.db.Begin()
 	if err != nil {
-		return nil, err
+		return -1, err
 	}
 	defer tx.Rollback()
 
@@ -133,25 +156,22 @@ func (f *file) sweep(qs []*Queue, legacy bool) (moved []*Queue, err error) {
 	now := time.Now().UnixMilli()
 	var swept int64
 	reap := true
-	switch err := tx.QueryRow("SELECT swept_at FROM __sqliteq_clock").Scan(&swept); {
+	// CAST: a value of another type must not fail every sweep for good
+	switch err := tx.QueryRow("SELECT CAST(swept_at AS INTEGER), CAST(moved AS INTEGER) FROM __sqliteq_clock").Scan(&swept, &moved); {
 	case errors.Is(err, sql.ErrNoRows):
 		reap = false
 	case err != nil:
-		return nil, err
+		return -1, err
 	default:
 		if gap := now - swept; gap > f.gapLimit() || gap < -f.gapLimit() {
-			if _, err := tx.Exec("UPDATE __sqliteq_owners SET expires_at = expires_at + ?", gap); err != nil {
-				return nil, err
+			if _, err := tx.Exec("UPDATE __sqliteq_owners SET expires_at = expires_at + ?, shifted = 1 WHERE shifted = 0", gap); err != nil {
+				return -1, err
 			}
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO __sqliteq_clock (id, swept_at) VALUES (1, ?)
-		ON CONFLICT (id) DO UPDATE SET swept_at = excluded.swept_at`, now); err != nil {
-		return nil, err
-	}
 	if f.claimed {
 		if _, err := tx.Exec(beatQuery, f.owner, f.hb.Milliseconds()); err != nil {
-			return nil, err
+			return -1, err
 		}
 	}
 
@@ -167,38 +187,49 @@ func (f *file) sweep(qs []*Queue, legacy bool) (moved []*Queue, err error) {
 	case legacy:
 		where = "owner IS NULL"
 	}
+	var errs []error
 	if where != "" {
-		at := time.UnixMilli(now).UTC()
+		at, some := time.UnixMilli(now).UTC(), false
 		for _, q := range qs {
 			res, err := tx.Exec(fmt.Sprintf("UPDATE %s SET status = 'pending', owner = NULL, updated_at = ? WHERE status = 'processing' AND ack = 0 AND %s",
 				q.table, where), append([]any{at}, args...)...)
 			if err != nil {
-				return nil, err
+				errs = append(errs, fmt.Errorf("%s: %w", q.name, err))
+				continue
 			}
 			if n, _ := res.RowsAffected(); n > 0 {
-				moved = append(moved, q)
+				some = true
 			}
 		}
+		if some {
+			moved++
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO __sqliteq_clock (id, swept_at, moved) VALUES (1, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET swept_at = excluded.swept_at, moved = excluded.moved`, now, moved); err != nil {
+		return -1, err
 	}
 	if reap {
 		if _, err := tx.Exec("DELETE FROM __sqliteq_owners WHERE expires_at <= ?", now); err != nil {
-			return nil, err
+			return -1, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return -1, err
 	}
 	if f.claimed {
 		f.lastBeat = now
 	}
-	return moved, nil
+	return moved, errors.Join(errs...)
 }
 
 // sweepLoop sweeps every table the process has open on the file, every
-// sweepEvery until the last release, and wakes the queues whose rows moved.
-// It runs in every process with a queue open, also one that never claims:
-// VarMQ pops only when Len is above 0, so a consumer that waits on an empty
-// queue would never start it, and a dead owner's rows would stay.
+// sweepEvery until the last release, and wakes its queues when any process
+// requeued rows. It runs in every process with a queue open, also one that
+// never claims: VarMQ pops only when Len is above 0, so a consumer that
+// waits on an empty queue would never start it, and a dead owner's rows
+// would stay. It takes no registry lock: an open of another file that waits
+// for SQLite must not hold up this file's heartbeat.
 func (f *file) sweepLoop() {
 	defer close(f.done)
 	t := time.NewTicker(f.sweepEvery())
@@ -210,17 +241,16 @@ func (f *file) sweepLoop() {
 		case <-t.C:
 		}
 
-		registry.mu.Lock()
-		qs := make([]*Queue, 0, len(f.handles))
-		for _, h := range f.handles {
-			qs = append(qs, h.queue())
-		}
-		registry.mu.Unlock()
-
+		qs := *f.swept.Load()
 		// A failed sweep (a busy file) is tried again at the next tick
-		moved, _ := f.sweep(qs, false)
-		for _, q := range moved {
-			q.wake()
+		wake, err := f.sweep(qs, false)
+		if err != nil && !errors.Is(err, errClosed) {
+			log.Printf("sqliteq: sweep of %s: %v", f.key, err)
+		}
+		if wake {
+			for _, q := range qs {
+				q.wake()
+			}
 		}
 	}
 }
@@ -239,10 +269,19 @@ func (f *file) handBack(tables []string) {
 		return
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC()
+	now, some := time.Now().UTC(), false
 	for _, t := range tables {
-		if _, err := tx.Exec(fmt.Sprintf("UPDATE %s SET status = 'pending', owner = NULL, updated_at = ? WHERE status = 'processing' AND ack = 0 AND owner = ?", t),
-			now, f.owner); err != nil {
+		res, err := tx.Exec(fmt.Sprintf("UPDATE %s SET status = 'pending', owner = NULL, updated_at = ? WHERE status = 'processing' AND ack = 0 AND owner = ?", t),
+			now, f.owner)
+		if err != nil {
+			return
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			some = true
+		}
+	}
+	if some { // the other processes wake their queues
+		if _, err := tx.Exec("UPDATE __sqliteq_clock SET moved = moved + 1"); err != nil {
 			return
 		}
 	}

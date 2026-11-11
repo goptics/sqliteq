@@ -27,14 +27,17 @@ type file struct {
 	recovered map[string]bool    // lower-cased table -> recovery done; under registry.mu
 
 	// Owner and heartbeat (see owner.go)
-	owner    string        // this process's id on the file; on the rows it claims
-	hb       time.Duration // heartbeat timeout
-	claimed  bool          // the owner row is written; under mu
-	lastBeat int64         // Unix ms of the last owner row write; under mu
-	closing  bool          // the last release began: no claim, no sweep; under mu
-	sweeping bool          // sweepLoop runs; under registry.mu
-	stop     chan struct{} // closed by the last release
-	done     chan struct{} // closed when sweepLoop returns
+	owner     string                   // this process's id on the file; on the rows it claims
+	hb        time.Duration            // heartbeat timeout
+	claimed   bool                     // the owner row is written; under mu
+	lastBeat  int64                    // Unix ms of the last owner row write; under mu
+	closing   bool                     // the last release began: no claim, no sweep; under mu
+	sweeping  bool                     // sweepLoop runs; under registry.mu
+	swept     atomic.Pointer[[]*Queue] // the handles' queues, for sweepLoop; stored under registry.mu
+	seen      bool                     // seenMoved is set; under mu
+	seenMoved int64                    // the file's requeue count at the last sweep; under mu
+	stop      chan struct{}            // closed by the last release
+	done      chan struct{}            // closed when sweepLoop returns
 }
 
 // handle is the queue opened under one name in a file; exactly one is set.
@@ -145,6 +148,7 @@ func newFile(path, root string, pages int, hb time.Duration) (*file, error) {
 		done:      make(chan struct{}),
 	}
 	f.b = &batcher{commit: f.commitRound}
+	f.swept.Store(&[]*Queue{})
 	return f, nil
 }
 
@@ -245,6 +249,11 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 	}
 
 	f.handles[key] = h
+	qs := make([]*Queue, 0, len(f.handles))
+	for _, h := range f.handles {
+		qs = append(qs, h.queue())
+	}
+	f.swept.Store(&qs)
 	if !f.sweeping {
 		f.sweeping = true
 		go f.sweepLoop()

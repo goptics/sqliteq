@@ -202,6 +202,73 @@ func TestOwnerDead(t *testing.T) {
 	})
 }
 
+// Processes that open the queue and are gone before their second sweep
+// still get a dead owner's row back: its heartbeat moves on once only.
+func TestOwnerDeadShortLived(t *testing.T) {
+	const hb = 600 * time.Millisecond
+	qs := fastStore(t, t.TempDir(), hb)
+	a, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim1(t, a)
+	kill(a.f)
+	for i := 0; ; i++ {
+		time.Sleep(hb / 2) // above the gap limit
+		f, err := newFile(a.f.key, strings.TrimPrefix(a.f.scope, "sqliteq:"), a.f.pages, hb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := f.open("q", false, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := h.q.Len()
+		f.release()
+		if n == 1 {
+			return
+		}
+		if i == 10 {
+			t.Fatal("Expected the dead owner's row back within a few opens")
+		}
+	}
+}
+
+// A requeue by another process's sweep, or by its hand-back, is seen by
+// this process's next sweep, which wakes its queues.
+func TestWakeAfterOthersRequeue(t *testing.T) {
+	a, qs := openQueue(t)
+	defer qs.Close()
+	sweep := func(q *Queue) bool {
+		t.Helper()
+		wake, err := q.f.sweep([]*Queue{q}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return wake
+	}
+	if sweep(a) {
+		t.Fatal("Expected no wake with nothing requeued")
+	}
+	observer, dead := otherProcess(t, a), otherProcess(t, a)
+	claim1(t, dead)
+	kill(dead.f)
+	mustExec(t, a.f.db, "UPDATE __sqliteq_owners SET expires_at = 0")
+	sweep(observer) // requeues
+	if a.Len() != 1 || !sweep(a) || sweep(a) {
+		t.Fatal("Expected one wake after the observer's requeue")
+	}
+
+	leaver := otherProcess(t, a)
+	if _, ok, _ := leaver.DequeueWithAckId(); !ok {
+		t.Fatal("claim failed")
+	}
+	leaver.f.release()
+	if a.Len() != 1 || !sweep(a) {
+		t.Fatal("Expected a wake after another process's hand-back")
+	}
+}
+
 // After a crash the restarted process gets its old rows back one timeout
 // later, not at open.
 func TestOwnerRestart(t *testing.T) {
@@ -336,8 +403,10 @@ func TestClockGap(t *testing.T) {
 		if status, expires := sweep(t, a); status != "processing" || expires < now {
 			t.Fatalf("Expected the owner kept after a long gap, got %s, expires %d ms from now", status, expires-now)
 		}
-		// Its second left runs out as usual
-		mustExec(t, a.f.db, "UPDATE __sqliteq_owners SET expires_at = expires_at - 2000")
+		// A second long gap with no beat of the owner between moves nothing
+		now = time.Now().UnixMilli()
+		mustExec(t, a.f.db, "UPDATE __sqliteq_clock SET swept_at = ?", now-hour)
+		mustExec(t, a.f.db, "UPDATE __sqliteq_owners SET expires_at = ?", now-1)
 		if status, _ := sweep(t, a); status != "pending" || ownerRows(t, a.f.db) != 0 {
 			t.Fatalf("Expected the dead owner reaped, got %s, %d owner rows", status, ownerRows(t, a.f.db))
 		}
@@ -350,6 +419,23 @@ func TestClockGap(t *testing.T) {
 		status, expires := sweep(t, a)
 		if status != "processing" || expires < now || expires > now+10_000 {
 			t.Fatalf("Expected the heartbeat moved back with the clock, got %s, expires %d ms from now", status, expires-now)
+		}
+	})
+	// A first claim right after the clock went back is not moved with it
+	t.Run("claim after clock set back", func(t *testing.T) {
+		a, _ := openQueue(t)
+		b := otherProcess(t, a)
+		mustExec(t, a.f.db, "UPDATE __sqliteq_clock SET swept_at = ?", time.Now().UnixMilli()+hour)
+		ack := claim1(t, b)
+		if status, _ := sweep(t, a); status != "processing" || !b.Acknowledge(ack) {
+			t.Fatalf("Expected the fresh owner kept, got %s", status)
+		}
+	})
+	t.Run("unreadable clock", func(t *testing.T) {
+		a, _ := setup(t)
+		mustExec(t, a.f.db, "UPDATE __sqliteq_clock SET swept_at = 'x'")
+		if _, err := a.f.sweep([]*Queue{a}, false); err != nil {
+			t.Fatalf("Expected the sweep to repair the clock, got %v", err)
 		}
 	})
 	t.Run("no clock row", func(t *testing.T) {
@@ -460,7 +546,7 @@ func TestHelperProcess(t *testing.T) {
 		t.Skip("helper of TestKilledProcess")
 	}
 	qs := mustNew(t, dir)
-	qs.(*queues).cfg.heartbeat = time.Second
+	qs.(*queues).cfg.heartbeat = 2 * time.Second
 	q, err := qs.NewQueue("q")
 	if err != nil {
 		t.Fatal(err)
@@ -478,7 +564,7 @@ func TestHelperProcess(t *testing.T) {
 // opened first and never claimed, with no reopen.
 func TestKilledProcess(t *testing.T) {
 	dir := t.TempDir()
-	qs := fastStore(t, dir, time.Second)
+	qs := fastStore(t, dir, 2*time.Second)
 	q, err := qs.NewQueue("q")
 	if err != nil {
 		t.Fatal(err)
@@ -524,7 +610,7 @@ func TestKilledProcess(t *testing.T) {
 	select {
 	case v := <-ran:
 		t.Fatalf("job %d ran while its owner is alive", v)
-	case <-time.After(2500 * time.Millisecond): // well past one timeout
+	case <-time.After(3 * time.Second): // past one timeout
 	}
 	if status, _ := rowOf(t, q.f.db); status != "processing" {
 		t.Fatalf("Expected the live owner's row processing, got %s", status)
