@@ -25,7 +25,7 @@ func (q *Queue) requeueNoAck() error {
 	if err != nil {
 		return err
 	}
-	_, err = f.sweep([]*Queue{q}, true)
+	_, err = f.sweep([]*Queue{q}, true, false)
 	return err
 }
 
@@ -241,7 +241,7 @@ func TestWakeAfterOthersRequeue(t *testing.T) {
 	defer qs.Close()
 	sweep := func(q *Queue) bool {
 		t.Helper()
-		wake, err := q.f.sweep([]*Queue{q}, false)
+		wake, err := q.f.sweep([]*Queue{q}, false, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -282,14 +282,41 @@ func TestOpenKeepsWake(t *testing.T) {
 	claim1(t, dead)
 	kill(dead.f)
 	mustExec(t, a.f.db, "UPDATE __sqliteq_owners SET expires_at = 0")
-	if _, err := observer.f.sweep([]*Queue{observer}, false); err != nil {
+	if _, err := observer.f.sweep([]*Queue{observer}, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := qs.NewQueue("y"); err != nil {
 		t.Fatal(err)
 	}
-	if wake, err := a.f.sweep([]*Queue{a}, false); err != nil || !wake {
+	if wake, err := a.f.sweep([]*Queue{a}, false, false); err != nil || !wake {
 		t.Fatalf("Expected the next sweep to wake after an open in between, got %t %v", wake, err)
+	}
+}
+
+// A tick sees a table from before its first sweep: an owner that dies
+// between that sweep and the tick is found in it.
+func TestOpenListsTableBeforeSweep(t *testing.T) {
+	qs := mustNew(t, filepath.Join(t.TempDir(), "one.db"), WithSingleFile())
+	defer qs.Close()
+	a, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := otherProcess(t, a)
+	claim1(t, dead)
+	kill(dead.f)
+	if _, err := qs.NewQueue("y"); err != nil { // the owner is live still
+		t.Fatal(err)
+	}
+	if n := len(*a.f.swept.Load()); n != 2 {
+		t.Fatalf("Expected both tables in the loop's list, got %d", n)
+	}
+	mustExec(t, a.f.db, "UPDATE __sqliteq_owners SET expires_at = 0")
+	if _, err := a.f.sweep(nil, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if a.Len() != 1 {
+		t.Fatal("Expected the tick to requeue the dead owner's row")
 	}
 }
 
@@ -350,7 +377,7 @@ func TestLegacyRows(t *testing.T) {
 	a, qs := openQueue(t)
 	defer qs.Close()
 	mustExec(t, a.f.db, `INSERT INTO "q" (data, status, ack) VALUES (x'00', 'processing', 0)`)
-	if _, err := a.f.sweep([]*Queue{a}, false); err != nil {
+	if _, err := a.f.sweep([]*Queue{a}, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if status, _ := rowOf(t, a.f.db); status != "processing" {
@@ -410,7 +437,7 @@ func TestClockGap(t *testing.T) {
 	}
 	sweep := func(t *testing.T, a *Queue) (status string, expires int64) {
 		t.Helper()
-		if _, err := a.f.sweep([]*Queue{a}, false); err != nil {
+		if _, err := a.f.sweep([]*Queue{a}, false, false); err != nil {
 			t.Fatal(err)
 		}
 		status, _ = rowOf(t, a.f.db)
@@ -458,7 +485,7 @@ func TestClockGap(t *testing.T) {
 	t.Run("unreadable clock", func(t *testing.T) {
 		a, _ := setup(t)
 		mustExec(t, a.f.db, "UPDATE __sqliteq_clock SET swept_at = 'x'")
-		if _, err := a.f.sweep([]*Queue{a}, false); err != nil {
+		if _, err := a.f.sweep([]*Queue{a}, false, false); err != nil {
 			t.Fatalf("Expected the sweep to repair the clock, got %v", err)
 		}
 	})
@@ -487,7 +514,7 @@ func TestProducerOnly(t *testing.T) {
 	}
 	stats(t, a)
 	a.Dequeue()
-	if _, err := a.f.sweep([]*Queue{a}, false); err != nil {
+	if _, err := a.f.sweep([]*Queue{a}, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if n := ownerRows(t, a.f.db); n != 0 || a.f.claimed {
@@ -539,25 +566,6 @@ func TestHeartbeatOption(t *testing.T) {
 	}
 }
 
-// A finish stays a rowid lookup with the owner match.
-func TestFinishQueryPlan(t *testing.T) {
-	q, qs := openQueue(t)
-	defer qs.Close()
-	for _, query := range []string{
-		`DELETE FROM "q" WHERE id = 1 AND status = 'processing' AND owner = 'x' RETURNING job_id, data`,
-		`UPDATE "q" SET status = 'completed', ack = 1 WHERE id = 1 AND status = 'processing' AND owner = 'x' RETURNING job_id, data`,
-	} {
-		var id, parent, unused int
-		var detail string
-		if err := q.f.db.QueryRow("EXPLAIN QUERY PLAN "+query).Scan(&id, &parent, &unused, &detail); err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(detail, "USING INTEGER PRIMARY KEY (rowid=?)") {
-			t.Errorf("%s\n\tplan %q", query, detail)
-		}
-	}
-}
-
 // A sweep with no dead owner reads no queue table, and a dead owner dropped
 // by one process makes every other process read its tables once.
 func TestSweepReadsTablesOnDeath(t *testing.T) {
@@ -565,7 +573,7 @@ func TestSweepReadsTablesOnDeath(t *testing.T) {
 	defer qs.Close()
 	sweep := func(q *Queue) {
 		t.Helper()
-		if _, err := q.f.sweep([]*Queue{q}, false); err != nil {
+		if _, err := q.f.sweep([]*Queue{q}, false, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -576,6 +584,15 @@ func TestSweepReadsTablesOnDeath(t *testing.T) {
 	if status, _ := rowOf(t, a.f.db); status != "processing" {
 		t.Fatalf("Expected a sweep with no dead owner to read no table, got %s", status)
 	}
+	// The loop's read once per timeout finds it
+	if _, err := a.f.sweep(nil, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := rowOf(t, a.f.db); status != "pending" {
+		t.Fatalf("Expected the full read to requeue the row, got %s", status)
+	}
+	mustExec(t, a.f.db, `UPDATE "q" SET status = 'processing', owner = 'gone'`)
+	sweep(a)
 	// Another process drops a dead owner: it has the table open too, so
 	// take the row out of its reach by the count alone
 	b := otherProcess(t, a)

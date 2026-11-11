@@ -92,7 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Owner id per process and file; column `owner` on queue tables, set by a claim, NULL on pending rows. (#28)
 - Tables `__sqliteq_owners` (heartbeats) and `__sqliteq_clock` (last sweep), per database file. (#28)
-- No index on processing rows: a sweep scans a queue table only on its first open and when a heartbeat expired, so a claim and an ack maintain nothing new. (#28)
+- No index on processing rows: a sweep scans a queue table only on its first open, when a heartbeat expired and once per timeout, so a claim and an ack maintain nothing new. (#28)
 - Only a process that claims writes a heartbeat. Producers, inspectors and pausers write none. (#28)
 - Sweep on a queue's first open and every sixth of the timeout, in every process with a queue open: requeues processing items whose owner has no live heartbeat. (#28)
 - A dead process's items return about one timeout after its last heartbeat, with no reopen. (#28)

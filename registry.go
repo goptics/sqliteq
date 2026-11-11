@@ -240,8 +240,19 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 
 	// First open: rows of dead owners, and rows an older version left
 	// without an owner, go back to pending
+	// The loop's list holds the table before its first sweep, so an owner
+	// that dies between that sweep and the next tick is found by the tick
+	old := f.swept.Load()
+	qs := []*Queue{h.queue()}
+	for k, o := range f.handles {
+		if k != key {
+			qs = append(qs, o.queue())
+		}
+	}
+	f.swept.Store(&qs)
 	if !f.recovered[key] {
-		if _, err := f.sweep([]*Queue{h.queue()}, true); err != nil {
+		if _, err := f.sweep([]*Queue{h.queue()}, true, false); err != nil {
+			f.swept.Store(old)
 			h.queue().Close() // stops a pause poll
 			return nil, fmt.Errorf("failed to requeue unacknowledged rows: %w", err)
 		}
@@ -249,11 +260,6 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 	}
 
 	f.handles[key] = h
-	qs := make([]*Queue, 0, len(f.handles))
-	for _, h := range f.handles {
-		qs = append(qs, h.queue())
-	}
-	f.swept.Store(&qs)
 	if !f.sweeping {
 		f.sweeping = true
 		go f.sweepLoop()

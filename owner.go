@@ -24,7 +24,8 @@ import (
 // first open, as recovery always did, and when an owner died: the sweep
 // that drops a dead owner's row moves the count in __sqliteq_clock, and
 // every process that sees the count move reads its open tables once and
-// wakes its queues.
+// wakes its queues. Each process also reads them once per timeout, for a
+// row whose owner row went without the count moving.
 //
 // Times are the host's wall clock in Unix ms. __sqliteq_clock also holds
 // when any process last swept (see sweepLocked for the gap guard).
@@ -103,23 +104,28 @@ func (f *file) beat() error {
 	}
 	first := !f.claimed
 	f.claimed = true
-	if _, err := f.sweepLocked(nil, false, false); err != nil {
+	if _, err := f.sweepLocked(nil, false, false, false); err != nil {
 		f.claimed = !first
 		return err
 	}
 	return nil
 }
 
-// sweep runs sweepLocked under the write mutex. wake reports that some
-// process requeued rows in the file since this one last looked: its queues
-// may have pending rows no local add announced.
-func (f *file) sweep(qs []*Queue, legacy bool) (wake bool, err error) {
+// sweep runs sweepLocked under the write mutex; a nil qs is every queue the
+// process has open, read under the mutex so no open falls between. full
+// reads the tables whatever the count says. wake reports that some process
+// dropped an owner or requeued rows in the file since this one last looked:
+// its queues may have pending rows no local add announced.
+func (f *file) sweep(qs []*Queue, legacy, full bool) (wake bool, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closing {
 		return false, errClosed
 	}
-	moved, err := f.sweepLocked(qs, legacy, f.seen)
+	if qs == nil {
+		qs = *f.swept.Load()
+	}
+	moved, err := f.sweepLocked(qs, legacy || full, legacy, f.seen)
 	if moved < 0 {
 		return false, err // nothing committed
 	}
@@ -138,10 +144,10 @@ func (f *file) sweep(qs []*Queue, legacy bool) (wake bool, err error) {
 
 // sweepLocked is one write transaction: it moves the clock, renews this
 // process's owner row if it has one and drops the owner rows that ran out.
-// It reads the tables of qs, a scan each, only when it has to: on a first
-// open (legacy), when it dropped an owner row, or when track is set and the
-// file's count moved since f.seenMoved (another process dropped one). The
-// read puts back to pending the unacknowledged processing rows whose owner
+// It reads the tables of qs, a scan each, only when it has to: when scan is
+// set (a first open, the loop's read once per timeout), when it dropped an
+// owner row, or when track is set and the file's count moved since
+// f.seenMoved (another process dropped one). The read puts back to pending the unacknowledged processing rows whose owner
 // has no live row; with legacy also those without an owner, which an older
 // version claimed. It returns the file's count, -1 when nothing was
 // committed. A table whose requeue fails does not stop the rest; its error
@@ -154,7 +160,7 @@ func (f *file) sweep(qs []*Queue, legacy bool) (wake bool, err error) {
 // moves once between two beats of its owner: a dead owner's time runs out
 // even when every process that opens the file is gone before its second
 // sweep. With no clock row yet, no owner is taken for dead.
-func (f *file) sweepLocked(qs []*Queue, legacy, track bool) (moved int64, err error) {
+func (f *file) sweepLocked(qs []*Queue, scan, legacy, track bool) (moved int64, err error) {
 	tx, err := f.db.Begin()
 	if err != nil {
 		return -1, err
@@ -184,7 +190,7 @@ func (f *file) sweepLocked(qs []*Queue, legacy, track bool) (moved int64, err er
 		}
 	}
 
-	scan := legacy || track && moved != f.seenMoved
+	scan = scan || track && moved != f.seenMoved
 	if reap {
 		res, err := tx.Exec("DELETE FROM __sqliteq_owners WHERE expires_at <= ?", now)
 		if err != nil {
@@ -250,21 +256,25 @@ func (f *file) sweepLoop() {
 	defer close(f.done)
 	t := time.NewTicker(f.sweepEvery())
 	defer t.Stop()
-	for {
+	for n := 1; ; n++ {
 		select {
 		case <-f.stop:
 			return
 		case <-t.C:
 		}
 
-		qs := *f.swept.Load()
+		// Once per timeout the tables are read whatever the count says: a
+		// row can carry an owner whose row went without the count moving
+		// (claimed after a stall, just as the row was dropped).
+		// ponytail: one scan of each open table per timeout. Upgrade path:
+		// the claim checks its owner row in the same statement.
 		// A failed sweep (a busy file) is tried again at the next tick
-		wake, err := f.sweep(qs, false)
+		wake, err := f.sweep(nil, false, n%6 == 0)
 		if err != nil && !errors.Is(err, errClosed) {
 			log.Printf("sqliteq: sweep of %s: %v", f.key, err)
 		}
 		if wake {
-			for _, q := range qs {
+			for _, q := range *f.swept.Load() {
 				q.wake()
 			}
 		}
