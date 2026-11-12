@@ -115,6 +115,9 @@ func (q *Queue) initSchema() error {
 	if err := q.addJobID(); err != nil {
 		return fmt.Errorf("failed to add job_id: %w", err)
 	}
+	if err := q.addOwner(); err != nil {
+		return fmt.Errorf("failed to add owner: %w", err)
+	}
 	if err := q.initSidecars(); err != nil {
 		return fmt.Errorf("failed to create outcome tables: %w", err)
 	}
@@ -241,10 +244,11 @@ func (q *Queue) prepare() (err error) {
 	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') ORDER BY %s",
 		q.table, q.meta, q.order)
 
-	// fin ends a processing row: deleted, or kept with its end as status
-	fin := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
+	// fin ends a processing row this process claimed: deleted, or kept with
+	// its end as status. A row another owner took since is not touched.
+	fin := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing' AND owner = ? RETURNING job_id, data", q.table)
 	if !q.removeOnComplete {
-		fin = fmt.Sprintf("UPDATE %s SET status = ?, ack = 1, updated_at = ? WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
+		fin = fmt.Sprintf("UPDATE %s SET status = ?, ack = 1, updated_at = ? WHERE id = ? AND status = 'processing' AND owner = ? RETURNING job_id, data", q.table)
 	}
 
 	for _, s := range []struct {
@@ -254,7 +258,7 @@ func (q *Queue) prepare() (err error) {
 		// The conflict target is the job_id index alone, so a NOT NULL or any
 		// other failure still errors; it must repeat the index's WHERE
 		{&q.insert, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
-		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
+		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', owner = ?, updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
 		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
 		{&q.fin, fin},
 		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
@@ -282,18 +286,6 @@ func (q *Queue) closeStmts() {
 			s.Close()
 		}
 	}
-}
-
-// requeueNoAck puts rows left in processing without an ack back to pending
-func (q *Queue) requeueNoAck() error {
-	q.f.mu.Lock()
-	defer q.f.mu.Unlock()
-
-	_, err := q.f.db.Exec(
-		fmt.Sprintf("UPDATE %s SET status = 'pending', updated_at = ? WHERE status = 'processing' AND ack = 0", q.table),
-		time.Now().UTC(),
-	)
-	return err
 }
 
 // hasColumn reports whether the table has a column with the given name
@@ -486,7 +478,10 @@ func (q *Queue) pushWorkflow(item []byte, priority int, id string) error {
 func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
 	g := q.pz.gen.Load()
 	q.f.mu.Lock()
-	out, capped, refused, err = q.claimGated(n)
+	// The owner row is live before a row carries the owner
+	if err = q.f.beat(); err == nil {
+		out, capped, refused, err = q.claimGated(n)
+	}
 	q.f.mu.Unlock()
 	if refused {
 		q.refused(g)
@@ -575,7 +570,7 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 // claimRows runs a claim statement and reads every row it returns; the
 // caller holds the write mutex
 func (q *Queue) claimRows(claim *sql.Stmt, n int) ([]claimed, error) {
-	rows, err := claim.Query(time.Now().UTC(), n)
+	rows, err := claim.Query(q.f.owner, time.Now().UTC(), n)
 	if err != nil {
 		return nil, err
 	}
@@ -800,13 +795,13 @@ func (q *Queue) finishTx(tx *sql.Tx, id int64, state contract.JobState, reason s
 // end finishes processing row id with state, in tx: the row is deleted or
 // kept with state as status, and a job with a Job ID gets its outcome
 // record. jobID is the row's, when the caller knows it. Reports whether
-// the row was processing.
+// the row was processing under this process's owner id.
 func (q *Queue) end(tx *sql.Tx, id int64, jobID string, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
 	var row *sql.Row
 	if q.removeOnComplete {
-		row = tx.Stmt(q.fin).QueryRow(id)
+		row = tx.Stmt(q.fin).QueryRow(id, q.f.owner)
 	} else {
-		row = tx.Stmt(q.fin).QueryRow(string(state), now.UTC(), id)
+		row = tx.Stmt(q.fin).QueryRow(string(state), now.UTC(), id, q.f.owner)
 	}
 	var (
 		once sql.NullString

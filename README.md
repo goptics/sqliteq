@@ -40,6 +40,7 @@
 - **Job cancel**: `CancelJob` drops a waiting job, and `OnCancel` tells every process on the file to stop a running one.
 - **Job records and inspection**: counts, totals and job lists for VarMQ's REST API and vartop.
 - **[Workflows](#workflows)**: `NewWorkflowStore` keeps VarMQ workflows (a DAG of jobs across queues) in SQLite, so they survive a restart.
+- **Recovery by owner**: each process has an owner id and a heartbeat in the file. Only the jobs of a dead process go back to the queue, so processes can share a file.
 - **Durable queue pause**: `Pause` stops the pops of every process on the file, and the pause outlives restarts.
 - **Automatic WAL checkpoints**, tunable with `WithCheckpointPages`.
 - **Thread-safe**: share one queue object across goroutines.
@@ -130,7 +131,7 @@ if ok {
 }
 ```
 
-An item taken with `DequeueWithAckId` is marked as processing until it is acknowledged. The first time a queue is opened after its file is opened in the process, every item still marked as processing goes back to pending, so a job that was running when the process stopped runs again. There is no visibility timeout: unacknowledged items return only when the file is next opened, not when a closed queue is opened again on a file that is still open.
+An item taken with `DequeueWithAckId` is marked as processing, under the owner id of the process that took it, until it is acknowledged. A process that takes items keeps a heartbeat in the file. When a process dies, its heartbeat runs out after the heartbeat timeout (30 s by default), and any process that has the queue open puts its items back to pending. A clean `Close` of the store puts them back at once. An `Acknowledge` or `Reject` for an item another process has taken since returns false and changes nothing. There is no visibility timeout: a job may run for as long as its process is alive. See [Processes and files](#processes-and-files).
 
 `Reject(ackID, reason)` finishes an item that failed for good, as VarMQ does when a job returns an error or panics. It is never requeued. When the job has a job ID, the reason is stored as its outcome error.
 
@@ -360,7 +361,20 @@ Names are case-insensitive in both layouts: `Jobs` and `jobs` are the same queue
 
 sqliteq keeps a registry in the process, keyed by the file's real path (made absolute, with symlinks resolved). Every `New` in the process that reaches the same file shares one connection pool and one write lock, so two `New` calls on one path never write through two competing pools. Two `Queues` values can therefore hold the same queue, and you get the same handle from both. The file closes when the last `Queues` using it is closed.
 
-Other processes can open the same file. SQLite's lock orders their writes, and what lives in the file reaches every process: a pause stops every process's pops at once, and a `Resume`, a cancel or a job outcome reaches the others within 50 ms (they poll). Recovery is the limit. Every process that opens a queue runs recovery on its first open of that queue, whatever it does with it: consumers, producers, observers (a process that only serves the REST API) and `Pause`/`Resume` callers alike. Recovery puts every item still marked as processing back to pending, so a process that opens the queue while another one runs its jobs makes those jobs run again. sqliteq does not take an OS lock to stop that. Sharing a file is safe only when every process opens the queue before any of them takes jobs, and no process opens it, or opens it again after a restart, later.
+Other processes can open the same file. SQLite's lock orders their writes, and what lives in the file reaches every process: a pause stops every process's pops at once, and a `Resume`, a cancel or a job outcome reaches the others within 50 ms (they poll).
+
+Recovery is by owner. Each process has a random owner id for each file, and every item it takes carries that id. The rules:
+
+- **Heartbeat.** A process that takes items keeps a row in `__sqliteq_owners` and renews it every sixth of the heartbeat timeout (`WithHeartbeatTimeout`, 30 s by default, at least 5 s). A process that only adds, inspects or pauses writes no row.
+- **Sweep.** Every process with a queue open sweeps that queue on its first open, and then every sixth of the timeout. A sweep deletes the heartbeats that ran out and, when it found one, puts back to pending the processing items whose owner has no live heartbeat. So a second process never takes the jobs of a live one, whatever it does with the queue.
+- **Dead process.** Its items come back about one heartbeat timeout after its last heartbeat, in any process that has the queue open. No reopen is needed. Each process sees the requeue at its next sweep and wakes the VarMQ workers bound to its queues, whichever process did the requeue.
+- **Restart after a crash.** The items of the crashed process also wait for its old heartbeat to run out: about one timeout after the restart, not at open. Lower the timeout for a faster return.
+- **Clean exit.** When the process closes a file, it puts its own items back to pending at once and deletes its heartbeat. A file closes with the last `Queues` that holds it, and under `WithSingleFile` with the `WorkflowStore` too. A job that still runs then runs again.
+- **Lost item.** An ack or a reject from a process that lost an item returns false. One limit: when a process froze for longer than the timeout and then took the same item again, the ack of its first run ends the second run. sqliteq does not count attempts.
+- **Stalls and clock steps.** When no process swept for longer than a third of the timeout (a suspended host), or the clock went back, every heartbeat moves by that gap first. So a stall does not make every process look dead. A heartbeat moves once only until its process renews it, so the items of a dead process still come back when every later process is short-lived. A second stall before that renewal can make a live process look dead, and its jobs then run twice. Liveness uses the wall clock of the one host.
+- **Timeout.** A heartbeat renewal can wait up to 5 s behind a write of another process (the busy timeout). Keep the timeout well above that when other processes write to the file. Processes with different timeouts can share a file; a process with a short timeout that opens the file can delay the return of a dead process's items by one sweep gap.
+- **One version.** Upgrade every process of a file together. A process of an older version still puts every processing item back when it opens a queue, and its own items carry no owner.
+- **No wake across processes.** A worker does not wake when another process adds a job.
 
 On macOS, spell a path the same way every time: the registry key keeps the letter case you pass, so `Data` and `data` would be two entries for one folder. On Windows, Go resolves existing folders and files to their on-disk letter case, so different spellings of them share one entry.
 
@@ -370,9 +384,10 @@ On macOS, spell a path the same way every time: the registry key keeps the lette
 | ----------------------------- | ------------------------------ | ------------- | ---------------------------------------------------------------------- |
 | `WithSingleFile()`            | `New`                          | folder layout | `path` is one database file holding every queue                        |
 | `WithCheckpointPages(n)`      | `New`                          | `1000`        | WAL size, in pages, at which SQLite checkpoints automatically          |
+| `WithHeartbeatTimeout(d)`     | `New`                          | `30s`         | Time without a heartbeat after which other processes requeue this process's unacknowledged items; at least `5s` |
 | `WithRemoveOnComplete(false)` | `NewQueue`, `NewPriorityQueue` | `true`        | Keep finished items, marked as `completed`, `failed` or `cancelled`, instead of deleting them |
 
-`New` returns an error instead of panicking: for a path it cannot use, an invalid option (`WithCheckpointPages` below 1, or a nil option), or a path that is an existing file when `WithSingleFile()` is not given. `NewQueue` and `NewPriorityQueue` return an error for a nil option too.
+`New` returns an error instead of panicking: for a path it cannot use, an invalid option (`WithCheckpointPages` below 1, `WithHeartbeatTimeout` below 5 s, or a nil option), or a path that is an existing file when `WithSingleFile()` is not given. `NewQueue` and `NewPriorityQueue` return an error for a nil option too.
 
 #### Checkpoints
 
@@ -384,7 +399,7 @@ qs, err := sqliteq.New("data", sqliteq.WithCheckpointPages(10000))
 
 Raising it makes those waits rarer, which cuts `Enqueue` tail latency and raises throughput, at the price of a larger WAL on disk: 10000 pages triggers a checkpoint at about 41 MB.
 
-The WAL is a log, not extra stored data: the database holds the same items either way. Everything that reaches one file must use the same value: a `NewQueue` or `NewPriorityQueue` that reaches a file already open with a different value returns an error naming the value the file is open with. `New` itself does not open files, so it does not detect this.
+The WAL is a log, not extra stored data: the database holds the same items either way. Everything in the process that reaches one file must use the same value, and the same heartbeat timeout: a `NewQueue` or `NewPriorityQueue` that reaches a file already open with a different value returns an error naming the value the file is open with. `New` itself does not open files, so it does not detect this.
 
 ## How It Works
 
@@ -394,14 +409,18 @@ Each queue is a table with these columns:
 - `priority`: priority queues only; a lower number comes out first. Opening an older table as a priority queue adds it.
 - `data`: the stored item.
 - `status`: `pending`, `processing`, or on a kept row `completed`, `failed` or `cancelled`.
-- `ack`: 0 when an item is added, 1 once it is acknowledged or rejected and kept with `WithRemoveOnComplete(false)` (`status` `completed`, `failed` or `cancelled`). On open, only `processing` rows with `ack` 0 go back to pending.
+- `ack`: 0 when an item is added, 1 once it is acknowledged or rejected and kept with `WithRemoveOnComplete(false)` (`status` `completed`, `failed` or `cancelled`). A sweep puts back only `processing` rows with `ack` 0.
 - `ack_id`: kept from v0.2 so old tables need no rebuild; no longer used.
 - `job_id`: the id an item was added with through `EnqueueOnce`, unique among the rows that have one; NULL for `Enqueue`. Opening an older table adds it.
+- `owner`: the owner id of the process that claimed the item; NULL while pending and on rows of older versions. Opening an older table adds it.
 - `created_at`, `updated_at`: when the item was added and last changed.
 
 On top of that table:
 
-- Two partial indexes: one covers the pending items in queue order. A unique one covers `job_id` on the rows that have one, which `EnqueueOnce` relies on.
+- Two partial indexes: one covers the pending items in queue order. A unique one covers `job_id` on the rows that have one, which `EnqueueOnce` relies on. Processing items have no index, so a claim and an ack do not pay for one.
+- `__sqliteq_owners` holds one heartbeat row per process that claims (`id`, `expires_at`, `shifted`). `__sqliteq_clock` holds when any process last swept and a count of the requeues. Both are per database file.
+- One sweep goroutine per open file, in every process with a queue open on it. Each sixth of the heartbeat timeout it renews the heartbeat and deletes expired heartbeats, in one transaction on the two small tables. It reads a queue table, one scan, only when a heartbeat expired: the process that deletes it moves a count in `__sqliteq_clock`, and each process that sees the count move puts the processing items of dead owners in its open queues back to pending. The first open of a queue reads its table too, as recovery always did, and each process reads its open tables once per timeout as a safety net.
+- A claim stores the owner id, and a finish matches it (`AND owner = ?`). The first claim of a process, and a claim after a stall of two sweep intervals, runs a sweep transaction first, which writes the heartbeat.
 - A claim or a pop is one `UPDATE ... RETURNING` or `DELETE ... RETURNING` statement. It selects nothing while the queue is paused.
 - `<name>__sqliteq_meta` holds the totals and the pause; a trigger counts each stored add.
 - `<name>__sqliteq_jobs` holds one outcome record per job ID: `seq`, `job_id`, `state`, `error`, `result` and `finished_at`. `seq` is `AUTOINCREMENT`, so a poll that reads the records above its last `seq` sees every new one.
@@ -418,8 +437,11 @@ On top of that table:
 ## Trade-offs
 
 - **At least once, not exactly once.** A job runs again when its process stops before the job is acknowledged. Make handlers idempotent.
-- **No visibility timeout.** Unacknowledged items go back to pending only when a process next opens the file. A hung worker keeps its job until then.
-- **Sharing a file between processes needs care.** Each process runs recovery on its first open of a queue. So a process that opens a queue late puts the jobs that other processes hold back to pending. See [Processes and files](#processes-and-files).
+- **No visibility timeout.** A hung worker keeps its job while its process is alive. Items come back only when their process dies or closes the store.
+- **Recovery waits for the heartbeat.** After a crash, the items of the dead process come back one heartbeat timeout later, also for a single process that restarts at once. See [Processes and files](#processes-and-files).
+- **A sweep in every process.** Each process with a queue open writes to each open file every sixth of the heartbeat timeout (5 s by default). Each process also scans its open queue tables under the write lock: once per timeout, and once more when a process dies.
+- **A stale ack of the same process counts.** A process that froze past the timeout and took the same item again can end the second run with the ack of the first.
+- **One version per file.** Processes of an older version on the same file still requeue the jobs of live processes.
 - **Polling, not push.** A queue object with watches or `OnCancel` hooks reads the file every 50 ms, in every process. Outcomes, cancels and a `Resume` from another process arrive within about 50 ms.
 - **Outcomes need the record.** A job without a job ID gets no outcome. A watch that starts after the job's record was trimmed is never called. Pair a watch with a timeout of your own.
 - **Fixed retention.** The record limits are not configurable. Kept rows (`WithRemoveOnComplete(false)`) have no retention at all.
@@ -431,7 +453,7 @@ On top of that table:
 
 | Call                                         | Guarantee                   | If the process stops                                       |
 | -------------------------------------------- | --------------------------- | ---------------------------------------------------------- |
-| `DequeueWithAckId`, `DequeueBatchWithAckIds` | At least once               | Unacknowledged items go back to pending on the next open   |
+| `DequeueWithAckId`, `DequeueBatchWithAckIds` | At least once               | Unacknowledged items go back to pending after the heartbeat timeout |
 | `Dequeue`                                    | At most once                | The item is deleted when it is returned                    |
 | `EnqueueOnce`                                | Once per id                 | Stored once while its row exists; the id survives recovery |
 | `Enqueue`                                    | Stored when it returns true | Survives a process crash                                   |
@@ -447,6 +469,10 @@ sqliteq runs SQLite in WAL mode with `synchronous=NORMAL`, unchanged from v0.2. 
 - Requires Go 1.27, because `go.mod` requires VarMQ.
 - A queue name must not contain `__sqliteq_`. Rename such a queue before the upgrade, or it fails to open.
 - The first open of a queue adds the tables `<name>__sqliteq_meta`, `<name>__sqliteq_jobs` and `<name>__sqliteq_cancelled`, and their triggers. The data in the queue is kept.
+- The first open of a queue also adds the `owner` column and the tables `__sqliteq_owners` and `__sqliteq_clock`. Processing rows of the older version carry no owner and go back to pending on that open, as before.
+- Upgrade every process that shares a file at the same time. An older process requeues the jobs of live processes when it opens a queue.
+- After a crash, unacknowledged items come back one heartbeat timeout (30 s by default) after the process last renewed its heartbeat, not at the next open. A clean `Close` returns them at once.
+- `OnPauseChange` hooks also get `false` when a sweep puts items back into a queue that is not paused.
 
 ## Upgrading from v0.2
 
