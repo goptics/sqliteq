@@ -3,11 +3,15 @@ package sqliteq
 import (
 	"bufio"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -693,5 +697,209 @@ func TestKilledProcess(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("the killed owner's job did not run in the survivor")
+	}
+}
+
+// brokenClock makes every write of the clock row fail.
+const brokenClock = "CREATE TRIGGER nope BEFORE UPDATE ON __sqliteq_clock BEGIN SELECT RAISE(ABORT, 'nope'); END"
+
+// A sweep that cannot finish a step returns the error and commits nothing;
+// a table that fails does not stop the sweep.
+func TestSweepErrors(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		claimed bool
+		commits bool
+		harm    func(t *testing.T, q *Queue)
+	}{
+		{name: "begin", harm: func(t *testing.T, q *Queue) { q.f.db.Close() }},
+		{name: "clock read", harm: func(t *testing.T, q *Queue) { mustExec(t, q.f.db, "DROP TABLE __sqliteq_clock") }},
+		{name: "gap", harm: func(t *testing.T, q *Queue) {
+			mustExec(t, q.f.db, "UPDATE __sqliteq_clock SET swept_at = 0")
+			mustExec(t, q.f.db, "DROP TABLE __sqliteq_owners")
+		}},
+		{name: "beat", claimed: true, harm: func(t *testing.T, q *Queue) { mustExec(t, q.f.db, "DROP TABLE __sqliteq_owners") }},
+		{name: "reap", harm: func(t *testing.T, q *Queue) { mustExec(t, q.f.db, "DROP TABLE __sqliteq_owners") }},
+		{name: "clock write", harm: func(t *testing.T, q *Queue) { mustExec(t, q.f.db, brokenClock) }},
+		{name: "table", commits: true, harm: func(t *testing.T, q *Queue) { mustExec(t, q.f.db, "DROP TABLE "+q.table) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			q, err := fastStore(t, t.TempDir(), defaultHeartbeat).NewQueue("q")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.claimed {
+				claim1(t, q)
+			}
+			c.harm(t, q)
+
+			q.f.mu.Lock()
+			moved, err := q.f.sweepLocked([]*Queue{q}, true, false, false)
+			q.f.mu.Unlock()
+			if err == nil || (moved >= 0) != c.commits {
+				t.Fatalf("moved %d, err %v; want an error, committed %t", moved, err, c.commits)
+			}
+			if _, err := q.f.sweep(nil, false, true); err == nil {
+				t.Fatal("sweep returned no error")
+			}
+		})
+	}
+}
+
+// A claim whose beat fails takes no row and leaves the owner unclaimed; a
+// file that is closing takes no claim and no sweep.
+func TestBeatErrors(t *testing.T) {
+	q, err := fastStore(t, t.TempDir(), defaultHeartbeat).NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.enqueue([]byte("job"), 0, "")
+	f := q.f
+
+	mustExec(t, f.db, brokenClock)
+	if _, ok, _ := q.DequeueWithAckId(); ok || f.claimed {
+		t.Fatalf("claimed with a failed beat (claimed %t)", f.claimed)
+	}
+	mustExec(t, f.db, "DROP TRIGGER nope")
+
+	f.mu.Lock()
+	f.closing = true
+	f.mu.Unlock()
+	if _, ok, _ := q.DequeueWithAckId(); ok {
+		t.Fatal("claimed on a closing file")
+	}
+	if _, err := f.sweep(nil, false, false); !errors.Is(err, errClosed) {
+		t.Fatalf("sweep on a closing file: %v", err)
+	}
+	f.mu.Lock()
+	f.closing = false
+	f.mu.Unlock()
+
+	if _, ok, _ := q.DequeueWithAckId(); !ok {
+		t.Fatal("no claim after the file recovered")
+	}
+}
+
+// A hand-back that fails changes nothing: the rows return one timeout later.
+func TestHandBackErrors(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		harm   string
+		tables []string
+	}{
+		{name: "table", tables: []string{`"nope"`}},
+		{name: "clock", harm: brokenClock},
+		{name: "owner row", harm: "DROP TABLE __sqliteq_owners"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			q, err := fastStore(t, t.TempDir(), defaultHeartbeat).NewQueue("q")
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim1(t, q)
+			if c.harm != "" {
+				mustExec(t, q.f.db, c.harm)
+			}
+			q.f.handBack(append([]string{q.table}, c.tables...))
+			if status, owner := rowOf(t, q.f.db); status != "processing" || owner.String != q.f.owner {
+				t.Fatalf("row is %s, owner %q; want processing under this owner", status, owner.String)
+			}
+		})
+	}
+}
+
+// A first open whose sweep fails gives no handle and leaves the loop's list
+// as it was; the next open works.
+func TestOpenSweepError(t *testing.T) {
+	qs := fastStore(t, filepath.Join(t.TempDir(), "one.db"), defaultHeartbeat, WithSingleFile())
+	q, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, q.f.db, brokenClock)
+	if _, err := qs.NewQueue("r"); err == nil {
+		t.Fatal("opened a queue whose first sweep failed")
+	}
+	if n := len(*q.f.swept.Load()); n != 1 {
+		t.Fatalf("loop lists %d queues, want 1", n)
+	}
+	mustExec(t, q.f.db, "DROP TRIGGER nope")
+	if _, err := qs.NewQueue("r"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(*q.f.swept.Load()); n != 2 {
+		t.Fatalf("loop lists %d queues, want 2", n)
+	}
+}
+
+// lockedBuf is a log sink the test reads while the loop writes.
+type lockedBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// The loop logs a sweep that fails and tries again at the next tick.
+func TestSweepLoopLogsError(t *testing.T) {
+	var buf lockedBuf
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	q, err := fastStore(t, t.TempDir(), 60*time.Millisecond).NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, q.f.db, brokenClock)
+	eventually(t, "the failed sweep is logged", func() bool { return strings.Contains(buf.String(), "sqliteq: sweep of") })
+
+	mustExec(t, q.f.db, "DROP TRIGGER nope")
+	claim1(t, q)
+	other := otherProcess(t, q)
+	kill(q.f)
+	eventually(t, "the loop sweeps again", func() bool {
+		status, _ := rowOf(t, other.f.db)
+		return status == "pending"
+	})
+}
+
+// wake calls no hook on a paused or a closed queue.
+func TestWakeSkipsPausedAndClosed(t *testing.T) {
+	q, err := fastStore(t, t.TempDir(), defaultHeartbeat).NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var woke atomic.Int32
+	q.OnPauseChange(func(paused bool) {
+		if !paused {
+			woke.Add(1)
+		}
+	})
+	q.wake()
+	if woke.Load() != 1 {
+		t.Fatalf("woke %d times, want 1", woke.Load())
+	}
+	if err := q.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	q.wake()
+	if err := q.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	n := woke.Load() // Resume may call the hook itself
+	q.Close()
+	q.wake()
+	if woke.Load() != n || n > 2 {
+		t.Fatalf("woke %d times after pause and close, was %d", woke.Load(), n)
 	}
 }
