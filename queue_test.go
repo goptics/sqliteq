@@ -2343,6 +2343,43 @@ func TestPopPastMarks(t *testing.T) {
 	}
 }
 
+// A finish uses the job ID its claim read, and drops it; without one (a
+// restart, another object) it reads the row: the outcome is the same.
+func TestFinishJobIDCache(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		q, qs := openQueue(t, WithRemoveOnComplete(!keep))
+		for _, cached := range []bool{true, false} {
+			id := fmt.Sprintf("k%v-c%v", keep, cached)
+			q.Enqueue(job(id))
+			q.Enqueue([]byte("plain"))
+			_, ack := pop(t, q)
+			_, plainAck := pop(t, q)
+			if !cached {
+				q.jobIDs.Clear()
+			}
+			ch := watch(q, id)
+			if !q.Reject(ack, "boom") || !q.Acknowledge(plainAck) {
+				t.Fatalf("%s: Expected both finishes to succeed", id)
+			}
+			if o := waitOutcome(t, ch); o.State != contract.JobFailed || o.Error != "boom" {
+				t.Errorf("%s: Expected failed with boom, got %+v", id, o)
+			}
+			if q.Reject(ack, "again") {
+				t.Errorf("%s: Expected a re-finish to fail", id)
+			}
+			n := 0
+			q.jobIDs.Range(func(any, any) bool { n++; return true })
+			if n != 0 {
+				t.Errorf("%s: Expected no cached ids after the finishes, got %d", id, n)
+			}
+		}
+		if s := stats(t, q); s.Totals.Failed != 2 || s.Totals.Completed != 2 {
+			t.Errorf("keep %v: Expected totals 2 failed 2 completed, got %+v", keep, s.Totals)
+		}
+		qs.Close()
+	}
+}
+
 // Completed, failed and cancelled pages sort by finish, not by add.
 func TestJobsNewestFinishFirst(t *testing.T) {
 	q, qs := openQueue(t, WithRemoveOnComplete(false))

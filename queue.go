@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,6 +48,14 @@ type Queue struct {
 	// claimFast and popFast also select nothing while a live cancel mark
 	// exists; idle reads the pause row and whether a row is pending
 	claimFast, popFast, idle *sql.Stmt
+	// finKnown is fin without RETURNING, for a row whose job ID is known
+	finKnown *sql.Stmt
+
+	// jobIDs: row id -> job ID ("" none) of rows this object claimed, read
+	// off the lock at claim; a finish takes its entry and skips the
+	// payload. Row ids are never reused and a row's data and job_id never
+	// change, so an entry stays true; a miss reads the row as before.
+	jobIDs sync.Map
 }
 
 // claimed is one row a claim moved to processing
@@ -249,10 +258,11 @@ func (q *Queue) prepare() (err error) {
 		q.table, q.meta, q.cancelled, q.order)
 
 	// fin ends a processing row: deleted, or kept with its end as status
-	fin := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
+	finKnown := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing'", q.table)
 	if !q.removeOnComplete {
-		fin = fmt.Sprintf("UPDATE %s SET status = ?, ack = 1, updated_at = ? WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
+		finKnown = fmt.Sprintf("UPDATE %s SET status = ?, ack = 1, updated_at = ? WHERE id = ? AND status = 'processing'", q.table)
 	}
+	fin := finKnown + " RETURNING job_id, data"
 
 	for _, s := range []struct {
 		stmt  **sql.Stmt
@@ -267,6 +277,7 @@ func (q *Queue) prepare() (err error) {
 		{&q.popFast, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pendingFast)},
 		{&q.idle, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at'), EXISTS (SELECT 1 FROM %s WHERE status = 'pending')", q.meta, q.table)},
 		{&q.fin, fin},
+		{&q.finKnown, finKnown},
 		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
 		{&q.unmark, fmt.Sprintf("DELETE FROM %s WHERE job_id = ?", q.cancelled)},
 		{&q.isMarked, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE job_id = ? AND expires_at > ?)", q.cancelled)},
@@ -287,7 +298,7 @@ func (q *Queue) prepare() (err error) {
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
 	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.isMarked, q.pausedAt, q.tally,
-		q.claimFast, q.popFast, q.idle} {
+		q.claimFast, q.popFast, q.idle, q.finKnown} {
 		if s != nil {
 			s.Close()
 		}
@@ -505,6 +516,9 @@ func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
 		return nil, false, refused, err
 	}
 
+	for _, c := range out {
+		q.jobIDs.Store(c.id, jobIDOf(c.once, c.data))
+	}
 	// RETURNING order is unspecified
 	slices.SortFunc(out, func(a, b claimed) int {
 		if c := cmp.Compare(a.priority, b.priority); c != 0 {
@@ -563,7 +577,7 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 				out = append(out, c)
 				continue
 			}
-			if _, err := q.end(tx, c.id, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
+			if _, err := q.end(tx, c.id, id, true, contract.JobCancelled, "cancelled", nil, now); err != nil {
 				return nil, false, false, err
 			}
 			drops++
@@ -794,8 +808,11 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 
 // finishTx is finish in the caller's tx, with the row id parsed.
 func (q *Queue) finishTx(tx *sql.Tx, id int64, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
+	// Taken even if tx rolls back: a retry then reads the row
+	jobID, known := q.jobIDs.LoadAndDelete(id)
+	jid, _ := jobID.(string)
 	// No row is an outcome, not an error: it must not fail the round
-	if ok, err := q.end(tx, id, "", state, reason, result, now); !ok || err != nil {
+	if ok, err := q.end(tx, id, jid, known, state, reason, result, now); !ok || err != nil {
 		return ok, err
 	}
 	// Totals: cancelled counts as failed (spec 6.14)
@@ -809,26 +826,32 @@ func (q *Queue) finishTx(tx *sql.Tx, id int64, state contract.JobState, reason s
 
 // end finishes processing row id with state, in tx: the row is deleted or
 // kept with state as status, and a job with a Job ID gets its outcome
-// record. jobID is the row's, when the caller knows it. Reports whether
-// the row was processing.
-func (q *Queue) end(tx *sql.Tx, id int64, jobID string, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
-	var row *sql.Row
-	if q.removeOnComplete {
-		row = tx.Stmt(q.fin).QueryRow(id)
+// record. known: jobID is the row's ("" none), so the row is not read
+// back. Reports whether the row was processing.
+func (q *Queue) end(tx *sql.Tx, id int64, jobID string, known bool, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
+	args := []any{id}
+	if !q.removeOnComplete {
+		args = []any{string(state), now.UTC(), id}
+	}
+	if known {
+		res, err := tx.Stmt(q.finKnown).Exec(args...)
+		if err != nil {
+			return false, err
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return false, err
+		}
 	} else {
-		row = tx.Stmt(q.fin).QueryRow(string(state), now.UTC(), id)
-	}
-	var (
-		once sql.NullString
-		data []byte
-	)
-	switch err := row.Scan(&once, &data); {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, err
-	}
-	if jobID == "" {
+		var (
+			once sql.NullString
+			data []byte
+		)
+		switch err := tx.Stmt(q.fin).QueryRow(args...).Scan(&once, &data); {
+		case errors.Is(err, sql.ErrNoRows):
+			return false, nil
+		case err != nil:
+			return false, err
+		}
 		jobID = jobIDOf(once, data)
 	}
 	if jobID == "" {
@@ -954,6 +977,7 @@ func (q *Queue) purge(ws *WorkflowStore) (tags []wfItemTag) {
 	if tx.Commit() != nil {
 		return nil
 	}
+	q.jobIDs.Clear() // claimed rows are gone
 	return tags
 }
 
@@ -985,6 +1009,7 @@ func (q *Queue) workflowTags(tx *sql.Tx) ([]wfItemTag, error) {
 func (q *Queue) Close() error {
 	q.closed.Store(true)
 	q.w.close()
+	q.jobIDs.Clear()
 
 	return nil
 }
