@@ -53,7 +53,7 @@ type Queue struct {
 	// drops meta row 'marked' once no cancel mark is live; byIDs reads the
 	// outcome records of a JSON array of job IDs
 	insert, claim, pop, fin, count, values, putJob, isMarked, pausedAt, tally lazyStmt
-	popFast, idle, unflag, byIDs                                              lazyStmt
+	popFast, idle, unflag, byIDs, readdJobs, readdMarks                       lazyStmt
 
 	// jobIDs: row id -> job ID ("" none) of rows this object claimed, read
 	// off the lock at claim; a finish takes its entry and skips the
@@ -339,6 +339,8 @@ func (q *Queue) prepare() (err error) {
 		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
 		{&q.pausedAt, fmt.Sprintf("SELECT value FROM %s WHERE key = 'paused_at'", q.meta)},
 		{&q.tally, fmt.Sprintf("UPDATE %s SET value = value + 1 WHERE key = ?", q.meta)},
+		{&q.readdJobs, fmt.Sprintf("DELETE FROM %s WHERE job_id = ?", q.jobs)},
+		{&q.readdMarks, fmt.Sprintf("DELETE FROM %s WHERE job_id = ?", q.cancelled)},
 		{&q.byIDs, fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (SELECT value FROM json_each(?))", q.jobs)},
 	} {
 		*l.stmt = lazyStmt{db: q.f.db, query: l.query}
@@ -369,7 +371,7 @@ func (q *Queue) closeStmts() {
 		}
 	}
 	for _, l := range []*lazyStmt{&q.insert, &q.claim, &q.pop, &q.fin, &q.count, &q.values, &q.putJob, &q.isMarked, &q.pausedAt, &q.tally,
-		&q.popFast, &q.idle, &q.unflag, &q.byIDs} {
+		&q.popFast, &q.idle, &q.unflag, &q.byIDs, &q.readdJobs, &q.readdMarks} {
 		l.close()
 	}
 }
@@ -502,16 +504,31 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 	}
 
 	now := time.Now().UTC()
+	if id != "" {
+		return q.f.b.do(func(tx *sql.Tx) (ok bool, err error) {
+			// Row and readd commit together: alone in its round, in a tx
+			if tx == nil {
+				if tx, err = q.f.db.Begin(); err != nil {
+					return false, err
+				}
+				defer func() {
+					if err == nil {
+						err = tx.Commit()
+					} else {
+						tx.Rollback()
+					}
+					ok = ok && err == nil
+				}()
+			}
+			_, err = q.insertOnce(tx, data, now, priority, id)
+			// A repeat id changes no row and is no error: it succeeds
+			return err == nil, err
+		})
+	}
 	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
 		insert := q.insertPlain
 		if tx != nil {
 			insert = tx.Stmt(insert)
-		}
-		if id != "" {
-			var err error
-			if insert, err = q.insert.in(tx); err != nil {
-				return false, err
-			}
 		}
 		// One statement, so a round of one, run without a transaction, is atomic
 		var err error
@@ -520,9 +537,40 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 		} else {
 			_, err = insert.Exec(data, now, now, jobID)
 		}
-		// A repeat id changes no row and is no error: it succeeds
 		return err == nil, err
 	})
+}
+
+// insertOnce adds a pending row under id in tx unless one has it; stored
+// reports that it did, and then the id's outcome record and cancel mark
+// are gone (spec 6.13, 6.14 Re-add).
+func (q *Queue) insertOnce(tx *sql.Tx, data any, now time.Time, priority int, id string) (stored bool, err error) {
+	insert, err := q.insert.in(tx)
+	if err != nil {
+		return false, err
+	}
+	var res sql.Result
+	if q.priority {
+		res, err = insert.Exec(data, now, now, id, priority)
+	} else {
+		res, err = insert.Exec(data, now, now, id)
+	}
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return false, err
+	}
+	for _, l := range []*lazyStmt{&q.readdJobs, &q.readdMarks} {
+		del, err := l.in(tx)
+		if err != nil {
+			return false, err
+		}
+		if _, err := del.Exec(id); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // errJobIDTaken: the job ID belongs to a row that is not the same workflow task.
@@ -532,21 +580,8 @@ var errJobIDTaken = errors.New("sqliteq: job id is held by another job")
 // mutex: one pending row under id. A repeat is fine only when the stored row
 // is the same workflow item (same wf, task and undo); else errJobIDTaken.
 func (q *Queue) enqueueTx(tx *sql.Tx, item []byte, priority int, id string) error {
-	now := time.Now().UTC()
-	insert, err := q.insert.in(tx)
-	if err != nil {
-		return err
-	}
-	var res sql.Result
-	if q.priority {
-		res, err = insert.Exec(item, now, now, id, priority)
-	} else {
-		res, err = insert.Exec(item, now, now, id)
-	}
-	if err != nil {
-		return err
-	}
-	if n, err := res.RowsAffected(); err != nil || n > 0 {
+	stored, err := q.insertOnce(tx, item, time.Now().UTC(), priority, id)
+	if err != nil || stored {
 		return err
 	}
 	var data []byte

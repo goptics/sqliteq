@@ -117,8 +117,8 @@ func TestTotalsPriorityRepeat(t *testing.T) {
 	}
 }
 
-// No trigger on the queue table: one slows every add, claim and ack under
-// many connections (v0.3.0 had none); the readd one is needed.
+// No trigger on the queue table: one compiles into every add (v0.3.0 had
+// none); an add that stores an id clears its record and mark itself.
 func TestQueueTableTriggers(t *testing.T) {
 	q, qs := openQueue(t)
 	defer qs.Close()
@@ -133,7 +133,32 @@ func TestQueueTableTriggers(t *testing.T) {
 		rows.Scan(&n)
 		names = append(names, n)
 	}
-	if !slices.Equal(names, []string{q.name + readdSuffix}) {
+	if len(names) != 0 {
 		t.Errorf("got triggers %v", names)
+	}
+}
+
+// The readd trigger an earlier build left is dropped on open; a re-add
+// still clears the id's record.
+func TestEarlierReaddTriggerDropped(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	if _, err := q.f.db.Exec(fmt.Sprintf(`CREATE TRIGGER %s AFTER INSERT ON %s WHEN NEW.job_id IS NOT NULL BEGIN
+		DELETE FROM %s WHERE job_id = NEW.job_id; END`, quoteIdent(q.name+readdSuffix), q.table, q.jobs)); err != nil {
+		t.Fatal(err)
+	}
+	o := otherProcess(t, q)
+	var n int
+	if err := o.f.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?", q.name).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("Expected no trigger after open, got %d %v", n, err)
+	}
+	o.EnqueueOnce(job("a"), "a")
+	_, ack := pop(t, o)
+	if !o.Acknowledge(ack) {
+		t.Fatal("ack failed")
+	}
+	o.EnqueueOnce(job("a"), "a")
+	if err := o.f.db.QueryRow("SELECT COUNT(*) FROM " + o.jobs + " WHERE job_id = 'a'").Scan(&n); err != nil || n != 0 {
+		t.Errorf("Expected the re-add to drop the record, got %d %v", n, err)
 	}
 }
