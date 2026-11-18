@@ -58,12 +58,10 @@ const (
 	readdSuffix     = "__sqliteq_readd"
 )
 
-// initSidecars creates the outcome and cancel tables. An add that stores
-// an id clears both for it (spec 6.13 and 6.14 Re-add) in its own
-// transaction (readd); earlier builds did it by a trigger on the queue
-// table, dropped here: a trigger compiles into every insert of the table,
-// plain ones too, and pins lookaside slots there. The caller holds the
-// write mutex.
+// initSidecars creates the outcome and cancel tables, and the trigger that
+// clears both for an id EnqueueOnce stores (spec 6.13 and 6.14 Re-add): an
+// ON CONFLICT DO NOTHING insert of a repeat id fires no trigger. The caller
+// holds the write mutex.
 func (q *Queue) initSidecars() error {
 	for _, s := range []string{
 		// AUTOINCREMENT: seq never reuses a deleted row's, so a seq > last
@@ -86,7 +84,10 @@ func (q *Queue) initSidecars() error {
 			expires_at INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS %[6]s ON %[3]s (expires_at)`,
-		`DROP TRIGGER IF EXISTS %[5]s`,
+		`CREATE TRIGGER IF NOT EXISTS %[5]s AFTER INSERT ON %[1]s WHEN NEW.job_id IS NOT NULL BEGIN
+			DELETE FROM %[2]s WHERE job_id = NEW.job_id;
+			DELETE FROM %[3]s WHERE job_id = NEW.job_id;
+		END`,
 		// A record drops its job's cancel mark in its own statement (REPLACE
 		// fires it too); a build that also deletes the mark itself is harmless
 		`CREATE TRIGGER IF NOT EXISTS %[8]s AFTER INSERT ON %[2]s BEGIN
