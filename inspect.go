@@ -131,8 +131,8 @@ func (q *Queue) QueueID() string {
 // snapshot). Counts: rows per status, cancelled under failed. Totals:
 // adds stored and jobs finished (cancelled ones as failed; a waiting job
 // dropped for a cancel or popped by Dequeue is neither) since the last
-// Purge, derived as initMeta says; an older table starts from the rows it
-// held. Paused is the file's, not the cache.
+// Purge, derived from the table's AUTOINCREMENT high mark and counters of
+// the rare paths; an older table starts from the rows it held. Paused is the file's, not the cache.
 // ponytail: counts scan the table; index status if kept rows grow large.
 func (q *Queue) QueueStats(ctx context.Context) (contract.QueueStats, error) {
 	if q.closed.Load() {

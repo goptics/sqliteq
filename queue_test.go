@@ -1423,7 +1423,7 @@ func TestVarmqRemoteResultAndCancel(t *testing.T) {
 	defer w.Stop()
 
 	p := varmq.NewResultQueue[int, int](q)
-	waiting, ok := p.Add(7) // no worker yet
+	waiting, ok := p.Add(7, varmq.WithJobId("waiting")) // no worker yet
 	if !ok {
 		t.Fatal("Add failed")
 	}
@@ -1434,7 +1434,7 @@ func TestVarmqRemoteResultAndCancel(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	j, _ := p.Add(21)
+	j, _ := p.Add(21, varmq.WithJobId("j21"))
 	if err := j.WaitContext(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1448,7 +1448,7 @@ func TestVarmqRemoteResultAndCancel(t *testing.T) {
 		t.Errorf("waiting job: got %v, want ErrJobCancelled", err)
 	}
 
-	running, _ := p.Add(-1)
+	running, _ := p.Add(-1, varmq.WithJobId("running"))
 	select {
 	case <-started:
 	case <-ctx.Done():
