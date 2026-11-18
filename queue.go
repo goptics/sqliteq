@@ -57,7 +57,54 @@ type Queue struct {
 	// off the lock at claim; a finish takes its entry and skips the
 	// payload. Row ids are never reused and a row's data and job_id never
 	// change, so an entry stays true; a miss reads the row as before.
-	jobIDs sync.Map
+	jobIDs idCache
+}
+
+// idCache is a mutex map: a sync.Map boxed key and value, 3 allocs a row.
+type idCache struct {
+	mu sync.Mutex
+	m  map[int64]string
+}
+
+// put stores the job IDs of claimed rows.
+func (c *idCache) put(rows []claimed) {
+	ids := make([]string, len(rows)) // parsed off the lock
+	for i, r := range rows {
+		ids[i] = jobIDOf(r.once, r.data)
+	}
+	c.mu.Lock()
+	if c.m == nil {
+		c.m = make(map[int64]string)
+	}
+	for i, r := range rows {
+		c.m[r.id] = ids[i]
+	}
+	c.mu.Unlock()
+}
+
+// take removes and returns row id's entry.
+func (c *idCache) take(id int64) (jobID string, ok bool) {
+	c.mu.Lock()
+	jobID, ok = c.m[id]
+	if ok {
+		delete(c.m, id)
+	}
+	c.mu.Unlock()
+	return jobID, ok
+}
+
+// clear drops every entry.
+func (c *idCache) clear() {
+	c.mu.Lock()
+	c.m = nil
+	c.mu.Unlock()
+}
+
+// len counts the entries.
+func (c *idCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.m)
 }
 
 // claimed is one row a claim moved to processing
@@ -520,9 +567,7 @@ func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
 		return nil, false, refused, err
 	}
 
-	for _, c := range out {
-		q.jobIDs.Store(c.id, jobIDOf(c.once, c.data))
-	}
+	q.jobIDs.put(out)
 	// RETURNING order is unspecified
 	slices.SortFunc(out, func(a, b claimed) int {
 		if c := cmp.Compare(a.priority, b.priority); c != 0 {
@@ -797,8 +842,7 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 
 	now := time.Now()
 	// Taken before the round: a retry of the op reuses it
-	jobID, known := q.jobIDs.LoadAndDelete(id)
-	jid, _ := jobID.(string)
+	jid, known := q.jobIDs.take(id)
 	return q.f.b.do(func(tx *sql.Tx) (ok bool, err error) {
 		// A completed job with no Job ID is one statement: alone in its
 		// round it runs as one autocommit, no tx
@@ -825,8 +869,7 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 // finishTx is finish in the caller's tx, with the row id parsed.
 func (q *Queue) finishTx(tx *sql.Tx, id int64, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
 	// Taken even if tx rolls back: a retry then reads the row
-	jobID, known := q.jobIDs.LoadAndDelete(id)
-	jid, _ := jobID.(string)
+	jid, known := q.jobIDs.take(id)
 	return q.finishKnown(tx, id, jid, known, state, reason, result, now)
 }
 
@@ -1021,7 +1064,7 @@ func (q *Queue) purge(ws *WorkflowStore) (tags []wfItemTag) {
 	if tx.Commit() != nil {
 		return nil
 	}
-	q.jobIDs.Clear() // claimed rows are gone
+	q.jobIDs.clear() // claimed rows are gone
 	return tags
 }
 
@@ -1053,7 +1096,7 @@ func (q *Queue) workflowTags(tx *sql.Tx) ([]wfItemTag, error) {
 func (q *Queue) Close() error {
 	q.closed.Store(true)
 	q.w.close()
-	q.jobIDs.Clear()
+	q.jobIDs.clear()
 
 	return nil
 }

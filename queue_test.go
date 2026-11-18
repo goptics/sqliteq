@@ -2424,7 +2424,7 @@ func TestFinishJobIDCache(t *testing.T) {
 			_, ack := pop(t, q)
 			_, plainAck := pop(t, q)
 			if !cached {
-				q.jobIDs.Clear()
+				q.jobIDs.clear()
 			}
 			ch := watch(q, id)
 			if !q.Reject(ack, "boom") || !q.Acknowledge(plainAck) {
@@ -2436,9 +2436,7 @@ func TestFinishJobIDCache(t *testing.T) {
 			if q.Reject(ack, "again") {
 				t.Errorf("%s: Expected a re-finish to fail", id)
 			}
-			n := 0
-			q.jobIDs.Range(func(any, any) bool { n++; return true })
-			if n != 0 {
+			if n := q.jobIDs.len(); n != 0 {
 				t.Errorf("%s: Expected no cached ids after the finishes, got %d", id, n)
 			}
 		}
