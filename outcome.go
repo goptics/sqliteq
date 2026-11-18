@@ -155,7 +155,11 @@ func (q *Queue) record(tx *sql.Tx, id string, state contract.JobState, reason st
 	if state != contract.JobCompleted {
 		errText = reason
 	}
-	if _, err := tx.Stmt(q.putJob).Exec(id, string(state), errText, result, now.UnixMilli()); err != nil {
+	putJob, err := q.putJob.in(tx)
+	if err != nil {
+		return err
+	}
+	if _, err := putJob.Exec(id, string(state), errText, result, now.UnixMilli()); err != nil {
 		return err
 	}
 	// The first record of a queue object trims too: a short-lived process
@@ -531,7 +535,11 @@ func (q *Queue) queryIDs(ids []string) (*sql.Rows, error) {
 		if err != nil {
 			return nil, err
 		}
-		return q.byIDs.Query(string(list))
+		byIDs, err := q.byIDs.get()
+		if err != nil {
+			return nil, err
+		}
+		return byIDs.Query(string(list))
 	}
 	args := make([]any, len(ids))
 	for i, id := range ids {

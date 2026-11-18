@@ -42,22 +42,18 @@ type Queue struct {
 	pz              pauseState   // Paused cache and OnPauseChange hooks
 	records         atomic.Int64 // outcome records written, for trims
 
-	// Prepared once per handle; they close with the file's pool
-	insert, claim, pop, fin, count, countCapped, values *sql.Stmt
-	putJob, isMarked, pausedAt, tally                   *sql.Stmt
-	// claimFast and popFast also select nothing while meta row 'marked'
-	// exists (a cancel mark may be live); idle reads the pause row and
-	// whether a row is pending
-	claimFast, popFast, idle *sql.Stmt
-	// finKnown is fin without RETURNING, for a row whose job ID is known
-	finKnown *sql.Stmt
-	// unflag drops meta row 'marked' once no cancel mark is live
-	unflag *sql.Stmt
-	// insertPlain is insert for a row with no id: v0.3.0's statement, no
-	// lookup of the job_id index
-	insertPlain *sql.Stmt
-	// byIDs reads the outcome records of a JSON array of job IDs
-	byIDs *sql.Stmt
+	// The plain path's statements, prepared once per handle; they close
+	// with the file's pool. claimFast also selects nothing while meta row
+	// 'marked' exists (a cancel mark may be live); finKnown is fin without
+	// RETURNING, for a row whose job ID is known; insertPlain is insert for
+	// a row with no id: v0.3.0's statement, no lookup of the job_id index
+	insertPlain, claimFast, finKnown, countCapped *sql.Stmt
+	// The rest, prepared on first use (lazyStmt). popFast is claimFast's
+	// pop; idle reads the pause row and whether a row is pending; unflag
+	// drops meta row 'marked' once no cancel mark is live; byIDs reads the
+	// outcome records of a JSON array of job IDs
+	insert, claim, pop, fin, count, values, putJob, isMarked, pausedAt, tally lazyStmt
+	popFast, idle, unflag, byIDs                                              lazyStmt
 
 	// jobIDs: row id -> job ID ("" none) of rows this object claimed, read
 	// off the lock at claim; a finish takes its entry and skips the
@@ -158,7 +154,7 @@ func newQueue(f *file, name string, priority bool, opts ...Option) (*Queue, erro
 		return nil, fmt.Errorf("failed to prepare statements: %w", err)
 	}
 	// A pause kept in the file holds this object from its first pop
-	if paused, err := readPaused(q.pausedAt); err != nil {
+	if paused, err := q.readPaused(nil); err != nil {
 		q.closeStmts()
 		return nil, fmt.Errorf("failed to read pause: %w", err)
 	} else if paused {
@@ -322,8 +318,8 @@ func (q *Queue) prepare() (err error) {
 	}
 	fin := finKnown + " RETURNING job_id, data"
 
-	for _, s := range []struct {
-		stmt  **sql.Stmt
+	for _, l := range []struct {
+		stmt  *lazyStmt
 		query string
 	}{
 		// A repeat id makes no row, so no AUTOINCREMENT step: the high
@@ -332,23 +328,30 @@ func (q *Queue) prepare() (err error) {
 		// any other failure still errors; it must repeat the index's WHERE
 		{&q.insert, fmt.Sprintf("INSERT INTO %[1]s (%[2]s) SELECT %[3]s WHERE NOT EXISTS (SELECT 1 FROM %[1]s WHERE job_id = ?4) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
 		{&q.unflag, fmt.Sprintf("DELETE FROM %s WHERE key = 'marked' AND NOT EXISTS (SELECT 1 FROM %s WHERE expires_at > ?)", q.meta, q.cancelled)},
-		// A NULL job_id never conflicts: a plain add steps the mark once
-		{&q.insertPlain, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", q.table, cols, vals)},
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
 		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
-		{&q.claimFast, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pendingFast, returning)},
 		{&q.popFast, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pendingFast)},
 		{&q.idle, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at'), EXISTS (SELECT 1 FROM %s WHERE status = 'pending')", q.meta, q.table)},
 		{&q.fin, fin},
-		{&q.finKnown, finKnown},
 		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
 		{&q.isMarked, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE job_id = ? AND expires_at > ?)", q.cancelled)},
 		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
-		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
 		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
 		{&q.pausedAt, fmt.Sprintf("SELECT value FROM %s WHERE key = 'paused_at'", q.meta)},
 		{&q.tally, fmt.Sprintf("UPDATE %s SET value = value + 1 WHERE key = ?", q.meta)},
 		{&q.byIDs, fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (SELECT value FROM json_each(?))", q.jobs)},
+	} {
+		*l.stmt = lazyStmt{db: q.f.db, query: l.query}
+	}
+	for _, s := range []struct {
+		stmt  **sql.Stmt
+		query string
+	}{
+		// A NULL job_id never conflicts: a plain add steps the mark once
+		{&q.insertPlain, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", q.table, cols, vals)},
+		{&q.claimFast, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pendingFast, returning)},
+		{&q.finKnown, finKnown},
+		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
 	} {
 		if *s.stmt, err = q.f.db.Prepare(s.query); err != nil {
 			return err
@@ -360,11 +363,14 @@ func (q *Queue) prepare() (err error) {
 
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
-	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.isMarked, q.pausedAt, q.tally,
-		q.claimFast, q.popFast, q.idle, q.finKnown, q.byIDs, q.insertPlain, q.unflag} {
+	for _, s := range []*sql.Stmt{q.insertPlain, q.claimFast, q.finKnown, q.countCapped} {
 		if s != nil {
 			s.Close()
 		}
+	}
+	for _, l := range []*lazyStmt{&q.insert, &q.claim, &q.pop, &q.fin, &q.count, &q.values, &q.putJob, &q.isMarked, &q.pausedAt, &q.tally,
+		&q.popFast, &q.idle, &q.unflag, &q.byIDs} {
+		l.close()
 	}
 }
 
@@ -497,12 +503,15 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 
 	now := time.Now().UTC()
 	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
-		insert := q.insert
-		if id == "" {
-			insert = q.insertPlain
-		}
+		insert := q.insertPlain
 		if tx != nil {
 			insert = tx.Stmt(insert)
+		}
+		if id != "" {
+			var err error
+			if insert, err = q.insert.in(tx); err != nil {
+				return false, err
+			}
 		}
 		// One statement, so a round of one, run without a transaction, is atomic
 		var err error
@@ -524,9 +533,11 @@ var errJobIDTaken = errors.New("sqliteq: job id is held by another job")
 // is the same workflow item (same wf, task and undo); else errJobIDTaken.
 func (q *Queue) enqueueTx(tx *sql.Tx, item []byte, priority int, id string) error {
 	now := time.Now().UTC()
-	insert := tx.Stmt(q.insert)
+	insert, err := q.insert.in(tx)
+	if err != nil {
+		return err
+	}
 	var res sql.Result
-	var err error
 	if q.priority {
 		res, err = insert.Exec(item, now, now, id, priority)
 	} else {
@@ -620,7 +631,14 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 	}
 	defer tx.Rollback()
 
-	claim, isMarked := tx.Stmt(q.claim), tx.Stmt(q.isMarked)
+	claim, err := q.claim.in(tx)
+	if err != nil {
+		return nil, false, false, err
+	}
+	isMarked, err := q.isMarked.in(tx)
+	if err != nil {
+		return nil, false, false, err
+	}
 	out = make([]claimed, 0, n)
 	drops := 0
 	for len(out) < n && drops < maxDrops {
@@ -658,7 +676,7 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 	}
 	if len(out) == 0 && !capped {
 		// The write lock is held: the row read is the one the claim saw
-		if refused, err = readPaused(tx.Stmt(q.pausedAt)); err != nil {
+		if refused, err = q.readPaused(tx); err != nil {
 			return nil, false, false, err
 		}
 	}
@@ -695,7 +713,11 @@ func (q *Queue) claimRows(claim *sql.Stmt, n int, mark ...any) ([]claimed, error
 // idleState reads, after an empty fast pop, whether the pause row exists
 // and whether any row is pending. The caller holds the write mutex.
 func (q *Queue) idleState() (paused, pending bool, err error) {
-	err = q.idle.QueryRow().Scan(&paused, &pending)
+	idle, err := q.idle.get()
+	if err != nil {
+		return false, false, err
+	}
+	err = idle.QueryRow().Scan(&paused, &pending)
 	return paused, pending, err
 }
 
@@ -744,7 +766,11 @@ func (q *Queue) popFastCounted(now time.Time) ([]byte, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	data, _, err := popRow(tx.Stmt(q.popFast))
+	popFast, err := q.popFast.in(tx)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := popRow(popFast)
 	if err != nil {
 		return nil, err
 	}
@@ -764,11 +790,18 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 		return nil, false, false, err
 	}
 	defer tx.Rollback()
-	pop, isMarked := tx.Stmt(q.pop), tx.Stmt(q.isMarked)
+	pop, err := q.pop.in(tx)
+	if err != nil {
+		return nil, false, false, err
+	}
+	isMarked, err := q.isMarked.in(tx)
+	if err != nil {
+		return nil, false, false, err
+	}
 	for range maxDrops {
 		data, once, err := popRow(pop)
 		if errors.Is(err, sql.ErrNoRows) {
-			if refused, err = readPaused(tx.Stmt(q.pausedAt)); err != nil {
+			if refused, err = q.readPaused(tx); err != nil {
 				return nil, false, false, err
 			}
 			if err := q.unflagTx(tx, now); err != nil {
@@ -804,7 +837,11 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 // unflagTx drops meta row 'marked' when no cancel mark is live, in tx, so
 // fast pops come back once the marks are gone.
 func (q *Queue) unflagTx(tx *sql.Tx, now time.Time) error {
-	_, err := tx.Stmt(q.unflag).Exec(now.UnixMilli())
+	unflag, err := q.unflag.in(tx)
+	if err != nil {
+		return err
+	}
+	_, err = unflag.Exec(now.UnixMilli())
 	return err
 }
 
@@ -944,7 +981,11 @@ func (q *Queue) finishKnown(tx *sql.Tx, id int64, jid string, known bool, state 
 
 // bump adds one to meta counter key, in tx.
 func (q *Queue) bump(tx *sql.Tx, key string) (bool, error) {
-	_, err := tx.Stmt(q.tally).Exec(key)
+	tally, err := q.tally.in(tx)
+	if err != nil {
+		return false, err
+	}
+	_, err = tally.Exec(key)
 	return err == nil, err
 }
 
@@ -986,7 +1027,11 @@ func (q *Queue) end(tx *sql.Tx, id int64, jobID string, known bool, state contra
 			once sql.NullString
 			data []byte
 		)
-		switch err := tx.Stmt(q.fin).QueryRow(args...).Scan(&once, &data); {
+		fin, err := q.fin.in(tx)
+		if err != nil {
+			return false, err
+		}
+		switch err := fin.QueryRow(args...).Scan(&once, &data); {
 		case errors.Is(err, sql.ErrNoRows):
 			return false, nil
 		case err != nil:
@@ -1003,7 +1048,11 @@ func (q *Queue) end(tx *sql.Tx, id int64, jobID string, known bool, state contra
 // Len returns the number of pending items in the queue
 func (q *Queue) Len() int {
 	var count int
-	if err := q.count.QueryRow().Scan(&count); err != nil {
+	stmt, err := q.count.get()
+	if err != nil {
+		return 0
+	}
+	if err := stmt.QueryRow().Scan(&count); err != nil {
 		return 0
 	}
 	return count
@@ -1011,7 +1060,11 @@ func (q *Queue) Len() int {
 
 // Values returns all pending items in the queue, in queue order
 func (q *Queue) Values() []any {
-	rows, err := q.values.Query()
+	stmt, err := q.values.get()
+	if err != nil {
+		return nil
+	}
+	rows, err := stmt.Query()
 	if err != nil {
 		return nil
 	}
