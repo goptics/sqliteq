@@ -246,9 +246,9 @@ func (q *Queue) prepare() (err error) {
 		}
 	}()
 
-	cols, vals, returning := "data, status, ack, created_at, updated_at, job_id", "?, 'pending', 0, ?, ?, ?", "id, data, job_id"
+	cols, vals, returning := "data, status, ack, created_at, updated_at, job_id", "?1, 'pending', 0, ?2, ?3, ?4", "id, data, job_id"
 	if q.priority {
-		cols, vals, returning = cols+", priority", vals+", ?", "id, priority, data, job_id"
+		cols, vals, returning = cols+", priority", vals+", ?5", "id, priority, data, job_id"
 	}
 	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') ORDER BY %s",
 		q.table, q.meta, q.order)
@@ -268,9 +268,11 @@ func (q *Queue) prepare() (err error) {
 		stmt  **sql.Stmt
 		query string
 	}{
-		// The conflict target is the job_id index alone, so a NOT NULL or any
-		// other failure still errors; it must repeat the index's WHERE
-		{&q.insert, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
+		// A repeat id makes no row, so no AUTOINCREMENT step: the high
+		// mark counts stored adds (initMeta). The conflict clause is a
+		// backstop; its target is the job_id index alone, so a NOT NULL or
+		// any other failure still errors; it must repeat the index's WHERE
+		{&q.insert, fmt.Sprintf("INSERT INTO %[1]s (%[2]s) SELECT %[3]s WHERE NOT EXISTS (SELECT 1 FROM %[1]s WHERE job_id = ?4) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
 		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
 		{&q.claimFast, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pendingFast, returning)},
@@ -580,6 +582,10 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 			if _, err := q.end(tx, c.id, id, true, contract.JobCancelled, "cancelled", nil, now); err != nil {
 				return nil, false, false, err
 			}
+			// Neither completed nor failed (a pop's drop counts by trigger)
+			if _, err := q.bump(tx, "other"); err != nil {
+				return nil, false, false, err
+			}
 			drops++
 		}
 	}
@@ -788,7 +794,15 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 	}
 
 	now := time.Now()
+	// Taken before the round: a retry of the op reuses it
+	jobID, known := q.jobIDs.LoadAndDelete(id)
+	jid, _ := jobID.(string)
 	return q.f.b.do(func(tx *sql.Tx) (ok bool, err error) {
+		// A completed job with no Job ID is one statement: alone in its
+		// round it runs as one autocommit, no tx
+		if tx == nil && known && jid == "" && state == contract.JobCompleted {
+			return q.endKnown(nil, id, state, now)
+		}
 		if tx == nil {
 			if tx, err = q.f.db.Begin(); err != nil {
 				return false, err
@@ -802,7 +816,7 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 				ok = ok && err == nil
 			}()
 		}
-		return q.finishTx(tx, id, state, reason, result, now)
+		return q.finishKnown(tx, id, jid, known, state, reason, result, now)
 	})
 }
 
@@ -811,17 +825,48 @@ func (q *Queue) finishTx(tx *sql.Tx, id int64, state contract.JobState, reason s
 	// Taken even if tx rolls back: a retry then reads the row
 	jobID, known := q.jobIDs.LoadAndDelete(id)
 	jid, _ := jobID.(string)
+	return q.finishKnown(tx, id, jid, known, state, reason, result, now)
+}
+
+// finishKnown is finishTx with the cache entry taken (known: jid is the
+// row's job ID).
+func (q *Queue) finishKnown(tx *sql.Tx, id int64, jid string, known bool, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
 	// No row is an outcome, not an error: it must not fail the round
 	if ok, err := q.end(tx, id, jid, known, state, reason, result, now); !ok || err != nil {
 		return ok, err
 	}
-	// Totals: cancelled counts as failed (spec 6.14)
-	total := "failed"
+	// Totals: completed derives from the rows (initMeta); cancelled
+	// counts as failed (spec 6.14)
 	if state == contract.JobCompleted {
-		total = "completed"
+		return true, nil
 	}
-	_, err := tx.Stmt(q.tally).Exec(total)
+	return q.bump(tx, "failed")
+}
+
+// bump adds one to meta counter key, in tx.
+func (q *Queue) bump(tx *sql.Tx, key string) (bool, error) {
+	_, err := tx.Stmt(q.tally).Exec(key)
 	return err == nil, err
+}
+
+// endKnown ends processing row id whose job ID is known to be none, with
+// one statement: in tx, or autocommit with a nil tx. Reports whether the
+// row was processing.
+func (q *Queue) endKnown(tx *sql.Tx, id int64, state contract.JobState, now time.Time) (bool, error) {
+	args := []any{id}
+	if !q.removeOnComplete {
+		args = []any{string(state), now.UTC(), id}
+	}
+	stmt := q.finKnown
+	if tx != nil {
+		stmt = tx.Stmt(stmt)
+	}
+	res, err := stmt.Exec(args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // end finishes processing row id with state, in tx: the row is deleted or
@@ -829,19 +874,15 @@ func (q *Queue) finishTx(tx *sql.Tx, id int64, state contract.JobState, reason s
 // record. known: jobID is the row's ("" none), so the row is not read
 // back. Reports whether the row was processing.
 func (q *Queue) end(tx *sql.Tx, id int64, jobID string, known bool, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
-	args := []any{id}
-	if !q.removeOnComplete {
-		args = []any{string(state), now.UTC(), id}
-	}
 	if known {
-		res, err := tx.Stmt(q.finKnown).Exec(args...)
-		if err != nil {
-			return false, err
-		}
-		if n, err := res.RowsAffected(); err != nil || n == 0 {
+		if ok, err := q.endKnown(tx, id, state, now); !ok || err != nil {
 			return false, err
 		}
 	} else {
+		args := []any{id}
+		if !q.removeOnComplete {
+			args = []any{string(state), now.UTC(), id}
+		}
 		var (
 			once sql.NullString
 			data []byte
@@ -961,7 +1002,8 @@ func (q *Queue) purge(ws *WorkflowStore) (tags []wfItemTag) {
 			return nil
 		}
 	}
-	if _, err := tx.Exec("UPDATE " + q.meta + " SET value = 0 WHERE key <> 'paused_at'"); err != nil {
+	// Totals restart: the high mark is the new base
+	if _, err := tx.Exec(fmt.Sprintf("UPDATE %s SET value = CASE key WHEN 'base' THEN %s ELSE 0 END WHERE key <> 'paused_at'", q.meta, q.highMark()), q.name); err != nil {
 		return nil
 	}
 	if ws != nil && ws.single {
