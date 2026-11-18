@@ -2301,6 +2301,48 @@ func TestResumeBetweenPopAndRead(t *testing.T) {
 	}
 }
 
+// A live mark on another id sends the pop to the gated path, which still
+// hands out the unmarked job; a mark another process clears between the
+// fast pop and its read does too.
+func TestPopPastMarks(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	other := otherProcess(t, q)
+	t.Cleanup(func() { afterEmptyPop = func() {} })
+	if err := q.CancelJob("elsewhere"); err != nil {
+		t.Fatal(err)
+	}
+	q.Enqueue(job("a"))
+	q.Enqueue(job("b"))
+	if v, ok := q.Dequeue(); !ok || string(v.([]byte)) != string(job("a")) {
+		t.Fatalf("Dequeue: Expected a past the mark, got %v %v", v, ok)
+	}
+	if v, _ := pop(t, q); v != string(job("b")) {
+		t.Fatalf("claim: Expected b past the mark, got %s", v)
+	}
+	if n, left, err := q.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2)); n != 0 || left != 0 || err != nil {
+		t.Fatalf("Expected an empty pop, got %d %d %v", n, left, err)
+	}
+
+	// The mark of c stops the fast pop; the re-add clears it
+	if err := q.CancelJob("c"); err != nil {
+		t.Fatal(err)
+	}
+	q.Enqueue(job("d"))
+	afterEmptyPop = func() {
+		afterEmptyPop = func() {}
+		if !other.EnqueueOnce(job("c"), "c") {
+			t.Error("EnqueueOnce failed")
+		}
+	}
+	if v, _ := pop(t, q); v != string(job("d")) {
+		t.Fatalf("Expected d, got %s", v)
+	}
+	if v, _ := pop(t, q); v != string(job("c")) {
+		t.Fatalf("Expected the re-added c, got %s", v)
+	}
+}
+
 // Completed, failed and cancelled pages sort by finish, not by add.
 func TestJobsNewestFinishFirst(t *testing.T) {
 	q, qs := openQueue(t, WithRemoveOnComplete(false))

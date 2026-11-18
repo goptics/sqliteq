@@ -43,7 +43,10 @@ type Queue struct {
 
 	// Prepared once per handle; they close with the file's pool
 	insert, claim, pop, fin, count, countCapped, values *sql.Stmt
-	putJob, unmark, hasMark, isMarked, pausedAt, tally  *sql.Stmt
+	putJob, unmark, isMarked, pausedAt, tally           *sql.Stmt
+	// claimFast and popFast also select nothing while a live cancel mark
+	// exists; idle reads the pause row and whether a row is pending
+	claimFast, popFast, idle *sql.Stmt
 }
 
 // claimed is one row a claim moved to processing
@@ -240,6 +243,10 @@ func (q *Queue) prepare() (err error) {
 	}
 	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') ORDER BY %s",
 		q.table, q.meta, q.order)
+	// One statement for a pop on a file without marks: both checks are
+	// uncorrelated, run once per statement
+	pendingFast := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') AND NOT EXISTS (SELECT 1 FROM %s WHERE expires_at > ?) ORDER BY %s",
+		q.table, q.meta, q.cancelled, q.order)
 
 	// fin ends a processing row: deleted, or kept with its end as status
 	fin := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
@@ -256,10 +263,12 @@ func (q *Queue) prepare() (err error) {
 		{&q.insert, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
 		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
+		{&q.claimFast, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pendingFast, returning)},
+		{&q.popFast, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pendingFast)},
+		{&q.idle, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at'), EXISTS (SELECT 1 FROM %s WHERE status = 'pending')", q.meta, q.table)},
 		{&q.fin, fin},
 		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
 		{&q.unmark, fmt.Sprintf("DELETE FROM %s WHERE job_id = ?", q.cancelled)},
-		{&q.hasMark, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE expires_at > ?)", q.cancelled)},
 		{&q.isMarked, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE job_id = ? AND expires_at > ?)", q.cancelled)},
 		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
 		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
@@ -277,7 +286,8 @@ func (q *Queue) prepare() (err error) {
 
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
-	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.hasMark, q.isMarked, q.pausedAt, q.tally} {
+	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.isMarked, q.pausedAt, q.tally,
+		q.claimFast, q.popFast, q.idle} {
 		if s != nil {
 			s.Close()
 		}
@@ -505,27 +515,24 @@ func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
 	return out, capped, false, nil
 }
 
-// claimGated claims up to n rows; with a live cancel mark on the file it
-// runs in one transaction that drops each marked row it claims (outcome
-// cancelled) and claims again, at most maxDrops drops; capped reports that
-// it stopped there. An empty claim reads the pause row: refused when it is
-// set. Outside a tx a Resume from another process can land between the two,
-// so an empty claim found unpaused claims once more. The caller holds the
-// write mutex.
-// ponytail: a second Pause and Resume, both in the window again, still make
-// one empty pop look like a failure.
+// claimGated claims up to n rows. The fast claim is one statement that
+// claims nothing while the pause row or a live cancel mark exists. When it
+// is empty, one read tells why: paused is refused, nothing pending is
+// empty. Else a mark is live, or another process lifted a pause or mark
+// in between: one transaction claims, drops each marked row it claims
+// (outcome cancelled) and claims again, at most maxDrops drops; capped
+// reports that it stopped there. Every check is in SQL, so a Pause or
+// CancelJob from any process holds. The caller holds the write mutex.
+// ponytail: a Pause and Resume, both between the fast claim and its read,
+// still make one empty pop look like a failure.
 func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err error) {
 	now := time.Now()
-	if !q.anyMark(now) {
-		for try := range 2 {
-			if out, err = q.claimRows(q.claim, n); err != nil || len(out) > 0 {
-				return out, false, false, err
-			}
-			afterEmptyPop()
-			if refused, err = readPaused(q.pausedAt); err != nil || refused || try == 1 {
-				return nil, false, refused, err
-			}
-		}
+	if out, err = q.claimRows(q.claimFast, n, now.UnixMilli()); err != nil || len(out) > 0 {
+		return out, false, false, err
+	}
+	afterEmptyPop()
+	if paused, pending, err := q.idleState(); err != nil || paused || !pending {
+		return nil, false, paused, err
 	}
 
 	tx, err := q.f.db.Begin()
@@ -572,10 +579,11 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 	return out, capped, refused, tx.Commit()
 }
 
-// claimRows runs a claim statement and reads every row it returns; the
-// caller holds the write mutex
-func (q *Queue) claimRows(claim *sql.Stmt, n int) ([]claimed, error) {
-	rows, err := claim.Query(time.Now().UTC(), n)
+// claimRows runs a claim statement and reads every row it returns; mark
+// is the live-mark time a fast claim takes. The caller holds the write
+// mutex
+func (q *Queue) claimRows(claim *sql.Stmt, n int, mark ...any) ([]claimed, error) {
+	rows, err := claim.Query(append(append([]any{time.Now().UTC()}, mark...), n)...)
 	if err != nil {
 		return nil, err
 	}
@@ -598,6 +606,13 @@ func (q *Queue) claimRows(claim *sql.Stmt, n int) ([]claimed, error) {
 	return out, rows.Err()
 }
 
+// idleState reads, after an empty fast pop, whether the pause row exists
+// and whether any row is pending. The caller holds the write mutex.
+func (q *Queue) idleState() (paused, pending bool, err error) {
+	err = q.idle.QueryRow().Scan(&paused, &pending)
+	return paused, pending, err
+}
+
 // Dequeue removes and returns the next item from the queue
 // Returns the item and a boolean indicating if the operation was successful
 func (q *Queue) Dequeue() (any, bool) {
@@ -615,22 +630,17 @@ func (q *Queue) Dequeue() (any, bool) {
 	return data, ok
 }
 
-// dequeue is Dequeue under the write mutex; an empty pop reads the pause
-// row, refused when it is set, and pops once more when it is not (see
-// claimGated).
+// dequeue is Dequeue under the write mutex: a fast pop, and when it is
+// empty the same read and fallback as claimGated.
 func (q *Queue) dequeue() (data []byte, ok, refused bool) {
 	now := time.Now()
-	if !q.anyMark(now) {
-		for try := range 2 {
-			data, _, err := popRow(q.pop)
-			if !errors.Is(err, sql.ErrNoRows) {
-				return data, err == nil, false
-			}
-			afterEmptyPop()
-			if refused, err = readPaused(q.pausedAt); err != nil || refused || try == 1 {
-				return nil, false, refused
-			}
-		}
+	data, _, err := popRow(q.popFast, now.UnixMilli())
+	if !errors.Is(err, sql.ErrNoRows) {
+		return data, err == nil, false
+	}
+	afterEmptyPop()
+	if paused, pending, err := q.idleState(); err != nil || paused || !pending {
+		return nil, false, paused
 	}
 	for {
 		data, capped, refused, err := q.popGated(now)
@@ -677,10 +687,10 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 	return nil, true, false, tx.Commit()
 }
 
-// popRow runs a pop statement: the deleted row's data and job_id, or
-// sql.ErrNoRows on an empty queue
-func popRow(pop *sql.Stmt) (data []byte, once sql.NullString, err error) {
-	err = pop.QueryRow().Scan(&data, &once)
+// popRow runs a pop statement, with args: the deleted row's data and
+// job_id, or sql.ErrNoRows on an empty queue
+func popRow(pop *sql.Stmt, args ...any) (data []byte, once sql.NullString, err error) {
+	err = pop.QueryRow(args...).Scan(&data, &once)
 	return data, once, err
 }
 

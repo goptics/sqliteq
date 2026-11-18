@@ -171,16 +171,6 @@ func (q *Queue) pollCancels(seq int64) {
 	}
 }
 
-// anyMark reports whether a live mark exists, so a pop without marks pays
-// one read; an error counts as a mark (the gated pop then reports it).
-func (q *Queue) anyMark(now time.Time) bool {
-	var n int
-	if err := q.hasMark.QueryRow(now.UnixMilli()).Scan(&n); err != nil {
-		return true
-	}
-	return n == 1
-}
-
 // marked reports whether job id has a live mark; isMarked is q.isMarked
 // in the caller's tx.
 func marked(isMarked *sql.Stmt, id string, now time.Time) (bool, error) {
