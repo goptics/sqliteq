@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/goptics/varmq/contract"
 )
@@ -493,12 +496,7 @@ func (q *Queue) readPending() {
 	for len(ids) > 0 {
 		chunk := ids[:min(len(ids), pollBatch)]
 		ids = ids[len(chunk):]
-		// One prepared statement for any count: the ids go as a JSON array
-		list, err := json.Marshal(chunk)
-		var rows *sql.Rows
-		if err == nil {
-			rows, err = q.byIDs.Query(string(list))
-		}
+		rows, err := q.queryIDs(chunk)
 		var outs []contract.JobOutcome
 		if err == nil {
 			outs, _ = q.scanOutcomes(rows, nil)
@@ -519,6 +517,25 @@ func (q *Queue) readPending() {
 			q.deliver(out, gen)
 		}
 	}
+}
+
+// queryIDs reads the outcome records of ids. One prepared statement for
+// any count, the ids as a JSON array; an id JSON would not round-trip
+// (bad UTF-8, NUL) takes an IN list built for the call.
+func (q *Queue) queryIDs(ids []string) (*sql.Rows, error) {
+	if !slices.ContainsFunc(ids, func(id string) bool { return !utf8.ValidString(id) || strings.IndexByte(id, 0) >= 0 }) {
+		list, err := json.Marshal(ids)
+		if err != nil {
+			return nil, err
+		}
+		return q.byIDs.Query(string(list))
+	}
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return q.f.db.Query(fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (%s)",
+		q.jobs, strings.Repeat("?, ", len(ids)-1)+"?"), args...)
 }
 
 // deliver ends the watches of out.ID started up to gen: each fn runs once,
