@@ -2,6 +2,7 @@ package sqliteq
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/goptics/varmq/contract"
@@ -92,5 +93,26 @@ func TestTotalsFromEarlierMeta(t *testing.T) {
 	q.f.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?", q.name+"__sqliteq_submitted").Scan(&n)
 	if n != 0 {
 		t.Error("Expected the earlier per-add trigger to be dropped")
+	}
+}
+
+// A priority queue's repeat id is no add either; its priority stays.
+func TestTotalsPriorityRepeat(t *testing.T) {
+	qs := mustNew(t, t.TempDir())
+	defer qs.Close()
+	pq, err := qs.NewPriorityQueue("pq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pq.EnqueueOnce(job("a"), 5, "a") || !pq.EnqueueOnce(job("a"), 1, "a") || !pq.Enqueue(job("b"), 3) {
+		t.Fatal("enqueue failed")
+	}
+	if got := ids(jobs(t, pq.Queue, contract.JobPending, 0, 10)); !slices.Equal(got, []string{"b", "a"}) {
+		t.Errorf("pending: got %q", got)
+	}
+	_, ack := pop(t, pq.Queue)
+	pq.Acknowledge(ack)
+	if got, want := stats(t, pq.Queue).Totals, (contract.JobTotals{Submitted: 2, Completed: 1}); got != want {
+		t.Errorf("got %+v, want %+v", got, want)
 	}
 }
