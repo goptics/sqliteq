@@ -85,10 +85,16 @@ func (q *Queue) initSidecars() error {
 			DELETE FROM %[2]s WHERE job_id = NEW.job_id;
 			DELETE FROM %[3]s WHERE job_id = NEW.job_id;
 		END`,
+		// A record drops its job's cancel mark in its own statement (REPLACE
+		// fires it too); a build that also deletes the mark itself is harmless
+		`CREATE TRIGGER IF NOT EXISTS %[8]s AFTER INSERT ON %[2]s BEGIN
+			DELETE FROM %[3]s WHERE job_id = NEW.job_id;
+		END`,
 	} {
 		query := fmt.Sprintf(s, q.table, q.jobs, q.cancelled,
 			quoteIdent(q.name+jobsSuffix+"_finished"), quoteIdent(q.name+readdSuffix),
-			quoteIdent(q.name+cancelledSuffix+"_expires"), quoteIdent(q.name+jobsSuffix+"_group"))
+			quoteIdent(q.name+cancelledSuffix+"_expires"), quoteIdent(q.name+jobsSuffix+"_group"),
+			quoteIdent(q.name+"__sqliteq_unmark"))
 		if _, err := q.f.db.Exec(query); err != nil {
 			return err
 		}
@@ -139,17 +145,14 @@ func jobIDOf(onceID sql.NullString, data []byte) string {
 	return env.ID
 }
 
-// record writes job id's outcome and drops its cancel mark, in tx; every
-// trimEvery-th record also trims both states.
+// record writes job id's outcome, in tx; the unmark trigger drops its
+// cancel mark. Every trimEvery-th record also trims both states.
 func (q *Queue) record(tx *sql.Tx, id string, state contract.JobState, reason string, result []byte, now time.Time) error {
 	var errText any
 	if state != contract.JobCompleted {
 		errText = reason
 	}
 	if _, err := tx.Stmt(q.putJob).Exec(id, string(state), errText, result, now.UnixMilli()); err != nil {
-		return err
-	}
-	if _, err := tx.Stmt(q.unmark).Exec(id); err != nil {
 		return err
 	}
 	// The first record of a queue object trims too: a short-lived process

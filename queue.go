@@ -44,7 +44,7 @@ type Queue struct {
 
 	// Prepared once per handle; they close with the file's pool
 	insert, claim, pop, fin, count, countCapped, values *sql.Stmt
-	putJob, unmark, isMarked, pausedAt, tally           *sql.Stmt
+	putJob, isMarked, pausedAt, tally                   *sql.Stmt
 	// claimFast and popFast also select nothing while a live cancel mark
 	// exists; idle reads the pause row and whether a row is pending
 	claimFast, popFast, idle *sql.Stmt
@@ -283,7 +283,6 @@ func (q *Queue) prepare() (err error) {
 		{&q.fin, fin},
 		{&q.finKnown, finKnown},
 		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
-		{&q.unmark, fmt.Sprintf("DELETE FROM %s WHERE job_id = ?", q.cancelled)},
 		{&q.isMarked, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE job_id = ? AND expires_at > ?)", q.cancelled)},
 		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
 		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
@@ -302,7 +301,7 @@ func (q *Queue) prepare() (err error) {
 
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
-	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.isMarked, q.pausedAt, q.tally,
+	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.isMarked, q.pausedAt, q.tally,
 		q.claimFast, q.popFast, q.idle, q.finKnown, q.byIDs} {
 		if s != nil {
 			s.Close()
