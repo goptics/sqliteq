@@ -116,3 +116,24 @@ func TestTotalsPriorityRepeat(t *testing.T) {
 		t.Errorf("got %+v, want %+v", got, want)
 	}
 }
+
+// No trigger on the queue table: one slows every add, claim and ack under
+// many connections (v0.3.0 had none); the readd one is needed.
+func TestQueueTableTriggers(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	rows, err := q.f.db.Query("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?", q.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		rows.Scan(&n)
+		names = append(names, n)
+	}
+	if !slices.Equal(names, []string{q.name + readdSuffix}) {
+		t.Errorf("got triggers %v", names)
+	}
+}

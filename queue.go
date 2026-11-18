@@ -50,6 +50,9 @@ type Queue struct {
 	claimFast, popFast, idle *sql.Stmt
 	// finKnown is fin without RETURNING, for a row whose job ID is known
 	finKnown *sql.Stmt
+	// insertPlain is insert for a row with no id: v0.3.0's statement, no
+	// lookup of the job_id index
+	insertPlain *sql.Stmt
 	// byIDs reads the outcome records of a JSON array of job IDs
 	byIDs *sql.Stmt
 
@@ -322,6 +325,8 @@ func (q *Queue) prepare() (err error) {
 		// backstop; its target is the job_id index alone, so a NOT NULL or
 		// any other failure still errors; it must repeat the index's WHERE
 		{&q.insert, fmt.Sprintf("INSERT INTO %[1]s (%[2]s) SELECT %[3]s WHERE NOT EXISTS (SELECT 1 FROM %[1]s WHERE job_id = ?4) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
+		// A NULL job_id never conflicts: a plain add steps the mark once
+		{&q.insertPlain, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", q.table, cols, vals)},
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
 		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
 		{&q.claimFast, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pendingFast, returning)},
@@ -349,7 +354,7 @@ func (q *Queue) prepare() (err error) {
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
 	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.isMarked, q.pausedAt, q.tally,
-		q.claimFast, q.popFast, q.idle, q.finKnown, q.byIDs} {
+		q.claimFast, q.popFast, q.idle, q.finKnown, q.byIDs, q.insertPlain} {
 		if s != nil {
 			s.Close()
 		}
@@ -486,6 +491,9 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 	now := time.Now().UTC()
 	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
 		insert := q.insert
+		if id == "" {
+			insert = q.insertPlain
+		}
 		if tx != nil {
 			insert = tx.Stmt(insert)
 		}
@@ -629,7 +637,7 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 			if _, err := q.end(tx, c.id, id, true, contract.JobCancelled, "cancelled", nil, now); err != nil {
 				return nil, false, false, err
 			}
-			// Neither completed nor failed (a pop's drop counts by trigger)
+			// Neither completed nor failed
 			if _, err := q.bump(tx, "other"); err != nil {
 				return nil, false, false, err
 			}
@@ -701,7 +709,7 @@ func (q *Queue) Dequeue() (any, bool) {
 // empty the same read and fallback as claimGated.
 func (q *Queue) dequeue() (data []byte, ok, refused bool) {
 	now := time.Now()
-	data, _, err := popRow(q.popFast, now.UnixMilli())
+	data, err := q.popFastCounted(now)
 	if !errors.Is(err, sql.ErrNoRows) {
 		return data, err == nil, false
 	}
@@ -715,6 +723,24 @@ func (q *Queue) dequeue() (data []byte, ok, refused bool) {
 			return data, err == nil && data != nil, refused
 		}
 	}
+}
+
+// popFastCounted is the fast pop and its count as other (no finish), in
+// one transaction. The caller holds the write mutex.
+func (q *Queue) popFastCounted(now time.Time) ([]byte, error) {
+	tx, err := q.f.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	data, _, err := popRow(tx.Stmt(q.popFast), now.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := q.bump(tx, "other"); err != nil {
+		return nil, err
+	}
+	return data, tx.Commit()
 }
 
 // popGated pops in one transaction, dropping each marked item it pops
@@ -737,6 +763,10 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 			return nil, false, refused, tx.Commit() // keep the drops
 		}
 		if err != nil {
+			return nil, false, false, err
+		}
+		// Popped, kept or dropped: no finish counts it
+		if _, err := q.bump(tx, "other"); err != nil {
 			return nil, false, false, err
 		}
 		id := jobIDOf(once, data)

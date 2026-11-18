@@ -34,7 +34,7 @@ const metaSuffix = "__sqliteq_meta"
 //     EnqueueOnce bumps the mark without a row, so it bumps base too
 //   - failed: Reject and cancel finishes
 //   - other: rows gone without a finish (a Dequeue pop, a cancel drop),
-//     counted by the popped trigger or the drop itself
+//     counted by the pop or drop itself
 //   - completed = submitted - pending - processing - failed - other
 //
 // An older table starts from the rows it holds; a meta of an earlier
@@ -87,11 +87,11 @@ func (q *Queue) initMeta() error {
 		}
 	}
 	for _, s := range []string{
-		// The earlier build's per-add counter
+		// The earlier build's per-add counter, and a pop counter trigger of
+		// an earlier build of this one: any trigger on the queue table
+		// slows every write of it, so pops count in their own transaction
 		`DROP TRIGGER IF EXISTS %[3]s`,
-		`CREATE TRIGGER IF NOT EXISTS %[4]s AFTER DELETE ON %[1]s WHEN OLD.status = 'pending' BEGIN
-			UPDATE %[2]s SET value = value + 1 WHERE key = 'other';
-		END`,
+		`DROP TRIGGER IF EXISTS %[4]s`,
 	} {
 		if _, err := tx.Exec(fmt.Sprintf(s, q.table, q.meta, quoteIdent(q.name+"__sqliteq_submitted"), quoteIdent(q.name+"__sqliteq_popped"))); err != nil {
 			return err
