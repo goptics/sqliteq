@@ -209,6 +209,11 @@ type watchers struct {
 	lastSeq int64  // newest cancel mark seq a poll has read
 	outSeq  int64  // newest outcome record seq a poll has read
 	gen     uint64 // watches started; a read reaches only watches started before it
+	// pending are the ids a by-id read must cover: a WatchOutcome's (its
+	// record may predate the cursor), or one a cursor read skipped for a
+	// watch newer than it. The poll reads them all in one query.
+	pending map[string]struct{}
+	wake    chan struct{} // a pending id waits: poll reads now, not at its tick
 	polling bool
 	closed  bool
 	stop    chan struct{} // closed by close
@@ -216,9 +221,25 @@ type watchers struct {
 
 // startLocked starts the poll goroutine if none runs; w.mu is held.
 func (w *watchers) startLocked(q *Queue) {
+	if w.wake == nil {
+		w.wake = make(chan struct{}, 1)
+	}
 	if !w.polling {
 		w.polling = true
 		go q.poll()
+	}
+}
+
+// pendLocked queues id for the next by-id read and wakes the poll; w.mu is
+// held, and the poll was started.
+func (w *watchers) pendLocked(id string) {
+	if w.pending == nil {
+		w.pending = map[string]struct{}{}
+	}
+	w.pending[id] = struct{}{}
+	select {
+	case w.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -236,15 +257,16 @@ func (w *watchers) close() {
 			o.done.Store(true)
 		}
 	}
-	w.byID, w.hooks = nil, nil
+	w.byID, w.hooks, w.pending = nil, nil, nil
 }
 
 // WatchOutcome implements contract.OutcomeWatcher: fn runs once, on its own
 // goroutine, when job id completes, fails or is cancelled through any
 // queue object on this database file, in this process or another. A job
-// whose record is still kept is reported even if it ended before the call.
-// It is polled every pollEvery. An empty id, or a closed queue, watches
-// nothing. Close drops watches without calling fn.
+// whose record is still kept is reported even if it ended before the call
+// (the poll's next by-id read, woken at once). New records are polled every
+// pollEvery. An empty id, or a closed queue, watches nothing. Close drops
+// watches without calling fn.
 func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel func()) {
 	o := &outcomeWatch{fn: fn}
 	w := &q.w
@@ -255,7 +277,7 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 	}
 	if len(w.byID) == 0 {
 		// No poll moved the cursor while nothing was watched: start it at
-		// the newest record. Older ones are this watch's catchUp below.
+		// the newest record. Older ones are this watch's by-id read.
 		w.mu.Unlock()
 		var last sql.NullInt64
 		err := q.f.db.QueryRow(fmt.Sprintf("SELECT MAX(seq) FROM %s", q.jobs)).Scan(&last)
@@ -268,8 +290,6 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 			w.outSeq = last.Int64
 		}
 	}
-	w.gen++
-	o.gen = w.gen
 	if w.byID == nil {
 		w.byID = map[string]map[*outcomeWatch]struct{}{}
 	}
@@ -278,9 +298,10 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 	}
 	w.byID[id][o] = struct{}{}
 	w.startLocked(q)
+	w.gen++
+	o.gen = w.gen
+	w.pendLocked(id)
 	w.mu.Unlock()
-
-	go q.catchUp([]string{id}, o.gen)
 
 	return func() {
 		if o.done.CompareAndSwap(false, true) {
@@ -298,17 +319,21 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 
 // poll reads new outcome records, cancel marks and, while the cache says
 // paused, the pause row every pollEvery, and sweeps every sweepEvery,
-// until Close or until nothing is watched and the cache says running.
+// until Close or until nothing is watched and the cache says running. A
+// wake does the pending by-id read alone.
 func (q *Queue) poll() {
 	t := time.NewTicker(pollEvery)
 	defer t.Stop()
 	w := &q.w
 	swept := time.Now()
 	for {
+		tick := true
 		select {
 		case <-w.stop:
 			return
 		case <-t.C:
+		case <-w.wake:
+			tick = false
 		}
 
 		w.mu.Lock()
@@ -322,8 +347,13 @@ func (q *Queue) poll() {
 		outSeq, seq, gen := w.outSeq, w.lastSeq, w.gen
 		w.mu.Unlock()
 
+		if !tick {
+			q.readPending()
+			continue
+		}
 		if watching {
 			q.pollOutcomes(outSeq, gen)
+			q.readPending() // ids the cursor skipped, at once
 		}
 		if hooks {
 			q.pollCancels(seq)
@@ -339,41 +369,61 @@ func (q *Queue) poll() {
 }
 
 // pollOutcomes reads the records newer than seq, in pollBatch reads, and
-// delivers the watched ones to watches up to gen.
+// delivers the watched ones to watches up to gen; a newer watch of one is
+// left to readPending (see deliver).
 func (q *Queue) pollOutcomes(seq int64, gen uint64) {
 	for {
-		rows, err := q.f.db.Query(fmt.Sprintf("SELECT seq, job_id FROM %s WHERE seq > ? ORDER BY seq LIMIT %d", q.jobs, pollBatch), seq)
+		rows, err := q.f.db.Query(fmt.Sprintf("SELECT seq, job_id, state, error, result FROM %s WHERE seq > ? ORDER BY seq LIMIT %d", q.jobs, pollBatch), seq)
 		if err != nil {
 			return
 		}
-		var ids []string
-		for rows.Next() {
-			var id string
-			if rows.Scan(&seq, &id) == nil {
-				ids = append(ids, id)
-			}
-		}
-		if rows.Close() != nil || rows.Err() != nil || len(ids) == 0 {
+		outs, n := q.scanOutcomes(rows, &seq)
+		if rows.Err() != nil || n == 0 {
 			return // read again from the old seq
 		}
 
 		w := &q.w
 		w.mu.Lock()
 		w.outSeq = max(w.outSeq, seq)
-		watched := ids[:0]
-		for _, id := range ids {
-			if w.byID[id] != nil {
-				watched = append(watched, id)
+		watched := outs[:0]
+		for _, out := range outs {
+			if w.byID[out.ID] != nil {
+				watched = append(watched, out)
 			}
 		}
 		w.mu.Unlock()
-		if len(watched) > 0 {
-			q.catchUp(watched, gen)
+		for _, out := range watched {
+			q.deliver(out, gen)
 		}
-		if len(ids) < pollBatch {
+		if n < pollBatch {
 			return
 		}
 	}
+}
+
+// scanOutcomes reads rows of (seq?, job_id, state, error, result) and
+// closes them; seq, if not nil, gets the last seq. n counts rows read.
+func (q *Queue) scanOutcomes(rows *sql.Rows, seq *int64) (outs []contract.JobOutcome, n int) {
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id, state string
+			errText   sql.NullString
+			result    []byte
+			err       error
+		)
+		if seq != nil {
+			err = rows.Scan(seq, &id, &state, &errText, &result)
+		} else {
+			err = rows.Scan(&id, &state, &errText, &result)
+		}
+		n++
+		if err != nil {
+			continue
+		}
+		outs = append(outs, contract.JobOutcome{ID: id, State: contract.JobState(state), Error: errText.String, Result: result})
+	}
+	return outs, n
 }
 
 // sweep applies retention and drops expired cancel marks (spec 5, 6.14
@@ -396,42 +446,59 @@ func (q *Queue) sweep() {
 	tx.Commit()
 }
 
-// catchUp delivers the ids whose outcome record exists to their watches
-// up to gen, those started before the read. A failed read is retried by
-// the next poll.
-func (q *Queue) catchUp(ids []string, gen uint64) {
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	rows, err := q.f.db.Query(fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (%s)",
-		q.jobs, strings.Repeat("?, ", len(ids)-1)+"?"), args...)
-	if err != nil {
-		return
-	}
-	var outs []contract.JobOutcome
-	for rows.Next() {
-		var (
-			id, state string
-			errText   sql.NullString
-			result    []byte
-		)
-		if rows.Scan(&id, &state, &errText, &result) != nil {
-			continue
+// readPending reads the records of the pending ids still watched, in
+// pollBatch chunks, and delivers them to the watches started before the
+// read. A failed read keeps its ids pending for the next poll. An id with
+// no record is dropped: its record, when written, is newer than the cursor.
+func (q *Queue) readPending() {
+	w := &q.w
+	w.mu.Lock()
+	ids := make([]string, 0, len(w.pending))
+	for id := range w.pending {
+		if w.byID[id] != nil {
+			ids = append(ids, id)
 		}
-		outs = append(outs, contract.JobOutcome{ID: id, State: contract.JobState(state), Error: errText.String, Result: result})
 	}
-	rows.Close()
+	clear(w.pending)
+	gen := w.gen
+	w.mu.Unlock()
 
-	for _, out := range outs {
-		q.deliver(out, gen)
+	for len(ids) > 0 {
+		chunk := ids[:min(len(ids), pollBatch)]
+		ids = ids[len(chunk):]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := q.f.db.Query(fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (%s)",
+			q.jobs, strings.Repeat("?, ", len(chunk)-1)+"?"), args...)
+		var outs []contract.JobOutcome
+		if err == nil {
+			outs, _ = q.scanOutcomes(rows, nil)
+			err = rows.Err()
+		}
+		if err != nil { // retried at the next tick, not woken: no hot loop
+			w.mu.Lock()
+			if w.pending == nil {
+				w.pending = map[string]struct{}{}
+			}
+			for _, id := range append(chunk, ids...) {
+				w.pending[id] = struct{}{}
+			}
+			w.mu.Unlock()
+			return
+		}
+		for _, out := range outs {
+			q.deliver(out, gen)
+		}
 	}
 }
 
 // deliver ends the watches of out.ID started up to gen: each fn runs once,
 // on its own goroutine, so a slow fn holds up no poll. A watch started
 // after the read stays: the record read may be an earlier run's, which a
-// re-add since deleted (spec 6.13 Re-add).
+// re-add since deleted (spec 6.13 Re-add). Its id goes pending, so a by-id
+// read made after it covers it even once the cursor is past the record.
 func (q *Queue) deliver(out contract.JobOutcome, gen uint64) {
 	w := &q.w
 	w.mu.Lock()
@@ -445,6 +512,8 @@ func (q *Queue) deliver(out contract.JobOutcome, gen uint64) {
 	}
 	if len(set) == 0 {
 		delete(w.byID, out.ID)
+	} else if !w.closed {
+		w.pendLocked(out.ID)
 	}
 	w.mu.Unlock()
 

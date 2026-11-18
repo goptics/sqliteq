@@ -89,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `WatchOutcome` no longer starts a goroutine and query per call: the poll goroutine reads all pending IDs in one query, woken at once. The poll reads each new record once, not twice. A watch started during a poll could be skipped by it for good (its `Wait` hung); now it is read again.
 - Transactions begin `IMMEDIATE`. (#22)
 - Finish (`Acknowledge`, `Reject`) always runs in a transaction. (#22)
 - Pop runs in a transaction while any cancel mark is live. (#22)

@@ -1703,6 +1703,75 @@ func TestDeliverSkipsNewerWatches(t *testing.T) {
 	waitOutcome(t, ch)
 }
 
+// The gen race: a watch started after a poll's snapshot, whose by-id read
+// ran before its record, is skipped by that poll's cursor read, which
+// moves past the record. Its id goes pending, and the next by-id read
+// ends it. No poll goroutine here: the test drives the reads.
+func TestCursorSkipGoesPending(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	w := &q.w
+	w.mu.Lock()
+	gen, seq := w.gen, w.outSeq // the poll's snapshot
+	w.gen++
+	ch := make(chan contract.JobOutcome, 1)
+	w.byID = map[string]map[*outcomeWatch]struct{}{"r": {{fn: func(o contract.JobOutcome) { ch <- o }, gen: w.gen}: {}}}
+	w.mu.Unlock() // its by-id read found nothing yet
+
+	q.Enqueue(job("r"))
+	_, ack := pop(t, q)
+	q.Acknowledge(ack)
+
+	q.pollOutcomes(seq, gen)
+	w.mu.Lock()
+	_, pending := w.pending["r"]
+	moved := w.outSeq > seq
+	w.mu.Unlock()
+	if !pending || !moved {
+		t.Fatalf("pending %v, cursor moved %v", pending, moved)
+	}
+	noOutcome(t, ch)
+	q.readPending()
+	if got := waitOutcome(t, ch); got.State != contract.JobCompleted {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// Many watches of ended jobs share by-id reads, pollBatch ids each.
+func TestWatchEndedMany(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	const n = pollBatch + 200
+	for i := range n {
+		q.Enqueue(job("m" + strconv.Itoa(i)))
+	}
+	items, acks := make([]any, n), make([]string, n)
+	for left := n; left > 0; {
+		k, _, err := q.DequeueBatchWithAckIds(items, acks)
+		if err != nil || k == 0 {
+			t.Fatalf("popped %d, %v", k, err)
+		}
+		for _, a := range acks[:k] {
+			q.Acknowledge(a)
+		}
+		left -= k
+	}
+	var fired atomic.Int64
+	done := make(chan struct{})
+	for i := range n {
+		q.WatchOutcome("m"+strconv.Itoa(i), func(contract.JobOutcome) {
+			if fired.Add(1) == n {
+				close(done)
+			}
+		})
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%d of %d fired", fired.Load(), n)
+	}
+}
+
 // Every watch fires when far more jobs end between two polls than
 // retention keeps, and more ids are watched than one read used to take.
 func TestWatchBurst(t *testing.T) {
