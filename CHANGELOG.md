@@ -95,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Totals derive from the table's AUTOINCREMENT high mark and rare-path counters (failed, popped or dropped): no meta write per add or acknowledge. A meta table of an earlier build is converted on open.
 - `Dequeue` pop runs in a transaction, so it counts itself. (#22)
 - No trigger on the queue table: an id add drops the id's record and mark itself; a trigger an earlier build left is dropped on open. An `EnqueueOnce` alone in its commit round runs in a transaction.
-- Fast claim and pop gate on one meta probe, in the `LIMIT`: meta row `marked` (set by `CancelJob`, dropped by a gated pop or the sweep once no mark is live) stands for live marks.
+- Fast claim and pop check the pause row and live marks in the `LIMIT`, not the `WHERE`; the claim's batch size is no bare bound `LIMIT`, which SQLite folds into the plan and re-prepares for each new size.
 - Statements off the plain path (dedupe add, gated claim, pops, outcome, cancel, totals) are prepared on first use, not at open.
 
 ## [0.3.0] - 2026-10-23

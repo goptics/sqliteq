@@ -13,7 +13,7 @@ func TestPlainPathLeavesColdStatementsUnprepared(t *testing.T) {
 		t.Fatal("Expected the plain add, pop and ack to work")
 	}
 	cold := map[string]*lazyStmt{"insert": &q.insert, "claim": &q.claim, "pop": &q.pop, "fin": &q.fin, "values": &q.values,
-		"putJob": &q.putJob, "isMarked": &q.isMarked, "tally": &q.tally, "popFast": &q.popFast, "unflag": &q.unflag, "byIDs": &q.byIDs}
+		"putJob": &q.putJob, "isMarked": &q.isMarked, "tally": &q.tally, "popFast": &q.popFast, "byIDs": &q.byIDs}
 	for name, l := range cold {
 		if l.s.Load() != nil {
 			t.Errorf("Expected %s unprepared on the plain path", name)
