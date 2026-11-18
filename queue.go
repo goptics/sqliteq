@@ -303,13 +303,15 @@ func (q *Queue) prepare() (err error) {
 	}
 	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') ORDER BY %s",
 		q.table, q.meta, q.order)
-	// One statement for a pop on a file without marks: the check is
-	// uncorrelated, run once per statement
-	// Both checks are one search of the meta key index: each probe more
-	// holds lookaside slots through the claim, and a full lookaside sends
-	// every small alloc to malloc under SQLite's global mem mutex
-	pendingFast := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key IN ('paused_at', 'marked')) ORDER BY %s",
-		q.table, q.meta, q.order)
+	// One statement for a pop on a file without marks: the pause row and
+	// meta row 'marked' are one search of the meta key index, in the
+	// LIMIT (0 while either exists), run once per statement. In the WHERE
+	// the same probe made the claim hold more lookaside slots: a full
+	// lookaside sends every small alloc to malloc under SQLite's global
+	// mem mutex (measured: lookaside-full allocs per claim 84 there, 2 in
+	// the LIMIT, 28 for v0.3.0's claim with no probe)
+	pendingFast := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)
+	gate := fmt.Sprintf("CASE WHEN EXISTS (SELECT 1 FROM %s WHERE key IN ('paused_at', 'marked')) THEN 0 ELSE %%s END", q.meta)
 
 	// fin ends a processing row: deleted, or kept with its end as status
 	finKnown := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing'", q.table)
@@ -330,7 +332,7 @@ func (q *Queue) prepare() (err error) {
 		{&q.unflag, fmt.Sprintf("DELETE FROM %s WHERE key = 'marked' AND NOT EXISTS (SELECT 1 FROM %s WHERE expires_at > ?)", q.meta, q.cancelled)},
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
 		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
-		{&q.popFast, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pendingFast)},
+		{&q.popFast, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT %s) RETURNING data, job_id", q.table, pendingFast, fmt.Sprintf(gate, "1"))},
 		{&q.idle, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at'), EXISTS (SELECT 1 FROM %s WHERE status = 'pending')", q.meta, q.table)},
 		{&q.fin, fin},
 		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
@@ -351,7 +353,7 @@ func (q *Queue) prepare() (err error) {
 	}{
 		// A NULL job_id never conflicts: a plain add steps the mark once
 		{&q.insertPlain, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", q.table, cols, vals)},
-		{&q.claimFast, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pendingFast, returning)},
+		{&q.claimFast, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT %s) RETURNING %s", q.table, pendingFast, fmt.Sprintf(gate, "?"), returning)},
 		{&q.finKnown, finKnown},
 		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
 	} {
