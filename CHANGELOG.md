@@ -62,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every pop drops a marked waiting job, outcome `cancelled`, at most 1000 per transaction. (#22)
 - At the drop cap: single-item pop goes on; batch pop reports an item left. (#22)
 - `CancelJob` returns `contract.ErrJobEnded` when the record shows the job ended. (#22)
-- `EnqueueOnce` that stores an id drops its old record and mark (trigger). (#22)
+- `EnqueueOnce` that stores an id drops its old record and mark, in the add's transaction. (#22)
 - `Purge` clears records and marks too. (#22)
 - `Queue.Close` drops watches and hooks. (#22)
 - Queue inspection (`contract.QueueInspector`) on both queues: VarMQ's REST API and vartop list sqliteq queues. (#23)
@@ -94,6 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Finish (`Acknowledge`, `Reject`) runs in a transaction; a completed job with no ID alone in its commit round is one autocommit statement. (#22)
 - Totals derive from the table's AUTOINCREMENT high mark and rare-path counters (failed, popped or dropped): no meta write per add or acknowledge. A meta table of an earlier build is converted on open.
 - `Dequeue` pop runs in a transaction, so it counts itself. (#22)
+- No trigger on the queue table: an id add drops the id's record and mark itself; a trigger an earlier build left is dropped on open. An `EnqueueOnce` alone in its commit round runs in a transaction.
+- Fast claim and pop gate on one meta probe, in the `LIMIT`: meta row `marked` (set by `CancelJob`, dropped by a gated pop or the sweep once no mark is live) stands for live marks.
+- Statements off the plain path (dedupe add, gated claim, pops, outcome, cancel, totals) are prepared on first use, not at open.
 
 ## [0.3.0] - 2026-10-23
 
