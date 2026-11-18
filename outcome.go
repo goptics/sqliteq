@@ -3,6 +3,7 @@ package sqliteq
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -70,7 +71,10 @@ func (q *Queue) initSidecars() error {
 			result BLOB,
 			finished_at INTEGER NOT NULL
 		)`,
-		`CREATE INDEX IF NOT EXISTS %[4]s ON %[2]s (finished_at)`,
+		// Retention index: per state group, by end time. Replaces the
+		// finished_at index of earlier builds (dropped below)
+		`CREATE INDEX IF NOT EXISTS %[7]s ON %[2]s ((state <> 'completed'), finished_at)`,
+		`DROP INDEX IF EXISTS %[4]s`,
 		`CREATE TABLE IF NOT EXISTS %[3]s (
 			seq INTEGER PRIMARY KEY AUTOINCREMENT,
 			job_id TEXT NOT NULL UNIQUE,
@@ -84,7 +88,7 @@ func (q *Queue) initSidecars() error {
 	} {
 		query := fmt.Sprintf(s, q.table, q.jobs, q.cancelled,
 			quoteIdent(q.name+jobsSuffix+"_finished"), quoteIdent(q.name+readdSuffix),
-			quoteIdent(q.name+cancelledSuffix+"_expires"))
+			quoteIdent(q.name+cancelledSuffix+"_expires"), quoteIdent(q.name+jobsSuffix+"_group"))
 		if _, err := q.f.db.Exec(query); err != nil {
 			return err
 		}
@@ -133,22 +137,46 @@ func (q *Queue) record(tx *sql.Tx, id string, state contract.JobState, reason st
 }
 
 // trim applies retention: per state group, records past the age limit and
-// those past the newest N that are older than trimFloor.
+// those past the newest N that are older than trimFloor. Each group is a
+// range of the group index: a group whose oldest record is younger than
+// trimFloor is skipped; the count limit finds the N-th newest record by
+// (finished_at, seq) and deletes what is older, so cost is O(log n + N),
+// never a walk of the whole table.
 func (q *Queue) trim(tx *sql.Tx, now time.Time) error {
+	floor := now.Add(-trimFloor).UnixMilli()
 	for _, g := range []struct {
-		where string
-		keep  int
-		age   time.Duration
+		grp  int // (state <> 'completed'): cancelled records count as failed
+		keep int
+		age  time.Duration
 	}{
-		{"state = 'completed'", keepCompleted, keepCompletedAge},
-		{"state <> 'completed'", keepFailed, keepFailedAge},
+		{0, keepCompleted, keepCompletedAge},
+		{1, keepFailed, keepFailedAge},
 	} {
-		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s AND finished_at <= ?", q.jobs, g.where),
+		// The group expression is written as the index's, or SQLite
+		// does not use it
+		where := fmt.Sprintf("(state <> 'completed') = %d", g.grp)
+		var oldest sql.NullInt64
+		if err := tx.QueryRow(fmt.Sprintf("SELECT MIN(finished_at) FROM %s WHERE %s", q.jobs, where)).Scan(&oldest); err != nil {
+			return err
+		}
+		if !oldest.Valid || oldest.Int64 > floor {
+			continue // ages >= trimFloor: nothing can go
+		}
+		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s AND finished_at <= ?", q.jobs, where),
 			now.Add(-g.age).UnixMilli()); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %[1]s WHERE finished_at <= ? AND job_id IN (SELECT job_id FROM %[1]s WHERE %[2]s ORDER BY finished_at DESC LIMIT -1 OFFSET %[3]d)",
-			q.jobs, g.where, g.keep), now.Add(-trimFloor).UnixMilli()); err != nil {
+		// The keep-th newest; ties on finished_at break by seq
+		var at, seq int64
+		switch err := tx.QueryRow(fmt.Sprintf("SELECT finished_at, seq FROM %s WHERE %s ORDER BY finished_at DESC, seq DESC LIMIT 1 OFFSET %d",
+			q.jobs, where, g.keep-1)).Scan(&at, &seq); {
+		case errors.Is(err, sql.ErrNoRows):
+			continue // keep or fewer
+		case err != nil:
+			return err
+		}
+		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s AND finished_at <= ? AND (finished_at, seq) < (?, ?)", q.jobs, where),
+			min(at, floor), at, seq); err != nil {
 			return err
 		}
 	}

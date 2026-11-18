@@ -1311,6 +1311,96 @@ func TestOutcomeRetention(t *testing.T) {
 	}
 }
 
+// The count limit keeps exactly N per group when records tie on
+// finished_at (ties break by seq: newest kept); failed and cancelled are
+// one group.
+func TestOutcomeRetentionTies(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	now := time.Now()
+	at := now.Add(-2 * trimFloor).UnixMilli()
+	tx, _ := q.f.db.Begin()
+	for i := range keepCompleted + 5 {
+		if _, err := tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES (?, 'completed', ?)", "c"+strconv.Itoa(i), at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range keepFailed + 3 {
+		state := "failed"
+		if i%2 == 1 {
+			state = "cancelled"
+		}
+		if _, err := tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES (?, ?, ?)", "f"+strconv.Itoa(i), state, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.trim(tx, now); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+	var completed, failed int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.jobs + " WHERE state = 'completed'").Scan(&completed)
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.jobs + " WHERE state <> 'completed'").Scan(&failed)
+	if completed != keepCompleted || failed != keepFailed {
+		t.Fatalf("Expected %d completed and %d failed kept, got %d and %d", keepCompleted, keepFailed, completed, failed)
+	}
+	for _, gone := range []string{"c0", "c4", "f0", "f2"} {
+		var n int
+		q.f.db.QueryRow("SELECT COUNT(*) FROM "+q.jobs+" WHERE job_id = ?", gone).Scan(&n)
+		if n != 0 {
+			t.Errorf("Expected the oldest tie %s trimmed", gone)
+		}
+	}
+}
+
+// Trim reads each group by the group index, never by a table scan, and a
+// file from an earlier build loses its finished_at index.
+func TestRetentionIndex(t *testing.T) {
+	dir := t.TempDir()
+	qs := mustNew(t, dir)
+	q, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := quoteIdent(q.name + jobsSuffix + "_finished")
+	if _, err := q.f.db.Exec("CREATE INDEX " + old + " ON " + q.jobs + " (finished_at)"); err != nil {
+		t.Fatal(err)
+	}
+	qs.Close()
+
+	qs = mustNew(t, dir)
+	defer qs.Close()
+	if q, err = qs.NewQueue("q"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?", q.name+jobsSuffix+"_finished").Scan(&n)
+	if n != 0 {
+		t.Error("Expected the old finished_at index dropped")
+	}
+	for _, query := range []string{
+		"SELECT MIN(finished_at) FROM " + q.jobs + " WHERE (state <> 'completed') = 1",
+		"SELECT finished_at, seq FROM " + q.jobs + " WHERE (state <> 'completed') = 0 ORDER BY finished_at DESC, seq DESC LIMIT 1 OFFSET 999",
+		"DELETE FROM " + q.jobs + " WHERE (state <> 'completed') = 0 AND finished_at <= 1 AND (finished_at, seq) < (1, 1)",
+	} {
+		rows, err := q.f.db.Query("EXPLAIN QUERY PLAN " + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			rows.Scan(&id, &parent, &unused, &detail)
+			plan = append(plan, detail)
+		}
+		rows.Close()
+		if p := strings.Join(plan, "; "); !strings.Contains(p, "_group") || strings.Contains(p, "SCAN") {
+			t.Errorf("Expected %q to search the group index, plan: %s", query, p)
+		}
+	}
+}
+
 // varmq end to end: a result job added on one queue object runs on a
 // worker bound to another (another process), and its handle gets the
 // result; Cancel stops a running job and drops a waiting one.
