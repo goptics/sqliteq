@@ -91,7 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `WatchOutcome` no longer starts a goroutine and query per call: the poll goroutine reads all pending IDs in one query, woken at once. The poll reads each new record once, not twice. A watch started during a poll could be skipped by it for good (its `Wait` hung); now it is read again.
 - Transactions begin `IMMEDIATE`. (#22)
-- Finish (`Acknowledge`, `Reject`) always runs in a transaction. (#22)
+- Finish (`Acknowledge`, `Reject`) runs in a transaction; a completed job with no ID alone in its commit round is one autocommit statement. (#22)
+- Totals derive from the table's AUTOINCREMENT high mark and rare-path counters (failed, popped or dropped): no meta write per add or acknowledge. A meta table of an earlier build is converted on open.
 - Pop runs in a transaction while any cancel mark is live. (#22)
 
 ## [0.3.0] - 2026-10-23
