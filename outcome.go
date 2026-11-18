@@ -1,6 +1,7 @@
 package sqliteq
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -96,6 +97,25 @@ func (q *Queue) initSidecars() error {
 	return nil
 }
 
+var noIDPrefix = []byte(`{"id":""`)
+
+// mayBeIDKey reports whether b has a string that encoding/json could
+// match to field "id": one starting i, I, an escape, or UTF-8 lead byte
+// 0xC4 (dotless i and dotted I fold to i). Conservative: false is exact.
+func mayBeIDKey(b []byte) bool {
+	for {
+		i := bytes.IndexByte(b, '"')
+		if i < 0 || i+1 >= len(b) {
+			return false
+		}
+		switch b[i+1] {
+		case 'i', 'I', '\\', 0xC4:
+			return true
+		}
+		b = b[i+1:]
+	}
+}
+
 // jobIDOf is a row's Job ID: its EnqueueOnce id, else the envelope "id" of
 // a JSON object item (varmq's generated ids come with plain Enqueue). ""
 // when it has neither: such a job has no outcome and is never cancelled.
@@ -104,6 +124,11 @@ func jobIDOf(onceID sql.NullString, data []byte) string {
 		return onceID.String
 	}
 	if len(data) == 0 || data[0] != '{' {
+		return ""
+	}
+	// varmq's envelope of a job with no ID: "id" first and empty. A parse
+	// gives "" too (or fails: "") unless a later key folds to "id"
+	if bytes.HasPrefix(data, noIDPrefix) && !mayBeIDKey(data[len(noIDPrefix):]) {
 		return ""
 	}
 	var env struct {
