@@ -50,6 +50,8 @@ type Queue struct {
 	claimFast, popFast, idle *sql.Stmt
 	// finKnown is fin without RETURNING, for a row whose job ID is known
 	finKnown *sql.Stmt
+	// byIDs reads the outcome records of a JSON array of job IDs
+	byIDs *sql.Stmt
 
 	// jobIDs: row id -> job ID ("" none) of rows this object claimed, read
 	// off the lock at claim; a finish takes its entry and skips the
@@ -288,6 +290,7 @@ func (q *Queue) prepare() (err error) {
 		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
 		{&q.pausedAt, fmt.Sprintf("SELECT value FROM %s WHERE key = 'paused_at'", q.meta)},
 		{&q.tally, fmt.Sprintf("UPDATE %s SET value = value + 1 WHERE key = ?", q.meta)},
+		{&q.byIDs, fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (SELECT value FROM json_each(?))", q.jobs)},
 	} {
 		if *s.stmt, err = q.f.db.Prepare(s.query); err != nil {
 			return err
@@ -300,7 +303,7 @@ func (q *Queue) prepare() (err error) {
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
 	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.isMarked, q.pausedAt, q.tally,
-		q.claimFast, q.popFast, q.idle, q.finKnown} {
+		q.claimFast, q.popFast, q.idle, q.finKnown, q.byIDs} {
 		if s != nil {
 			s.Close()
 		}

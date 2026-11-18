@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -491,12 +490,12 @@ func (q *Queue) readPending() {
 	for len(ids) > 0 {
 		chunk := ids[:min(len(ids), pollBatch)]
 		ids = ids[len(chunk):]
-		args := make([]any, len(chunk))
-		for i, id := range chunk {
-			args[i] = id
+		// One prepared statement for any count: the ids go as a JSON array
+		list, err := json.Marshal(chunk)
+		var rows *sql.Rows
+		if err == nil {
+			rows, err = q.byIDs.Query(string(list))
 		}
-		rows, err := q.f.db.Query(fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (%s)",
-			q.jobs, strings.Repeat("?, ", len(chunk)-1)+"?"), args...)
 		var outs []contract.JobOutcome
 		if err == nil {
 			outs, _ = q.scanOutcomes(rows, nil)
