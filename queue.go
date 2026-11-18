@@ -45,11 +45,14 @@ type Queue struct {
 	// Prepared once per handle; they close with the file's pool
 	insert, claim, pop, fin, count, countCapped, values *sql.Stmt
 	putJob, isMarked, pausedAt, tally                   *sql.Stmt
-	// claimFast and popFast also select nothing while a live cancel mark
-	// exists; idle reads the pause row and whether a row is pending
+	// claimFast and popFast also select nothing while meta row 'marked'
+	// exists (a cancel mark may be live); idle reads the pause row and
+	// whether a row is pending
 	claimFast, popFast, idle *sql.Stmt
 	// finKnown is fin without RETURNING, for a row whose job ID is known
 	finKnown *sql.Stmt
+	// unflag drops meta row 'marked' once no cancel mark is live
+	unflag *sql.Stmt
 	// insertPlain is insert for a row with no id: v0.3.0's statement, no
 	// lookup of the job_id index
 	insertPlain *sql.Stmt
@@ -304,10 +307,13 @@ func (q *Queue) prepare() (err error) {
 	}
 	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') ORDER BY %s",
 		q.table, q.meta, q.order)
-	// One statement for a pop on a file without marks: both checks are
+	// One statement for a pop on a file without marks: the check is
 	// uncorrelated, run once per statement
-	pendingFast := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') AND NOT EXISTS (SELECT 1 FROM %s WHERE expires_at > ?) ORDER BY %s",
-		q.table, q.meta, q.cancelled, q.order)
+	// Both checks are one search of the meta key index: each probe more
+	// holds lookaside slots through the claim, and a full lookaside sends
+	// every small alloc to malloc under SQLite's global mem mutex
+	pendingFast := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key IN ('paused_at', 'marked')) ORDER BY %s",
+		q.table, q.meta, q.order)
 
 	// fin ends a processing row: deleted, or kept with its end as status
 	finKnown := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing'", q.table)
@@ -325,6 +331,7 @@ func (q *Queue) prepare() (err error) {
 		// backstop; its target is the job_id index alone, so a NOT NULL or
 		// any other failure still errors; it must repeat the index's WHERE
 		{&q.insert, fmt.Sprintf("INSERT INTO %[1]s (%[2]s) SELECT %[3]s WHERE NOT EXISTS (SELECT 1 FROM %[1]s WHERE job_id = ?4) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
+		{&q.unflag, fmt.Sprintf("DELETE FROM %s WHERE key = 'marked' AND NOT EXISTS (SELECT 1 FROM %s WHERE expires_at > ?)", q.meta, q.cancelled)},
 		// A NULL job_id never conflicts: a plain add steps the mark once
 		{&q.insertPlain, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", q.table, cols, vals)},
 		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
@@ -354,7 +361,7 @@ func (q *Queue) prepare() (err error) {
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
 	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.isMarked, q.pausedAt, q.tally,
-		q.claimFast, q.popFast, q.idle, q.finKnown, q.byIDs, q.insertPlain} {
+		q.claimFast, q.popFast, q.idle, q.finKnown, q.byIDs, q.insertPlain, q.unflag} {
 		if s != nil {
 			s.Close()
 		}
@@ -587,18 +594,19 @@ func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
 }
 
 // claimGated claims up to n rows. The fast claim is one statement that
-// claims nothing while the pause row or a live cancel mark exists. When it
+// claims nothing while the pause row or the 'marked' row exists. When it
 // is empty, one read tells why: paused is refused, nothing pending is
-// empty. Else a mark is live, or another process lifted a pause or mark
-// in between: one transaction claims, drops each marked row it claims
+// empty. Else a mark may be live, or another process lifted a pause in
+// between: one transaction claims, drops each marked row it claims
 // (outcome cancelled) and claims again, at most maxDrops drops; capped
-// reports that it stopped there. Every check is in SQL, so a Pause or
-// CancelJob from any process holds. The caller holds the write mutex.
+// reports that it stopped there; with no live mark left it drops
+// 'marked'. Every check is in SQL, so a Pause or CancelJob from any
+// process holds. The caller holds the write mutex.
 // ponytail: a Pause and Resume, both between the fast claim and its read,
 // still make one empty pop look like a failure.
 func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err error) {
 	now := time.Now()
-	if out, err = q.claimRows(q.claimFast, n, now.UnixMilli()); err != nil || len(out) > 0 {
+	if out, err = q.claimRows(q.claimFast, n); err != nil || len(out) > 0 {
 		return out, false, false, err
 	}
 	afterEmptyPop()
@@ -645,6 +653,9 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 		}
 	}
 	capped = len(out) < n && drops >= maxDrops
+	if err := q.unflagTx(tx, now); err != nil {
+		return nil, false, false, err
+	}
 	if len(out) == 0 && !capped {
 		// The write lock is held: the row read is the one the claim saw
 		if refused, err = readPaused(tx.Stmt(q.pausedAt)); err != nil {
@@ -733,7 +744,7 @@ func (q *Queue) popFastCounted(now time.Time) ([]byte, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	data, _, err := popRow(tx.Stmt(q.popFast), now.UnixMilli())
+	data, _, err := popRow(tx.Stmt(q.popFast))
 	if err != nil {
 		return nil, err
 	}
@@ -760,6 +771,9 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 			if refused, err = readPaused(tx.Stmt(q.pausedAt)); err != nil {
 				return nil, false, false, err
 			}
+			if err := q.unflagTx(tx, now); err != nil {
+				return nil, false, false, err
+			}
 			return nil, false, refused, tx.Commit() // keep the drops
 		}
 		if err != nil {
@@ -775,6 +789,9 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 			return nil, false, false, err
 		}
 		if !drop {
+			if err := q.unflagTx(tx, now); err != nil {
+				return nil, false, false, err
+			}
 			return data, false, false, tx.Commit()
 		}
 		if err := q.record(tx, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
@@ -782,6 +799,13 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 		}
 	}
 	return nil, true, false, tx.Commit()
+}
+
+// unflagTx drops meta row 'marked' when no cancel mark is live, in tx, so
+// fast pops come back once the marks are gone.
+func (q *Queue) unflagTx(tx *sql.Tx, now time.Time) error {
+	_, err := tx.Stmt(q.unflag).Exec(now.UnixMilli())
+	return err
 }
 
 // popRow runs a pop statement, with args: the deleted row's data and
@@ -1076,6 +1100,9 @@ func (q *Queue) purge(ws *WorkflowStore) (tags []wfItemTag) {
 		if _, err := tx.Exec("DELETE FROM " + t); err != nil {
 			return nil
 		}
+	}
+	if _, err := tx.Exec("DELETE FROM " + q.meta + " WHERE key = 'marked'"); err != nil {
+		return nil
 	}
 	// Totals restart: the high mark is the new base
 	if _, err := tx.Exec(fmt.Sprintf("UPDATE %s SET value = CASE key WHEN 'base' THEN %s ELSE 0 END WHERE key <> 'paused_at'", q.meta, q.highMark()), q.name); err != nil {

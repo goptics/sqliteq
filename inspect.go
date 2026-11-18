@@ -86,6 +86,11 @@ func (q *Queue) initMeta() error {
 			return err
 		}
 	}
+	// Marks an earlier build left gate the fast pops too
+	if _, err := tx.Exec(fmt.Sprintf(`INSERT OR IGNORE INTO %s (key, value) SELECT 'marked', 0 WHERE EXISTS
+		(SELECT 1 FROM %s WHERE expires_at > ?)`, q.meta, q.cancelled), time.Now().UnixMilli()); err != nil {
+		return err
+	}
 	for _, s := range []string{
 		// The earlier build's per-add counter, and a pop counter trigger of
 		// an earlier build of this one: any trigger on the queue table

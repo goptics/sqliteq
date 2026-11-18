@@ -473,6 +473,9 @@ func (q *Queue) sweep() {
 	if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE expires_at <= ?", q.cancelled), now.UnixMilli()); err != nil {
 		return
 	}
+	if q.unflagTx(tx, now) != nil {
+		return
+	}
 	tx.Commit()
 }
 

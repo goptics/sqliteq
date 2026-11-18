@@ -79,6 +79,10 @@ func (q *Queue) CancelJob(id string) error {
 		id, now+cancelTTL.Milliseconds()); err != nil {
 		return err
 	}
+	// Fast pops stop until a gated one finds no live mark
+	if _, err := tx.Exec(fmt.Sprintf("INSERT OR IGNORE INTO %s (key, value) VALUES ('marked', 0)", q.meta)); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
