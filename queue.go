@@ -305,9 +305,10 @@ func (q *Queue) prepare() (err error) {
 	// One statement for a pop on a file without marks: the pause row and
 	// a live mark are checked in the LIMIT (0 while either exists), once
 	// per statement. Not "LIMIT ?": SQLite folds a bare bound LIMIT into
-	// the plan (sqlite3ExprIsInteger), so a new batch size expires the
-	// statement and every claim re-prepares it, allocs and all (v0.3.0
-	// too). Not in the WHERE: there each probe made the claim hold more
+	// the plan (sqlite3ExprIsInteger marks it in expmask), so any bind of
+	// it expires the statement; mattn binds each run, so every claim
+	// re-prepared, allocs and all (v0.3.0 too; inferred from the source
+	// and lookaside counts). Not in the WHERE: each probe made the claim hold more
 	// lookaside slots. A full lookaside sends small allocs to malloc under
 	// SQLite's global mem mutex, shared by every file's connections
 	pendingFast := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)

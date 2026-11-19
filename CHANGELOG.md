@@ -94,7 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Finish (`Acknowledge`, `Reject`) runs in a transaction; a completed job with no ID alone in its commit round is one autocommit statement. (#22)
 - Totals derive from the table's AUTOINCREMENT high mark and rare-path counters (failed, popped or dropped): no meta write per add or acknowledge. A meta table of an earlier build is converted on open.
 - `Dequeue` pop runs in a transaction, so it counts itself. (#22)
-- Fast claim and pop check the pause row and live marks in the `LIMIT`, not the `WHERE`; the claim's batch size is no bare bound `LIMIT`, which SQLite folds into the plan and re-prepares for each new size.
+- Fast claim and pop check the pause row and live marks in the `LIMIT`, not the `WHERE`; the claim's batch size is no bare bound `LIMIT`, which SQLite folds into the plan and re-prepares on every bind.
 - Statements off the plain path (dedupe add, gated claim, pops, outcome, cancel, totals) are prepared on first use, not at open.
 
 ## [0.3.0] - 2026-10-23
