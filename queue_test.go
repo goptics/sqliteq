@@ -1311,6 +1311,96 @@ func TestOutcomeRetention(t *testing.T) {
 	}
 }
 
+// The count limit keeps exactly N per group when records tie on
+// finished_at (ties break by seq: newest kept); failed and cancelled are
+// one group.
+func TestOutcomeRetentionTies(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	now := time.Now()
+	at := now.Add(-2 * trimFloor).UnixMilli()
+	tx, _ := q.f.db.Begin()
+	for i := range keepCompleted + 5 {
+		if _, err := tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES (?, 'completed', ?)", "c"+strconv.Itoa(i), at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range keepFailed + 3 {
+		state := "failed"
+		if i%2 == 1 {
+			state = "cancelled"
+		}
+		if _, err := tx.Exec("INSERT INTO "+q.jobs+" (job_id, state, finished_at) VALUES (?, ?, ?)", "f"+strconv.Itoa(i), state, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.trim(tx, now); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+	var completed, failed int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.jobs + " WHERE state = 'completed'").Scan(&completed)
+	q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.jobs + " WHERE state <> 'completed'").Scan(&failed)
+	if completed != keepCompleted || failed != keepFailed {
+		t.Fatalf("Expected %d completed and %d failed kept, got %d and %d", keepCompleted, keepFailed, completed, failed)
+	}
+	for _, gone := range []string{"c0", "c4", "f0", "f2"} {
+		var n int
+		q.f.db.QueryRow("SELECT COUNT(*) FROM "+q.jobs+" WHERE job_id = ?", gone).Scan(&n)
+		if n != 0 {
+			t.Errorf("Expected the oldest tie %s trimmed", gone)
+		}
+	}
+}
+
+// Trim reads each group by the group index, never by a table scan, and a
+// file from an earlier build loses its finished_at index.
+func TestRetentionIndex(t *testing.T) {
+	dir := t.TempDir()
+	qs := mustNew(t, dir)
+	q, err := qs.NewQueue("q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := quoteIdent(q.name + jobsSuffix + "_finished")
+	if _, err := q.f.db.Exec("CREATE INDEX " + old + " ON " + q.jobs + " (finished_at)"); err != nil {
+		t.Fatal(err)
+	}
+	qs.Close()
+
+	qs = mustNew(t, dir)
+	defer qs.Close()
+	if q, err = qs.NewQueue("q"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	q.f.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?", q.name+jobsSuffix+"_finished").Scan(&n)
+	if n != 0 {
+		t.Error("Expected the old finished_at index dropped")
+	}
+	for _, query := range []string{
+		"SELECT MIN(finished_at) FROM " + q.jobs + " WHERE (state <> 'completed') = 1",
+		"SELECT finished_at, seq FROM " + q.jobs + " WHERE (state <> 'completed') = 0 ORDER BY finished_at DESC, seq DESC LIMIT 1 OFFSET 999",
+		"DELETE FROM " + q.jobs + " WHERE (state <> 'completed') = 0 AND finished_at <= 1 AND (finished_at, seq) < (1, 1)",
+	} {
+		rows, err := q.f.db.Query("EXPLAIN QUERY PLAN " + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			rows.Scan(&id, &parent, &unused, &detail)
+			plan = append(plan, detail)
+		}
+		rows.Close()
+		if p := strings.Join(plan, "; "); !strings.Contains(p, "_group") || strings.Contains(p, "SCAN") {
+			t.Errorf("Expected %q to search the group index, plan: %s", query, p)
+		}
+	}
+}
+
 // varmq end to end: a result job added on one queue object runs on a
 // worker bound to another (another process), and its handle gets the
 // result; Cancel stops a running job and drops a waiting one.
@@ -1333,7 +1423,7 @@ func TestVarmqRemoteResultAndCancel(t *testing.T) {
 	defer w.Stop()
 
 	p := varmq.NewResultQueue[int, int](q)
-	waiting, ok := p.Add(7) // no worker yet
+	waiting, ok := p.Add(7, varmq.WithJobId("waiting")) // no worker yet
 	if !ok {
 		t.Fatal("Add failed")
 	}
@@ -1344,7 +1434,7 @@ func TestVarmqRemoteResultAndCancel(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	j, _ := p.Add(21)
+	j, _ := p.Add(21, varmq.WithJobId("j21"))
 	if err := j.WaitContext(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1358,7 +1448,7 @@ func TestVarmqRemoteResultAndCancel(t *testing.T) {
 		t.Errorf("waiting job: got %v, want ErrJobCancelled", err)
 	}
 
-	running, _ := p.Add(-1)
+	running, _ := p.Add(-1, varmq.WithJobId("running"))
 	select {
 	case <-started:
 	case <-ctx.Done():
@@ -1611,6 +1701,75 @@ func TestDeliverSkipsNewerWatches(t *testing.T) {
 	noOutcome(t, ch)
 	q.deliver(contract.JobOutcome{ID: "x", State: contract.JobCompleted}, gen)
 	waitOutcome(t, ch)
+}
+
+// The gen race: a watch started after a poll's snapshot, whose by-id read
+// ran before its record, is skipped by that poll's cursor read, which
+// moves past the record. Its id goes pending, and the next by-id read
+// ends it. No poll goroutine here: the test drives the reads.
+func TestCursorSkipGoesPending(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	w := &q.w
+	w.mu.Lock()
+	gen, seq := w.gen, w.outSeq // the poll's snapshot
+	w.gen++
+	ch := make(chan contract.JobOutcome, 1)
+	w.byID = map[string]map[*outcomeWatch]struct{}{"r": {{fn: func(o contract.JobOutcome) { ch <- o }, gen: w.gen}: {}}}
+	w.mu.Unlock() // its by-id read found nothing yet
+
+	q.Enqueue(job("r"))
+	_, ack := pop(t, q)
+	q.Acknowledge(ack)
+
+	q.pollOutcomes(seq, gen)
+	w.mu.Lock()
+	_, pending := w.pending["r"]
+	moved := w.outSeq > seq
+	w.mu.Unlock()
+	if !pending || !moved {
+		t.Fatalf("pending %v, cursor moved %v", pending, moved)
+	}
+	noOutcome(t, ch)
+	q.readPending()
+	if got := waitOutcome(t, ch); got.State != contract.JobCompleted {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// Many watches of ended jobs share by-id reads, pollBatch ids each.
+func TestWatchEndedMany(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	const n = pollBatch + 200
+	for i := range n {
+		q.Enqueue(job("m" + strconv.Itoa(i)))
+	}
+	items, acks := make([]any, n), make([]string, n)
+	for left := n; left > 0; {
+		k, _, err := q.DequeueBatchWithAckIds(items, acks)
+		if err != nil || k == 0 {
+			t.Fatalf("popped %d, %v", k, err)
+		}
+		for _, a := range acks[:k] {
+			q.Acknowledge(a)
+		}
+		left -= k
+	}
+	var fired atomic.Int64
+	done := make(chan struct{})
+	for i := range n {
+		q.WatchOutcome("m"+strconv.Itoa(i), func(contract.JobOutcome) {
+			if fired.Add(1) == n {
+				close(done)
+			}
+		})
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%d of %d fired", fired.Load(), n)
+	}
 }
 
 // Every watch fires when far more jobs end between two polls than
@@ -2208,6 +2367,83 @@ func TestResumeBetweenPopAndRead(t *testing.T) {
 		if !p.pop() {
 			t.Errorf("%s: Expected the item after the Resume", p.name)
 		}
+	}
+}
+
+// A live mark on another id sends the pop to the gated path, which still
+// hands out the unmarked job; a mark another process clears between the
+// fast pop and its read does too.
+func TestPopPastMarks(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+	other := otherProcess(t, q)
+	t.Cleanup(func() { afterEmptyPop = func() {} })
+	if err := q.CancelJob("elsewhere"); err != nil {
+		t.Fatal(err)
+	}
+	q.Enqueue(job("a"))
+	q.Enqueue(job("b"))
+	if v, ok := q.Dequeue(); !ok || string(v.([]byte)) != string(job("a")) {
+		t.Fatalf("Dequeue: Expected a past the mark, got %v %v", v, ok)
+	}
+	if v, _ := pop(t, q); v != string(job("b")) {
+		t.Fatalf("claim: Expected b past the mark, got %s", v)
+	}
+	if n, left, err := q.DequeueBatchWithAckIds(make([]any, 2), make([]string, 2)); n != 0 || left != 0 || err != nil {
+		t.Fatalf("Expected an empty pop, got %d %d %v", n, left, err)
+	}
+
+	// The mark of c stops the fast pop; the re-add clears it
+	if err := q.CancelJob("c"); err != nil {
+		t.Fatal(err)
+	}
+	q.Enqueue(job("d"))
+	afterEmptyPop = func() {
+		afterEmptyPop = func() {}
+		if !other.EnqueueOnce(job("c"), "c") {
+			t.Error("EnqueueOnce failed")
+		}
+	}
+	if v, _ := pop(t, q); v != string(job("d")) {
+		t.Fatalf("Expected d, got %s", v)
+	}
+	if v, _ := pop(t, q); v != string(job("c")) {
+		t.Fatalf("Expected the re-added c, got %s", v)
+	}
+}
+
+// A finish uses the job ID its claim read, and drops it; without one (a
+// restart, another object) it reads the row: the outcome is the same.
+func TestFinishJobIDCache(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		q, qs := openQueue(t, WithRemoveOnComplete(!keep))
+		for _, cached := range []bool{true, false} {
+			id := fmt.Sprintf("k%v-c%v", keep, cached)
+			q.Enqueue(job(id))
+			q.Enqueue([]byte("plain"))
+			_, ack := pop(t, q)
+			_, plainAck := pop(t, q)
+			if !cached {
+				q.jobIDs.clear()
+			}
+			ch := watch(q, id)
+			if !q.Reject(ack, "boom") || !q.Acknowledge(plainAck) {
+				t.Fatalf("%s: Expected both finishes to succeed", id)
+			}
+			if o := waitOutcome(t, ch); o.State != contract.JobFailed || o.Error != "boom" {
+				t.Errorf("%s: Expected failed with boom, got %+v", id, o)
+			}
+			if q.Reject(ack, "again") {
+				t.Errorf("%s: Expected a re-finish to fail", id)
+			}
+			if n := q.jobIDs.len(); n != 0 {
+				t.Errorf("%s: Expected no cached ids after the finishes, got %d", id, n)
+			}
+		}
+		if s := stats(t, q); s.Totals.Failed != 2 || s.Totals.Completed != 2 {
+			t.Errorf("keep %v: Expected totals 2 failed 2 completed, got %+v", keep, s.Totals)
+		}
+		qs.Close()
 	}
 }
 

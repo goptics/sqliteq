@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,9 +42,70 @@ type Queue struct {
 	pz              pauseState   // Paused cache and OnPauseChange hooks
 	records         atomic.Int64 // outcome records written, for trims
 
-	// Prepared once per handle; they close with the file's pool
-	insert, claim, pop, fin, count, countCapped, values *sql.Stmt
-	putJob, unmark, hasMark, isMarked, pausedAt, tally  *sql.Stmt
+	// The plain path's statements, prepared once per handle; they close
+	// with the file's pool. claimFast also selects nothing while the pause
+	// row or a live cancel mark exists; finKnown is fin without
+	// RETURNING, for a row whose job ID is known; insertPlain is insert for
+	// a row with no id: v0.3.0's statement, no lookup of the job_id index
+	insertPlain, claimFast, finKnown, countCapped *sql.Stmt
+	// The rest, prepared on first use (lazyStmt). popFast is claimFast's
+	// pop; idle reads the pause row and whether a row is pending; byIDs
+	// reads the outcome records of a JSON array of job IDs
+	insert, claim, pop, fin, count, values, putJob, isMarked, pausedAt, tally lazyStmt
+	popFast, idle, byIDs                                                      lazyStmt
+
+	// jobIDs: row id -> job ID ("" none) of rows this object claimed, read
+	// off the lock at claim; a finish takes its entry and skips the
+	// payload. Row ids are never reused and a row's data and job_id never
+	// change, so an entry stays true; a miss reads the row as before.
+	jobIDs idCache
+}
+
+// idCache is a mutex map: a sync.Map boxed key and value, 3 allocs a row.
+type idCache struct {
+	mu sync.Mutex
+	m  map[int64]string
+}
+
+// put stores the job IDs of claimed rows.
+func (c *idCache) put(rows []claimed) {
+	ids := make([]string, len(rows)) // parsed off the lock
+	for i, r := range rows {
+		ids[i] = jobIDOf(r.once, r.data)
+	}
+	c.mu.Lock()
+	if c.m == nil {
+		c.m = make(map[int64]string)
+	}
+	for i, r := range rows {
+		c.m[r.id] = ids[i]
+	}
+	c.mu.Unlock()
+}
+
+// take removes and returns row id's entry.
+func (c *idCache) take(id int64) (jobID string, ok bool) {
+	c.mu.Lock()
+	jobID, ok = c.m[id]
+	if ok {
+		delete(c.m, id)
+	}
+	c.mu.Unlock()
+	return jobID, ok
+}
+
+// clear drops every entry.
+func (c *idCache) clear() {
+	c.mu.Lock()
+	c.m = nil
+	c.mu.Unlock()
+}
+
+// len counts the entries.
+func (c *idCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.m)
 }
 
 // claimed is one row a claim moved to processing
@@ -91,7 +153,7 @@ func newQueue(f *file, name string, priority bool, opts ...Option) (*Queue, erro
 		return nil, fmt.Errorf("failed to prepare statements: %w", err)
 	}
 	// A pause kept in the file holds this object from its first pop
-	if paused, err := readPaused(q.pausedAt); err != nil {
+	if paused, err := q.readPaused(nil); err != nil {
 		q.closeStmts()
 		return nil, fmt.Errorf("failed to read pause: %w", err)
 	} else if paused {
@@ -234,38 +296,64 @@ func (q *Queue) prepare() (err error) {
 		}
 	}()
 
-	cols, vals, returning := "data, status, ack, created_at, updated_at, job_id", "?, 'pending', 0, ?, ?, ?", "id, data, job_id"
+	cols, vals, returning := "data, status, ack, created_at, updated_at, job_id", "?1, 'pending', 0, ?2, ?3, ?4", "id, data, job_id"
 	if q.priority {
-		cols, vals, returning = cols+", priority", vals+", ?", "id, priority, data, job_id"
+		cols, vals, returning = cols+", priority", vals+", ?5", "id, priority, data, job_id"
 	}
 	pending := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') ORDER BY %s",
 		q.table, q.meta, q.order)
+	// One statement for a pop on a file without marks: the pause row and
+	// a live mark are checked in the LIMIT (0 while either exists), once
+	// per statement. Not "LIMIT ?": SQLite folds a bare bound LIMIT into
+	// the plan (sqlite3ExprIsInteger marks it in expmask), so any bind of
+	// it expires the statement; mattn binds each run, so every claim
+	// re-prepared, allocs and all (v0.3.0 too; inferred from the source
+	// and lookaside counts). Not in the WHERE: each probe made the claim hold more
+	// lookaside slots. A full lookaside sends small allocs to malloc under
+	// SQLite's global mem mutex, shared by every file's connections
+	pendingFast := fmt.Sprintf("SELECT id FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)
+	gate := fmt.Sprintf("CASE WHEN EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at') OR EXISTS (SELECT 1 FROM %s WHERE expires_at > ?) THEN 0 ELSE %%s END", q.meta, q.cancelled)
 
 	// fin ends a processing row: deleted, or kept with its end as status
-	fin := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
+	finKnown := fmt.Sprintf("DELETE FROM %s WHERE id = ? AND status = 'processing'", q.table)
 	if !q.removeOnComplete {
-		fin = fmt.Sprintf("UPDATE %s SET status = ?, ack = 1, updated_at = ? WHERE id = ? AND status = 'processing' RETURNING job_id, data", q.table)
+		finKnown = fmt.Sprintf("UPDATE %s SET status = ?, ack = 1, updated_at = ? WHERE id = ? AND status = 'processing'", q.table)
 	}
+	fin := finKnown + " RETURNING job_id, data"
 
+	for _, l := range []struct {
+		stmt  *lazyStmt
+		query string
+	}{
+		// A repeat id makes no row, so no AUTOINCREMENT step: the high
+		// mark counts stored adds (initMeta). The conflict clause is a
+		// backstop; its target is the job_id index alone, so a NOT NULL or
+		// any other failure still errors; it must repeat the index's WHERE
+		{&q.insert, fmt.Sprintf("INSERT INTO %[1]s (%[2]s) SELECT %[3]s WHERE NOT EXISTS (SELECT 1 FROM %[1]s WHERE job_id = ?4) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
+		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
+		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
+		{&q.popFast, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT %s) RETURNING data, job_id", q.table, pendingFast, fmt.Sprintf(gate, "1"))},
+		{&q.idle, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE key = 'paused_at'), EXISTS (SELECT 1 FROM %s WHERE status = 'pending')", q.meta, q.table)},
+		{&q.fin, fin},
+		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
+		{&q.isMarked, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE job_id = ? AND expires_at > ?)", q.cancelled)},
+		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
+		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
+		{&q.pausedAt, fmt.Sprintf("SELECT value FROM %s WHERE key = 'paused_at'", q.meta)},
+		{&q.tally, fmt.Sprintf("UPDATE %s SET value = value + 1 WHERE key = ?", q.meta)},
+		{&q.byIDs, fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (SELECT value FROM json_each(?))", q.jobs)},
+	} {
+		*l.stmt = lazyStmt{db: q.f.db, query: l.query}
+	}
 	for _, s := range []struct {
 		stmt  **sql.Stmt
 		query string
 	}{
-		// The conflict target is the job_id index alone, so a NOT NULL or any
-		// other failure still errors; it must repeat the index's WHERE
-		{&q.insert, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING", q.table, cols, vals)},
-		{&q.claim, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT ?) RETURNING %s", q.table, pending, returning)},
-		{&q.pop, fmt.Sprintf("DELETE FROM %s WHERE id IN (%s LIMIT 1) RETURNING data, job_id", q.table, pending)},
-		{&q.fin, fin},
-		{&q.putJob, fmt.Sprintf("INSERT OR REPLACE INTO %s (job_id, state, error, result, finished_at) VALUES (?, ?, ?, ?, ?)", q.jobs)},
-		{&q.unmark, fmt.Sprintf("DELETE FROM %s WHERE job_id = ?", q.cancelled)},
-		{&q.hasMark, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE expires_at > ?)", q.cancelled)},
-		{&q.isMarked, fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s WHERE job_id = ? AND expires_at > ?)", q.cancelled)},
-		{&q.count, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE status = 'pending'", q.table)},
+		// A NULL job_id never conflicts: a plain add steps the mark once
+		{&q.insertPlain, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", q.table, cols, vals)},
+		{&q.claimFast, fmt.Sprintf("UPDATE %s SET status = 'processing', updated_at = ? WHERE id IN (%s LIMIT %s) RETURNING %s", q.table, pendingFast, fmt.Sprintf(gate, "?"), returning)},
+		{&q.finKnown, finKnown},
 		{&q.countCapped, fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE status = 'pending' LIMIT %d)", q.table, remainingCap)},
-		{&q.values, fmt.Sprintf("SELECT data FROM %s WHERE status = 'pending' ORDER BY %s", q.table, q.order)},
-		{&q.pausedAt, fmt.Sprintf("SELECT value FROM %s WHERE key = 'paused_at'", q.meta)},
-		{&q.tally, fmt.Sprintf("UPDATE %s SET value = value + 1 WHERE key = ?", q.meta)},
 	} {
 		if *s.stmt, err = q.f.db.Prepare(s.query); err != nil {
 			return err
@@ -277,10 +365,14 @@ func (q *Queue) prepare() (err error) {
 
 // closeStmts closes the statements prepared so far
 func (q *Queue) closeStmts() {
-	for _, s := range []*sql.Stmt{q.insert, q.claim, q.pop, q.fin, q.count, q.countCapped, q.values, q.putJob, q.unmark, q.hasMark, q.isMarked, q.pausedAt, q.tally} {
+	for _, s := range []*sql.Stmt{q.insertPlain, q.claimFast, q.finKnown, q.countCapped} {
 		if s != nil {
 			s.Close()
 		}
+	}
+	for _, l := range []*lazyStmt{&q.insert, &q.claim, &q.pop, &q.fin, &q.count, &q.values, &q.putJob, &q.isMarked, &q.pausedAt, &q.tally,
+		&q.popFast, &q.idle, &q.byIDs} {
+		l.close()
 	}
 }
 
@@ -413,7 +505,13 @@ func (q *Queue) enqueue(item any, priority int, id string) bool {
 
 	now := time.Now().UTC()
 	return q.f.b.do(func(tx *sql.Tx) (bool, error) {
-		insert := q.insert
+		insert := q.insertPlain
+		if id != "" {
+			var err error
+			if insert, err = q.insert.get(); err != nil {
+				return false, err
+			}
+		}
 		if tx != nil {
 			insert = tx.Stmt(insert)
 		}
@@ -437,9 +535,11 @@ var errJobIDTaken = errors.New("sqliteq: job id is held by another job")
 // is the same workflow item (same wf, task and undo); else errJobIDTaken.
 func (q *Queue) enqueueTx(tx *sql.Tx, item []byte, priority int, id string) error {
 	now := time.Now().UTC()
-	insert := tx.Stmt(q.insert)
+	insert, err := q.insert.in(tx)
+	if err != nil {
+		return err
+	}
 	var res sql.Result
-	var err error
 	if q.priority {
 		res, err = insert.Exec(item, now, now, id, priority)
 	} else {
@@ -495,6 +595,7 @@ func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
 		return nil, false, refused, err
 	}
 
+	q.jobIDs.put(out)
 	// RETURNING order is unspecified
 	slices.SortFunc(out, func(a, b claimed) int {
 		if c := cmp.Compare(a.priority, b.priority); c != 0 {
@@ -505,27 +606,24 @@ func (q *Queue) claimN(n int) (out []claimed, capped, refused bool, err error) {
 	return out, capped, false, nil
 }
 
-// claimGated claims up to n rows; with a live cancel mark on the file it
-// runs in one transaction that drops each marked row it claims (outcome
-// cancelled) and claims again, at most maxDrops drops; capped reports that
-// it stopped there. An empty claim reads the pause row: refused when it is
-// set. Outside a tx a Resume from another process can land between the two,
-// so an empty claim found unpaused claims once more. The caller holds the
-// write mutex.
-// ponytail: a second Pause and Resume, both in the window again, still make
-// one empty pop look like a failure.
+// claimGated claims up to n rows. The fast claim is one statement that
+// claims nothing while the pause row or a live cancel mark exists. When it
+// is empty, one read tells why: paused is refused, nothing pending is
+// empty. Else a mark is live, or another process lifted a pause or mark
+// in between: one transaction claims, drops each marked row it claims
+// (outcome cancelled) and claims again, at most maxDrops drops; capped
+// reports that it stopped there. Every check is in SQL, so a Pause or
+// CancelJob from any process holds. The caller holds the write mutex.
+// ponytail: a Pause and Resume, both between the fast claim and its read,
+// still make one empty pop look like a failure.
 func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err error) {
 	now := time.Now()
-	if !q.anyMark(now) {
-		for try := range 2 {
-			if out, err = q.claimRows(q.claim, n); err != nil || len(out) > 0 {
-				return out, false, false, err
-			}
-			afterEmptyPop()
-			if refused, err = readPaused(q.pausedAt); err != nil || refused || try == 1 {
-				return nil, false, refused, err
-			}
-		}
+	if out, err = q.claimRows(q.claimFast, n, now.UnixMilli()); err != nil || len(out) > 0 {
+		return out, false, false, err
+	}
+	afterEmptyPop()
+	if paused, pending, err := q.idleState(); err != nil || paused || !pending {
+		return nil, false, paused, err
 	}
 
 	tx, err := q.f.db.Begin()
@@ -534,7 +632,14 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 	}
 	defer tx.Rollback()
 
-	claim, isMarked := tx.Stmt(q.claim), tx.Stmt(q.isMarked)
+	claim, err := q.claim.in(tx)
+	if err != nil {
+		return nil, false, false, err
+	}
+	isMarked, err := q.isMarked.in(tx)
+	if err != nil {
+		return nil, false, false, err
+	}
 	out = make([]claimed, 0, n)
 	drops := 0
 	for len(out) < n && drops < maxDrops {
@@ -556,7 +661,11 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 				out = append(out, c)
 				continue
 			}
-			if _, err := q.end(tx, c.id, id, contract.JobCancelled, "cancelled", nil, now); err != nil {
+			if _, err := q.end(tx, c.id, id, true, contract.JobCancelled, "cancelled", nil, now); err != nil {
+				return nil, false, false, err
+			}
+			// Neither completed nor failed
+			if _, err := q.bump(tx, "other"); err != nil {
 				return nil, false, false, err
 			}
 			drops++
@@ -565,17 +674,18 @@ func (q *Queue) claimGated(n int) (out []claimed, capped, refused bool, err erro
 	capped = len(out) < n && drops >= maxDrops
 	if len(out) == 0 && !capped {
 		// The write lock is held: the row read is the one the claim saw
-		if refused, err = readPaused(tx.Stmt(q.pausedAt)); err != nil {
+		if refused, err = q.readPaused(tx); err != nil {
 			return nil, false, false, err
 		}
 	}
 	return out, capped, refused, tx.Commit()
 }
 
-// claimRows runs a claim statement and reads every row it returns; the
-// caller holds the write mutex
-func (q *Queue) claimRows(claim *sql.Stmt, n int) ([]claimed, error) {
-	rows, err := claim.Query(time.Now().UTC(), n)
+// claimRows runs a claim statement and reads every row it returns; mark
+// is the live-mark time a fast claim takes. The caller holds the write
+// mutex
+func (q *Queue) claimRows(claim *sql.Stmt, n int, mark ...any) ([]claimed, error) {
+	rows, err := claim.Query(append(append([]any{time.Now().UTC()}, mark...), n)...)
 	if err != nil {
 		return nil, err
 	}
@@ -598,6 +708,17 @@ func (q *Queue) claimRows(claim *sql.Stmt, n int) ([]claimed, error) {
 	return out, rows.Err()
 }
 
+// idleState reads, after an empty fast pop, whether the pause row exists
+// and whether any row is pending. The caller holds the write mutex.
+func (q *Queue) idleState() (paused, pending bool, err error) {
+	idle, err := q.idle.get()
+	if err != nil {
+		return false, false, err
+	}
+	err = idle.QueryRow().Scan(&paused, &pending)
+	return paused, pending, err
+}
+
 // Dequeue removes and returns the next item from the queue
 // Returns the item and a boolean indicating if the operation was successful
 func (q *Queue) Dequeue() (any, bool) {
@@ -615,22 +736,17 @@ func (q *Queue) Dequeue() (any, bool) {
 	return data, ok
 }
 
-// dequeue is Dequeue under the write mutex; an empty pop reads the pause
-// row, refused when it is set, and pops once more when it is not (see
-// claimGated).
+// dequeue is Dequeue under the write mutex: a fast pop, and when it is
+// empty the same read and fallback as claimGated.
 func (q *Queue) dequeue() (data []byte, ok, refused bool) {
 	now := time.Now()
-	if !q.anyMark(now) {
-		for try := range 2 {
-			data, _, err := popRow(q.pop)
-			if !errors.Is(err, sql.ErrNoRows) {
-				return data, err == nil, false
-			}
-			afterEmptyPop()
-			if refused, err = readPaused(q.pausedAt); err != nil || refused || try == 1 {
-				return nil, false, refused
-			}
-		}
+	data, err := q.popFastCounted(now)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return data, err == nil, false
+	}
+	afterEmptyPop()
+	if paused, pending, err := q.idleState(); err != nil || paused || !pending {
+		return nil, false, paused
 	}
 	for {
 		data, capped, refused, err := q.popGated(now)
@@ -638,6 +754,28 @@ func (q *Queue) dequeue() (data []byte, ok, refused bool) {
 			return data, err == nil && data != nil, refused
 		}
 	}
+}
+
+// popFastCounted is the fast pop and its count as other (no finish), in
+// one transaction. The caller holds the write mutex.
+func (q *Queue) popFastCounted(now time.Time) ([]byte, error) {
+	tx, err := q.f.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	popFast, err := q.popFast.in(tx)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := popRow(popFast, now.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := q.bump(tx, "other"); err != nil {
+		return nil, err
+	}
+	return data, tx.Commit()
 }
 
 // popGated pops in one transaction, dropping each marked item it pops
@@ -650,16 +788,27 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 		return nil, false, false, err
 	}
 	defer tx.Rollback()
-	pop, isMarked := tx.Stmt(q.pop), tx.Stmt(q.isMarked)
+	pop, err := q.pop.in(tx)
+	if err != nil {
+		return nil, false, false, err
+	}
+	isMarked, err := q.isMarked.in(tx)
+	if err != nil {
+		return nil, false, false, err
+	}
 	for range maxDrops {
 		data, once, err := popRow(pop)
 		if errors.Is(err, sql.ErrNoRows) {
-			if refused, err = readPaused(tx.Stmt(q.pausedAt)); err != nil {
+			if refused, err = q.readPaused(tx); err != nil {
 				return nil, false, false, err
 			}
 			return nil, false, refused, tx.Commit() // keep the drops
 		}
 		if err != nil {
+			return nil, false, false, err
+		}
+		// Popped, kept or dropped: no finish counts it
+		if _, err := q.bump(tx, "other"); err != nil {
 			return nil, false, false, err
 		}
 		id := jobIDOf(once, data)
@@ -677,10 +826,10 @@ func (q *Queue) popGated(now time.Time) (data []byte, capped, refused bool, err 
 	return nil, true, false, tx.Commit()
 }
 
-// popRow runs a pop statement: the deleted row's data and job_id, or
-// sql.ErrNoRows on an empty queue
-func popRow(pop *sql.Stmt) (data []byte, once sql.NullString, err error) {
-	err = pop.QueryRow().Scan(&data, &once)
+// popRow runs a pop statement, with args: the deleted row's data and
+// job_id, or sql.ErrNoRows on an empty queue
+func popRow(pop *sql.Stmt, args ...any) (data []byte, once sql.NullString, err error) {
+	err = pop.QueryRow(args...).Scan(&data, &once)
 	return data, once, err
 }
 
@@ -764,7 +913,14 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 	}
 
 	now := time.Now()
+	// Taken before the round: a retry of the op reuses it
+	jid, known := q.jobIDs.take(id)
 	return q.f.b.do(func(tx *sql.Tx) (ok bool, err error) {
+		// A completed job with no Job ID is one statement: alone in its
+		// round it runs as one autocommit, no tx
+		if tx == nil && known && jid == "" && state == contract.JobCompleted {
+			return q.endKnown(nil, id, state, now)
+		}
 		if tx == nil {
 			if tx, err = q.f.db.Begin(); err != nil {
 				return false, err
@@ -778,47 +934,90 @@ func (q *Queue) finish(ackID string, state contract.JobState, reason string, res
 				ok = ok && err == nil
 			}()
 		}
-		return q.finishTx(tx, id, state, reason, result, now)
+		return q.finishKnown(tx, id, jid, known, state, reason, result, now)
 	})
 }
 
 // finishTx is finish in the caller's tx, with the row id parsed.
 func (q *Queue) finishTx(tx *sql.Tx, id int64, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
+	// Taken even if tx rolls back: a retry then reads the row
+	jid, known := q.jobIDs.take(id)
+	return q.finishKnown(tx, id, jid, known, state, reason, result, now)
+}
+
+// finishKnown is finishTx with the cache entry taken (known: jid is the
+// row's job ID).
+func (q *Queue) finishKnown(tx *sql.Tx, id int64, jid string, known bool, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
 	// No row is an outcome, not an error: it must not fail the round
-	if ok, err := q.end(tx, id, "", state, reason, result, now); !ok || err != nil {
+	if ok, err := q.end(tx, id, jid, known, state, reason, result, now); !ok || err != nil {
 		return ok, err
 	}
-	// Totals: cancelled counts as failed (spec 6.14)
-	total := "failed"
+	// Totals: completed derives from the rows (initMeta); cancelled
+	// counts as failed (spec 6.14)
 	if state == contract.JobCompleted {
-		total = "completed"
+		return true, nil
 	}
-	_, err := tx.Stmt(q.tally).Exec(total)
+	return q.bump(tx, "failed")
+}
+
+// bump adds one to meta counter key, in tx.
+func (q *Queue) bump(tx *sql.Tx, key string) (bool, error) {
+	tally, err := q.tally.in(tx)
+	if err != nil {
+		return false, err
+	}
+	_, err = tally.Exec(key)
 	return err == nil, err
+}
+
+// endKnown ends processing row id whose job ID is known to be none, with
+// one statement: in tx, or autocommit with a nil tx. Reports whether the
+// row was processing.
+func (q *Queue) endKnown(tx *sql.Tx, id int64, state contract.JobState, now time.Time) (bool, error) {
+	args := []any{id}
+	if !q.removeOnComplete {
+		args = []any{string(state), now.UTC(), id}
+	}
+	stmt := q.finKnown
+	if tx != nil {
+		stmt = tx.Stmt(stmt)
+	}
+	res, err := stmt.Exec(args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // end finishes processing row id with state, in tx: the row is deleted or
 // kept with state as status, and a job with a Job ID gets its outcome
-// record. jobID is the row's, when the caller knows it. Reports whether
-// the row was processing.
-func (q *Queue) end(tx *sql.Tx, id int64, jobID string, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
-	var row *sql.Row
-	if q.removeOnComplete {
-		row = tx.Stmt(q.fin).QueryRow(id)
+// record. known: jobID is the row's ("" none), so the row is not read
+// back. Reports whether the row was processing.
+func (q *Queue) end(tx *sql.Tx, id int64, jobID string, known bool, state contract.JobState, reason string, result []byte, now time.Time) (bool, error) {
+	if known {
+		if ok, err := q.endKnown(tx, id, state, now); !ok || err != nil {
+			return false, err
+		}
 	} else {
-		row = tx.Stmt(q.fin).QueryRow(string(state), now.UTC(), id)
-	}
-	var (
-		once sql.NullString
-		data []byte
-	)
-	switch err := row.Scan(&once, &data); {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, err
-	}
-	if jobID == "" {
+		args := []any{id}
+		if !q.removeOnComplete {
+			args = []any{string(state), now.UTC(), id}
+		}
+		var (
+			once sql.NullString
+			data []byte
+		)
+		fin, err := q.fin.in(tx)
+		if err != nil {
+			return false, err
+		}
+		switch err := fin.QueryRow(args...).Scan(&once, &data); {
+		case errors.Is(err, sql.ErrNoRows):
+			return false, nil
+		case err != nil:
+			return false, err
+		}
 		jobID = jobIDOf(once, data)
 	}
 	if jobID == "" {
@@ -830,7 +1029,11 @@ func (q *Queue) end(tx *sql.Tx, id int64, jobID string, state contract.JobState,
 // Len returns the number of pending items in the queue
 func (q *Queue) Len() int {
 	var count int
-	if err := q.count.QueryRow().Scan(&count); err != nil {
+	stmt, err := q.count.get()
+	if err != nil {
+		return 0
+	}
+	if err := stmt.QueryRow().Scan(&count); err != nil {
 		return 0
 	}
 	return count
@@ -838,7 +1041,11 @@ func (q *Queue) Len() int {
 
 // Values returns all pending items in the queue, in queue order
 func (q *Queue) Values() []any {
-	rows, err := q.values.Query()
+	stmt, err := q.values.get()
+	if err != nil {
+		return nil
+	}
+	rows, err := stmt.Query()
 	if err != nil {
 		return nil
 	}
@@ -928,7 +1135,8 @@ func (q *Queue) purge(ws *WorkflowStore) (tags []wfItemTag) {
 			return nil
 		}
 	}
-	if _, err := tx.Exec("UPDATE " + q.meta + " SET value = 0 WHERE key <> 'paused_at'"); err != nil {
+	// Totals restart: the high mark is the new base
+	if _, err := tx.Exec(fmt.Sprintf("UPDATE %s SET value = CASE key WHEN 'base' THEN %s ELSE 0 END WHERE key <> 'paused_at'", q.meta, q.highMark()), q.name); err != nil {
 		return nil
 	}
 	if ws != nil && ws.single {
@@ -944,6 +1152,7 @@ func (q *Queue) purge(ws *WorkflowStore) (tags []wfItemTag) {
 	if tx.Commit() != nil {
 		return nil
 	}
+	q.jobIDs.clear() // claimed rows are gone
 	return tags
 }
 
@@ -975,6 +1184,7 @@ func (q *Queue) workflowTags(tx *sql.Tx) ([]wfItemTag, error) {
 func (q *Queue) Close() error {
 	q.closed.Store(true)
 	q.w.close()
+	q.jobIDs.clear()
 
 	return nil
 }
