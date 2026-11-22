@@ -3921,3 +3921,45 @@ func TestPurgeKeepsJobsWithoutStore(t *testing.T) {
 		}
 	})
 }
+
+// A VarMQ job without an ID leaves no outcome record; one with an ID does,
+// and its handle learns the outcome.
+func TestVarmqOutcomeRecordOnlyWithID(t *testing.T) {
+	q, qs := openQueue(t)
+	defer qs.Close()
+
+	w := varmq.NewErrWorker(func(varmq.Job[int]) error { return nil })
+	defer w.Stop()
+	h := w.WithQueue(q)
+
+	none, ok := h.Add(1)
+	if !ok {
+		t.Fatal("add without ID refused")
+	}
+	if err := none.Err(); !errors.Is(err, varmq.ErrDetached) {
+		t.Fatalf("no ID: err = %v, want ErrDetached", err)
+	}
+	named, ok := h.Add(2, varmq.WithJobId("rec"))
+	if !ok {
+		t.Fatal("add with ID refused")
+	}
+	if err := named.Err(); err != nil { // waits for the outcome
+		t.Fatalf("with ID: err = %v", err)
+	}
+
+	var n int
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := q.f.db.QueryRow("SELECT COUNT(*) FROM " + q.jobs).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if q.Len() == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(pollEvery)
+	}
+	var id string
+	if err := q.f.db.QueryRow("SELECT job_id FROM " + q.jobs).Scan(&id); err != nil || n != 1 || id != "rec" {
+		t.Fatalf("records = %d (job_id %q, err %v), want 1 for rec", n, id, err)
+	}
+}
