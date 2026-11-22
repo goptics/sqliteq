@@ -286,7 +286,8 @@ func indexColumns(db *sql.DB, index string) ([]string, error) {
 	return cols, rows.Err()
 }
 
-// prepare prepares every statement of the queue once. Each read keeps
+// prepare prepares the hot statements now and the rest on first use
+// (lazyStmt), each once. Each read keeps
 // status = 'pending' literal, or SQLite cannot use the partial index. Pops
 // select nothing while the pause row exists.
 func (q *Queue) prepare() (err error) {
@@ -905,7 +906,8 @@ func (q *Queue) Reject(ackID string, reason string) bool {
 
 // finish ends the processing row of ackID with state in the file's next
 // group commit round. A round of one runs in its own transaction: the row
-// and its outcome record commit together.
+// and its outcome record commit together. A completed job with no Job ID
+// alone in its round writes no record: one autocommit statement.
 func (q *Queue) finish(ackID string, state contract.JobState, reason string, result []byte) bool {
 	id, ok := parseAckID(ackID)
 	if !ok {

@@ -31,7 +31,7 @@ const metaSuffix = "__sqliteq_meta"
 // initMeta creates the meta table (key -> integer; paused_at while
 // paused) and the counters totals derive from, so no hot write touches it:
 //   - submitted = the table's AUTOINCREMENT high mark - base; a repeat
-//     EnqueueOnce bumps the mark without a row, so it bumps base too
+//     EnqueueOnce makes no row and no AUTOINCREMENT step
 //   - failed: Reject and cancel finishes
 //   - other: rows gone without a finish (a Dequeue pop, a cancel drop),
 //     counted by the pop or drop itself

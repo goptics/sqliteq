@@ -196,7 +196,7 @@ Requires VarMQ ≥ v1.11.0. The [VarMQ versions table](https://varmq.goptics.org
 
 sqliteq imports VarMQ's `contract` module, and it imports VarMQ itself only in tests. Its `go.mod` still requires VarMQ, so sqliteq needs Go 1.27, as VarMQ does.
 
-A worker whose only source is the sqliteq queue claims several jobs in one statement through `DequeueBatchWithAckIds`. A worker bound to several queues claims one job per call. A job added with an ID (`WithJobId`, or one from `WithJobIdGenerator`) goes through `EnqueueOnce`.
+A worker whose only source is the sqliteq queue claims several jobs in one statement through `DequeueBatchWithAckIds`. A worker bound to several queues claims one job per call. A job added with an ID you give (`WithJobId`, `Item.ID`) goes through `EnqueueOnce`; one from `WithJobIdGenerator` goes through `Enqueue`.
 
 sqliteq has no `JobReader`. So VarMQ's one-job read (`GET /queues/{id}/jobs/{jobId}`) answers 501 for a sqliteq queue. For workflows, see [Workflows](#workflows).
 
@@ -403,12 +403,13 @@ On top of that table:
 
 - Two partial indexes: one covers the pending items in queue order. A unique one covers `job_id` on the rows that have one, which `EnqueueOnce` relies on.
 - A claim or a pop is one `UPDATE ... RETURNING` or `DELETE ... RETURNING` statement. It selects nothing while the queue is paused.
-- `<name>__sqliteq_meta` holds the totals and the pause; a trigger counts each stored add.
+- `<name>__sqliteq_meta` holds the pause and the rare-path counters (failed, popped or dropped). Submitted derives from the table's `AUTOINCREMENT` high mark, so an add or an acknowledge writes no meta row.
 - `<name>__sqliteq_jobs` holds one outcome record per job ID: `seq`, `job_id`, `state`, `error`, `result` and `finished_at`. `seq` is `AUTOINCREMENT`, so a poll that reads the records above its last `seq` sees every new one.
 - `<name>__sqliteq_cancelled` holds the cancel marks: `seq`, `job_id` and `expires_at`. A repeat cancel replaces the mark under a new `seq`, so the `OnCancel` hooks hear it again.
 - The trigger `<name>__sqliteq_readd` fires when `EnqueueOnce` stores a job ID. It deletes the outcome record and the cancel mark of that ID. A repeat `EnqueueOnce` stores nothing, so it fires no trigger.
-- A finish (`Acknowledge`, `AcknowledgeResult`, `Reject` or `AcknowledgeCancelled`) always runs in a transaction, and its outcome record commits with it.
-- Each pop first checks for a live cancel mark. While one exists, the pop runs in a transaction and drops the marked items it meets.
+- The trigger `<name>__sqliteq_unmark` fires on each new outcome record and deletes that job's cancel mark. The index `<name>__sqliteq_jobs_group` serves retention: completed records apart from the rest, by `finished_at`.
+- A finish (`Acknowledge`, `AcknowledgeResult`, `Reject` or `AcknowledgeCancelled`) runs in a transaction, and its outcome record commits with it. A completed job without a job ID, alone in its commit round, writes no record and runs as one autocommit statement.
+- A pop is one statement that checks the pause row and live cancel marks in its `LIMIT`: it selects nothing while either exists. Then, while a mark is live, the pop runs in a transaction and drops the marked items it meets.
 - Transactions begin `IMMEDIATE` (`_txlock=immediate`). So a transaction that reads before it writes, such as `CancelJob` or a checked pop, waits for the write lock instead of failing with `SQLITE_BUSY`.
 - One poll goroutine per queue object reads new outcome records and new cancel marks every 50 ms. While the cache says paused, it also reads the pause row. It runs only while the queue object has watches, `OnCancel` hooks or a paused cache.
 - The poll goroutine applies retention and deletes expired marks once a minute. A queue object also applies retention in the finish transaction of its first record and of every 100th record after that.
@@ -423,7 +424,7 @@ On top of that table:
 - **Polling, not push.** A queue object with watches or `OnCancel` hooks reads the file every 50 ms, in every process. Outcomes, cancels and a `Resume` from another process arrive within about 50 ms.
 - **Outcomes need the record.** A job without a job ID gets no outcome. A watch that starts after the job's record was trimmed is never called. Pair a watch with a timeout of your own.
 - **Fixed retention.** The record limits are not configurable. Kept rows (`WithRemoveOnComplete(false)`) have no retention at all.
-- **Cancel marks cost every pop a check.** A pop without live marks pays one extra read. While a mark exists, each pop runs in a transaction and checks its items. A mark for an unknown ID lasts 24 hours.
+- **Cancel marks cost a pop a check.** A pop checks for live marks inside its one statement. While a mark exists, each pop runs in a transaction and checks its items. A mark for an unknown ID lasts 24 hours.
 - **No retry limit or dead-letter queue.** A job that crashes its process runs again after each restart.
 - **One host.** SQLite's WAL mode needs every process on the same host, and it does not work over a network file system.
 
