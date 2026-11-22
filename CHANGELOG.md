@@ -71,8 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `QueueStats` counts: per row status, one statement; cancelled under failed. (#23)
 - Completed and failed counts only with `WithRemoveOnComplete(false)`. (#23)
 - `QueueStats` totals: submitted, completed, failed, in new table `<name>__sqliteq_meta`. (#23)
-- Insert trigger counts adds. (#23)
-- Finish counts in its transaction. (#23)
+- Totals from the table's AUTOINCREMENT high mark and rare-path counters, not a trigger or a finish write (see Performance). (#23)
 - `Purge` resets totals. (#23)
 - Older table: totals start from its rows, so jobs deleted before the upgrade are missing. (#23)
 - `QueueStats` reports the pause. (#23)
@@ -89,9 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `WatchOutcome` no longer starts a goroutine and query per call: the poll goroutine reads all pending IDs in one query, woken at once. The poll reads each new record once, not twice. A watch started during a poll could be skipped by it for good (its `Wait` hung); now it is read again.
 - Transactions begin `IMMEDIATE`. (#22)
-- Finish (`Acknowledge`, `Reject`) always runs in a transaction. (#22)
-- Pop runs in a transaction while any cancel mark is live. (#22)
+- Finish (`Acknowledge`, `Reject`) runs in a transaction; a completed job with no ID alone in its commit round is one autocommit statement. (#22)
+- Totals derive from the table's AUTOINCREMENT high mark and rare-path counters (failed, popped or dropped): no meta write per add or acknowledge. A meta table of an earlier build is converted on open.
+- `Dequeue` pop runs in a transaction, so it counts itself. (#22)
+- Fast claim and pop check the pause row and live marks in the `LIMIT`, not the `WHERE`; the claim's batch size is no bare bound `LIMIT`, which SQLite folds into the plan and re-prepares on every bind.
+- Statements off the plain path (dedupe add, gated claim, pops, outcome, cancel, totals) are prepared on first use, not at open.
 
 ## [0.3.0] - 2026-10-23
 

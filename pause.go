@@ -133,16 +133,20 @@ func (q *Queue) refused(g uint64) {
 // pollPause reads the pause row for the poll.
 func (q *Queue) pollPause() {
 	g := q.pz.gen.Load()
-	if paused, err := readPaused(q.pausedAt); err == nil {
+	if paused, err := q.readPaused(nil); err == nil {
 		q.setPaused(paused, g)
 	}
 }
 
-// readPaused reports whether the pause row exists, through stmt
-// (q.pausedAt, maybe in a tx).
-func readPaused(stmt *sql.Stmt) (bool, error) {
+// readPaused reports whether the pause row exists, in tx or outside one
+// with a nil tx.
+func (q *Queue) readPaused(tx *sql.Tx) (bool, error) {
+	stmt, err := q.pausedAt.in(tx)
+	if err != nil {
+		return false, err
+	}
 	var at int64
-	err := stmt.QueryRow().Scan(&at)
+	err = stmt.QueryRow().Scan(&at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}

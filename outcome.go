@@ -1,13 +1,17 @@
 package sqliteq
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/goptics/varmq/contract"
 )
@@ -70,7 +74,10 @@ func (q *Queue) initSidecars() error {
 			result BLOB,
 			finished_at INTEGER NOT NULL
 		)`,
-		`CREATE INDEX IF NOT EXISTS %[4]s ON %[2]s (finished_at)`,
+		// Retention index: per state group, by end time. Replaces the
+		// finished_at index of earlier builds (dropped below)
+		`CREATE INDEX IF NOT EXISTS %[7]s ON %[2]s ((state <> 'completed'), finished_at)`,
+		`DROP INDEX IF EXISTS %[4]s`,
 		`CREATE TABLE IF NOT EXISTS %[3]s (
 			seq INTEGER PRIMARY KEY AUTOINCREMENT,
 			job_id TEXT NOT NULL UNIQUE,
@@ -81,15 +88,40 @@ func (q *Queue) initSidecars() error {
 			DELETE FROM %[2]s WHERE job_id = NEW.job_id;
 			DELETE FROM %[3]s WHERE job_id = NEW.job_id;
 		END`,
+		// A record drops its job's cancel mark in its own statement (REPLACE
+		// fires it too); a build that also deletes the mark itself is harmless
+		`CREATE TRIGGER IF NOT EXISTS %[8]s AFTER INSERT ON %[2]s BEGIN
+			DELETE FROM %[3]s WHERE job_id = NEW.job_id;
+		END`,
 	} {
 		query := fmt.Sprintf(s, q.table, q.jobs, q.cancelled,
 			quoteIdent(q.name+jobsSuffix+"_finished"), quoteIdent(q.name+readdSuffix),
-			quoteIdent(q.name+cancelledSuffix+"_expires"))
+			quoteIdent(q.name+cancelledSuffix+"_expires"), quoteIdent(q.name+jobsSuffix+"_group"),
+			quoteIdent(q.name+"__sqliteq_unmark"))
 		if _, err := q.f.db.Exec(query); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+var noIDPrefix = []byte(`{"id":""`)
+
+// mayBeIDKey reports whether b has a string that encoding/json could
+// match to field "id": one starting i, I, an escape, or UTF-8 lead byte
+// 0xC4 (dotless i and dotted I fold to i). Conservative: false is exact.
+func mayBeIDKey(b []byte) bool {
+	for {
+		i := bytes.IndexByte(b, '"')
+		if i < 0 || i+1 >= len(b) {
+			return false
+		}
+		switch b[i+1] {
+		case 'i', 'I', '\\', 0xC4:
+			return true
+		}
+		b = b[i+1:]
+	}
 }
 
 // jobIDOf is a row's Job ID: its EnqueueOnce id, else the envelope "id" of
@@ -102,6 +134,11 @@ func jobIDOf(onceID sql.NullString, data []byte) string {
 	if len(data) == 0 || data[0] != '{' {
 		return ""
 	}
+	// varmq's envelope of a job with no ID: "id" first and empty. A parse
+	// gives "" too (or fails: "") unless a later key folds to "id"
+	if bytes.HasPrefix(data, noIDPrefix) && !mayBeIDKey(data[len(noIDPrefix):]) {
+		return ""
+	}
 	var env struct {
 		ID string `json:"id"`
 	}
@@ -111,17 +148,18 @@ func jobIDOf(onceID sql.NullString, data []byte) string {
 	return env.ID
 }
 
-// record writes job id's outcome and drops its cancel mark, in tx; every
-// trimEvery-th record also trims both states.
+// record writes job id's outcome, in tx; the unmark trigger drops its
+// cancel mark. Every trimEvery-th record also trims both states.
 func (q *Queue) record(tx *sql.Tx, id string, state contract.JobState, reason string, result []byte, now time.Time) error {
 	var errText any
 	if state != contract.JobCompleted {
 		errText = reason
 	}
-	if _, err := tx.Stmt(q.putJob).Exec(id, string(state), errText, result, now.UnixMilli()); err != nil {
+	putJob, err := q.putJob.in(tx)
+	if err != nil {
 		return err
 	}
-	if _, err := tx.Stmt(q.unmark).Exec(id); err != nil {
+	if _, err := putJob.Exec(id, string(state), errText, result, now.UnixMilli()); err != nil {
 		return err
 	}
 	// The first record of a queue object trims too: a short-lived process
@@ -133,22 +171,46 @@ func (q *Queue) record(tx *sql.Tx, id string, state contract.JobState, reason st
 }
 
 // trim applies retention: per state group, records past the age limit and
-// those past the newest N that are older than trimFloor.
+// those past the newest N that are older than trimFloor. Each group is a
+// range of the group index: a group whose oldest record is younger than
+// trimFloor is skipped; the count limit finds the N-th newest record by
+// (finished_at, seq) and deletes what is older, so cost is O(log n + N),
+// never a walk of the whole table.
 func (q *Queue) trim(tx *sql.Tx, now time.Time) error {
+	floor := now.Add(-trimFloor).UnixMilli()
 	for _, g := range []struct {
-		where string
-		keep  int
-		age   time.Duration
+		grp  int // (state <> 'completed'): cancelled records count as failed
+		keep int
+		age  time.Duration
 	}{
-		{"state = 'completed'", keepCompleted, keepCompletedAge},
-		{"state <> 'completed'", keepFailed, keepFailedAge},
+		{0, keepCompleted, keepCompletedAge},
+		{1, keepFailed, keepFailedAge},
 	} {
-		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s AND finished_at <= ?", q.jobs, g.where),
+		// The group expression is written as the index's, or SQLite
+		// does not use it
+		where := fmt.Sprintf("(state <> 'completed') = %d", g.grp)
+		var oldest sql.NullInt64
+		if err := tx.QueryRow(fmt.Sprintf("SELECT MIN(finished_at) FROM %s WHERE %s", q.jobs, where)).Scan(&oldest); err != nil {
+			return err
+		}
+		if !oldest.Valid || oldest.Int64 > floor {
+			continue // ages >= trimFloor: nothing can go
+		}
+		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s AND finished_at <= ?", q.jobs, where),
 			now.Add(-g.age).UnixMilli()); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %[1]s WHERE finished_at <= ? AND job_id IN (SELECT job_id FROM %[1]s WHERE %[2]s ORDER BY finished_at DESC LIMIT -1 OFFSET %[3]d)",
-			q.jobs, g.where, g.keep), now.Add(-trimFloor).UnixMilli()); err != nil {
+		// The keep-th newest; ties on finished_at break by seq
+		var at, seq int64
+		switch err := tx.QueryRow(fmt.Sprintf("SELECT finished_at, seq FROM %s WHERE %s ORDER BY finished_at DESC, seq DESC LIMIT 1 OFFSET %d",
+			q.jobs, where, g.keep-1)).Scan(&at, &seq); {
+		case errors.Is(err, sql.ErrNoRows):
+			continue // keep or fewer
+		case err != nil:
+			return err
+		}
+		if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s AND finished_at <= ? AND (finished_at, seq) < (?, ?)", q.jobs, where),
+			min(at, floor), at, seq); err != nil {
 			return err
 		}
 	}
@@ -181,6 +243,11 @@ type watchers struct {
 	lastSeq int64  // newest cancel mark seq a poll has read
 	outSeq  int64  // newest outcome record seq a poll has read
 	gen     uint64 // watches started; a read reaches only watches started before it
+	// pending are the ids a by-id read must cover: a WatchOutcome's (its
+	// record may predate the cursor), or one a cursor read skipped for a
+	// watch newer than it. The poll reads them all in one query.
+	pending map[string]struct{}
+	wake    chan struct{} // a pending id waits: poll reads now, not at its tick
 	polling bool
 	closed  bool
 	stop    chan struct{} // closed by close
@@ -188,9 +255,25 @@ type watchers struct {
 
 // startLocked starts the poll goroutine if none runs; w.mu is held.
 func (w *watchers) startLocked(q *Queue) {
+	if w.wake == nil {
+		w.wake = make(chan struct{}, 1)
+	}
 	if !w.polling {
 		w.polling = true
 		go q.poll()
+	}
+}
+
+// pendLocked queues id for the next by-id read and wakes the poll; w.mu is
+// held, and the poll was started.
+func (w *watchers) pendLocked(id string) {
+	if w.pending == nil {
+		w.pending = map[string]struct{}{}
+	}
+	w.pending[id] = struct{}{}
+	select {
+	case w.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -208,15 +291,16 @@ func (w *watchers) close() {
 			o.done.Store(true)
 		}
 	}
-	w.byID, w.hooks = nil, nil
+	w.byID, w.hooks, w.pending = nil, nil, nil
 }
 
 // WatchOutcome implements contract.OutcomeWatcher: fn runs once, on its own
 // goroutine, when job id completes, fails or is cancelled through any
 // queue object on this database file, in this process or another. A job
-// whose record is still kept is reported even if it ended before the call.
-// It is polled every pollEvery. An empty id, or a closed queue, watches
-// nothing. Close drops watches without calling fn.
+// whose record is still kept is reported even if it ended before the call
+// (the poll's next by-id read, woken at once). New records are polled every
+// pollEvery. An empty id, or a closed queue, watches nothing. Close drops
+// watches without calling fn.
 func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel func()) {
 	o := &outcomeWatch{fn: fn}
 	w := &q.w
@@ -227,7 +311,7 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 	}
 	if len(w.byID) == 0 {
 		// No poll moved the cursor while nothing was watched: start it at
-		// the newest record. Older ones are this watch's catchUp below.
+		// the newest record. Older ones are this watch's by-id read.
 		w.mu.Unlock()
 		var last sql.NullInt64
 		err := q.f.db.QueryRow(fmt.Sprintf("SELECT MAX(seq) FROM %s", q.jobs)).Scan(&last)
@@ -240,8 +324,6 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 			w.outSeq = last.Int64
 		}
 	}
-	w.gen++
-	o.gen = w.gen
 	if w.byID == nil {
 		w.byID = map[string]map[*outcomeWatch]struct{}{}
 	}
@@ -250,9 +332,10 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 	}
 	w.byID[id][o] = struct{}{}
 	w.startLocked(q)
+	w.gen++
+	o.gen = w.gen
+	w.pendLocked(id)
 	w.mu.Unlock()
-
-	go q.catchUp([]string{id}, o.gen)
 
 	return func() {
 		if o.done.CompareAndSwap(false, true) {
@@ -270,17 +353,21 @@ func (q *Queue) WatchOutcome(id string, fn func(contract.JobOutcome)) (cancel fu
 
 // poll reads new outcome records, cancel marks and, while the cache says
 // paused, the pause row every pollEvery, and sweeps every sweepEvery,
-// until Close or until nothing is watched and the cache says running.
+// until Close or until nothing is watched and the cache says running. A
+// wake does the pending by-id read alone.
 func (q *Queue) poll() {
 	t := time.NewTicker(pollEvery)
 	defer t.Stop()
 	w := &q.w
 	swept := time.Now()
 	for {
+		tick := true
 		select {
 		case <-w.stop:
 			return
 		case <-t.C:
+		case <-w.wake:
+			tick = false
 		}
 
 		w.mu.Lock()
@@ -294,8 +381,13 @@ func (q *Queue) poll() {
 		outSeq, seq, gen := w.outSeq, w.lastSeq, w.gen
 		w.mu.Unlock()
 
+		if !tick {
+			q.readPending()
+			continue
+		}
 		if watching {
 			q.pollOutcomes(outSeq, gen)
+			q.readPending() // ids the cursor skipped, at once
 		}
 		if hooks {
 			q.pollCancels(seq)
@@ -311,41 +403,61 @@ func (q *Queue) poll() {
 }
 
 // pollOutcomes reads the records newer than seq, in pollBatch reads, and
-// delivers the watched ones to watches up to gen.
+// delivers the watched ones to watches up to gen; a newer watch of one is
+// left to readPending (see deliver).
 func (q *Queue) pollOutcomes(seq int64, gen uint64) {
 	for {
-		rows, err := q.f.db.Query(fmt.Sprintf("SELECT seq, job_id FROM %s WHERE seq > ? ORDER BY seq LIMIT %d", q.jobs, pollBatch), seq)
+		rows, err := q.f.db.Query(fmt.Sprintf("SELECT seq, job_id, state, error, result FROM %s WHERE seq > ? ORDER BY seq LIMIT %d", q.jobs, pollBatch), seq)
 		if err != nil {
 			return
 		}
-		var ids []string
-		for rows.Next() {
-			var id string
-			if rows.Scan(&seq, &id) == nil {
-				ids = append(ids, id)
-			}
-		}
-		if rows.Close() != nil || rows.Err() != nil || len(ids) == 0 {
+		outs, n := q.scanOutcomes(rows, &seq)
+		if rows.Err() != nil || n == 0 {
 			return // read again from the old seq
 		}
 
 		w := &q.w
 		w.mu.Lock()
 		w.outSeq = max(w.outSeq, seq)
-		watched := ids[:0]
-		for _, id := range ids {
-			if w.byID[id] != nil {
-				watched = append(watched, id)
+		watched := outs[:0]
+		for _, out := range outs {
+			if w.byID[out.ID] != nil {
+				watched = append(watched, out)
 			}
 		}
 		w.mu.Unlock()
-		if len(watched) > 0 {
-			q.catchUp(watched, gen)
+		for _, out := range watched {
+			q.deliver(out, gen)
 		}
-		if len(ids) < pollBatch {
+		if n < pollBatch {
 			return
 		}
 	}
+}
+
+// scanOutcomes reads rows of (seq?, job_id, state, error, result) and
+// closes them; seq, if not nil, gets the last seq. n counts rows read.
+func (q *Queue) scanOutcomes(rows *sql.Rows, seq *int64) (outs []contract.JobOutcome, n int) {
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id, state string
+			errText   sql.NullString
+			result    []byte
+			err       error
+		)
+		if seq != nil {
+			err = rows.Scan(seq, &id, &state, &errText, &result)
+		} else {
+			err = rows.Scan(&id, &state, &errText, &result)
+		}
+		n++
+		if err != nil {
+			continue
+		}
+		outs = append(outs, contract.JobOutcome{ID: id, State: contract.JobState(state), Error: errText.String, Result: result})
+	}
+	return outs, n
 }
 
 // sweep applies retention and drops expired cancel marks (spec 5, 6.14
@@ -368,42 +480,77 @@ func (q *Queue) sweep() {
 	tx.Commit()
 }
 
-// catchUp delivers the ids whose outcome record exists to their watches
-// up to gen, those started before the read. A failed read is retried by
-// the next poll.
-func (q *Queue) catchUp(ids []string, gen uint64) {
+// readPending reads the records of the pending ids still watched, in
+// pollBatch chunks, and delivers them to the watches started before the
+// read. A failed read keeps its ids pending for the next poll. An id with
+// no record is dropped: its record, when written, is newer than the cursor.
+func (q *Queue) readPending() {
+	w := &q.w
+	w.mu.Lock()
+	ids := make([]string, 0, len(w.pending))
+	for id := range w.pending {
+		if w.byID[id] != nil {
+			ids = append(ids, id)
+		}
+	}
+	clear(w.pending)
+	gen := w.gen
+	w.mu.Unlock()
+
+	for len(ids) > 0 {
+		chunk := ids[:min(len(ids), pollBatch)]
+		ids = ids[len(chunk):]
+		rows, err := q.queryIDs(chunk)
+		var outs []contract.JobOutcome
+		if err == nil {
+			outs, _ = q.scanOutcomes(rows, nil)
+			err = rows.Err()
+		}
+		if err != nil { // retried at the next tick, not woken: no hot loop
+			w.mu.Lock()
+			if w.pending == nil {
+				w.pending = map[string]struct{}{}
+			}
+			for _, id := range append(chunk, ids...) {
+				w.pending[id] = struct{}{}
+			}
+			w.mu.Unlock()
+			return
+		}
+		for _, out := range outs {
+			q.deliver(out, gen)
+		}
+	}
+}
+
+// queryIDs reads the outcome records of ids. One prepared statement for
+// any count, the ids as a JSON array; an id JSON would not round-trip
+// (bad UTF-8, NUL) takes an IN list built for the call.
+func (q *Queue) queryIDs(ids []string) (*sql.Rows, error) {
+	if !slices.ContainsFunc(ids, func(id string) bool { return !utf8.ValidString(id) || strings.IndexByte(id, 0) >= 0 }) {
+		list, err := json.Marshal(ids)
+		if err != nil {
+			return nil, err
+		}
+		byIDs, err := q.byIDs.get()
+		if err != nil {
+			return nil, err
+		}
+		return byIDs.Query(string(list))
+	}
 	args := make([]any, len(ids))
 	for i, id := range ids {
 		args[i] = id
 	}
-	rows, err := q.f.db.Query(fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (%s)",
+	return q.f.db.Query(fmt.Sprintf("SELECT job_id, state, error, result FROM %s WHERE job_id IN (%s)",
 		q.jobs, strings.Repeat("?, ", len(ids)-1)+"?"), args...)
-	if err != nil {
-		return
-	}
-	var outs []contract.JobOutcome
-	for rows.Next() {
-		var (
-			id, state string
-			errText   sql.NullString
-			result    []byte
-		)
-		if rows.Scan(&id, &state, &errText, &result) != nil {
-			continue
-		}
-		outs = append(outs, contract.JobOutcome{ID: id, State: contract.JobState(state), Error: errText.String, Result: result})
-	}
-	rows.Close()
-
-	for _, out := range outs {
-		q.deliver(out, gen)
-	}
 }
 
 // deliver ends the watches of out.ID started up to gen: each fn runs once,
 // on its own goroutine, so a slow fn holds up no poll. A watch started
 // after the read stays: the record read may be an earlier run's, which a
-// re-add since deleted (spec 6.13 Re-add).
+// re-add since deleted (spec 6.13 Re-add). Its id goes pending, so a by-id
+// read made after it covers it even once the cursor is past the record.
 func (q *Queue) deliver(out contract.JobOutcome, gen uint64) {
 	w := &q.w
 	w.mu.Lock()
@@ -417,6 +564,8 @@ func (q *Queue) deliver(out contract.JobOutcome, gen uint64) {
 	}
 	if len(set) == 0 {
 		delete(w.byID, out.ID)
+	} else if !w.closed {
+		w.pendLocked(out.ID)
 	}
 	w.mu.Unlock()
 
