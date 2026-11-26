@@ -1,2 +1,10 @@
+coverage:
+  status:
+    patch:
+      default:
+        target: auto
+        # SQLite error returns (prepare, begin, scan) need fault injection to hit
+        threshold: 5%
+
 ignore:
   - "example/*"
