@@ -293,12 +293,12 @@ func (f *file) purgeStore() (ws *WorkflowStore, done func(), err error) {
 		case err != nil:
 			return nil, none, fmt.Errorf("checking for the workflow file: %w", err)
 		}
-		if wf, err = acquire(path, root, f.pages); err != nil {
+		if wf, err = acquire(path, root, f.pages, f.hb); err != nil {
 			return nil, none, fmt.Errorf("opening the workflow file: %w", err)
 		}
 		release = func() { wf.release() }
 	}
-	qs := &queues{cfg: storeConfig{singleFile: single, checkpointPages: f.pages}, root: root, files: map[*file]struct{}{}}
+	qs := &queues{cfg: storeConfig{singleFile: single, checkpointPages: f.pages, heartbeat: f.hb}, root: root, files: map[*file]struct{}{}}
 	qs.byID.Store(&map[string]*handle{})
 	ws = &WorkflowStore{qs: qs, f: wf, single: single, scope: f.scope, cfg: workflowConfig{resultLimit: defaultResultLimit, retention: defaultRetention}}
 	// tables of an older version get the columns this one reads

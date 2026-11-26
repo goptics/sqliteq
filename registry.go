@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -24,6 +25,19 @@ type file struct {
 	rounds    atomic.Int64       // rounds committed by b; read by tests
 	handles   map[string]*handle // lower-cased queue name -> handle; under registry.mu
 	recovered map[string]bool    // lower-cased table -> recovery done; under registry.mu
+
+	// Owner and heartbeat (see owner.go)
+	owner     string                   // this process's id on the file; on the rows it claims
+	hb        time.Duration            // heartbeat timeout
+	claimed   bool                     // the owner row is written; under mu
+	lastBeat  int64                    // Unix ms of the last owner row write; under mu
+	closing   bool                     // the last release began: no claim, no sweep; under mu
+	sweeping  bool                     // sweepLoop runs; under registry.mu
+	swept     atomic.Pointer[[]*Queue] // the handles' queues, for sweepLoop; stored under registry.mu
+	seen      bool                     // seenMoved is set; under mu
+	seenMoved int64                    // the file's requeue count at the last sweep; under mu
+	stop      chan struct{}            // closed by the last release
+	done      chan struct{}            // closed when sweepLoop returns
 }
 
 // handle is the queue opened under one name in a file; exactly one is set.
@@ -82,7 +96,7 @@ var registry = struct {
 
 // acquire returns the registry entry for the resolved path, opening the pool
 // on first use, and takes one reference on it.
-func acquire(path, root string, pages int) (*file, error) {
+func acquire(path, root string, pages int, hb time.Duration) (*file, error) {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 
@@ -93,10 +107,24 @@ func acquire(path, root string, pages int) (*file, error) {
 		if f.pages != pages {
 			return nil, fmt.Errorf("sqliteq: %s is already open with checkpoint pages %d, not %d", path, f.pages, pages)
 		}
+		if f.hb != hb {
+			return nil, fmt.Errorf("sqliteq: %s is already open with heartbeat timeout %s, not %s", path, f.hb, hb)
+		}
 		f.refs++
 		return f, nil
 	}
 
+	f, err := newFile(path, root, pages, hb)
+	if err != nil {
+		return nil, err
+	}
+	registry.files[path] = f
+	return f, nil
+}
+
+// newFile opens the pool of a database file under a new owner id, holding
+// one reference. It is not in the registry.
+func newFile(path, root string, pages int, hb time.Duration) (*file, error) {
 	// sql.Open only validates its arguments; no connection is made here
 	db, err := sql.Open(driverName(pages), dsn(path))
 	if err != nil {
@@ -114,13 +142,18 @@ func acquire(path, root string, pages int) (*file, error) {
 		refs:      1,
 		handles:   map[string]*handle{},
 		recovered: map[string]bool{},
+		owner:     newOwnerID(),
+		hb:        hb,
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	f.b = &batcher{commit: f.commitRound}
-	registry.files[path] = f
+	f.swept.Store(&[]*Queue{})
 	return f, nil
 }
 
-// release drops one reference; the last one closes the pool and the entry.
+// release drops one reference; the last one stops the sweep, hands this
+// owner's unacknowledged rows back and closes the pool and the entry.
 func (f *file) release() error {
 	registry.mu.Lock()
 	f.refs--
@@ -132,10 +165,23 @@ func (f *file) release() error {
 		delete(registry.files, f.key)
 	}
 	// Stop the queues' polls before the pool closes under them
+	tables := make([]string, 0, len(f.handles))
 	for _, h := range f.handles {
 		h.queue().Close()
+		tables = append(tables, h.queue().table)
 	}
+	sweeping := f.sweeping
+	f.sweeping = false // a repeated release stops nothing twice
 	registry.mu.Unlock()
+
+	f.mu.Lock()
+	f.closing = true
+	f.mu.Unlock()
+	if sweeping {
+		close(f.stop)
+		<-f.done
+	}
+	f.handBack(tables)
 
 	// Close waits for running queries, so it runs outside the lock
 	return f.db.Close()
@@ -143,7 +189,8 @@ func (f *file) release() error {
 
 // open returns the handle for name, creating it if there is none or the
 // existing one was closed. Creation holds registry.mu across table init and
-// recovery, so no handle on a table is handed out before its recovery ends.
+// the table's first sweep, so no handle on a table is handed out before it
+// ends. The first table starts the file's sweep loop.
 func (f *file) open(name string, priority bool, opts []Option) (*handle, error) {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
@@ -191,12 +238,21 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 		h.q = q
 	}
 
-	// ponytail: recovery runs on every process's first open, also one that
-	// never takes jobs (a producer, observer or pauser), and requeues jobs
-	// another process is running. Upgrade path: owner ids plus heartbeats
-	// on processing rows, requeueing only rows of dead owners (redisq's model).
+	// First open: rows of dead owners, and rows an older version left
+	// without an owner, go back to pending
+	// The loop's list holds the table before its first sweep, so an owner
+	// that dies between that sweep and the next tick is found by the tick
+	old := f.swept.Load()
+	qs := []*Queue{h.queue()}
+	for k, o := range f.handles {
+		if k != key {
+			qs = append(qs, o.queue())
+		}
+	}
+	f.swept.Store(&qs)
 	if !f.recovered[key] {
-		if err := h.queue().requeueNoAck(); err != nil {
+		if _, err := f.sweep([]*Queue{h.queue()}, true, false); err != nil {
+			f.swept.Store(old)
 			h.queue().Close() // stops a pause poll
 			return nil, fmt.Errorf("failed to requeue unacknowledged rows: %w", err)
 		}
@@ -204,6 +260,10 @@ func (f *file) open(name string, priority bool, opts []Option) (*handle, error) 
 	}
 
 	f.handles[key] = h
+	if !f.sweeping {
+		f.sweeping = true
+		go f.sweepLoop()
+	}
 	return h, nil
 }
 

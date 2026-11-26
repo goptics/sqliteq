@@ -42,6 +42,10 @@ func New(path string, opts ...StoreOption) (Queues, error) {
 		return nil, fmt.Errorf("sqliteq: checkpoint pages must be at least 1, got %d", cfg.checkpointPages)
 	}
 
+	if cfg.heartbeat < minHeartbeat {
+		return nil, fmt.Errorf("sqliteq: heartbeat timeout must be at least %s, got %s", minHeartbeat, cfg.heartbeat)
+	}
+
 	root, err := layout(path, cfg.singleFile)
 	if err != nil {
 		return nil, err
@@ -151,7 +155,7 @@ func (qs *queues) open(name string, priority bool, opts []Option) (*handle, erro
 
 	fresh := f == nil
 	if fresh {
-		if f, err = acquire(path, qs.root, qs.cfg.checkpointPages); err != nil {
+		if f, err = acquire(path, qs.root, qs.cfg.checkpointPages, qs.cfg.heartbeat); err != nil {
 			return nil, err
 		}
 	}

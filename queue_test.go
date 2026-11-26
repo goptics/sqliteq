@@ -914,22 +914,16 @@ func TestWritesTakeFileMutex(t *testing.T) {
 // process on the same database file would.
 func otherProcess(t *testing.T, q *Queue) *Queue {
 	t.Helper()
-	db, err := sql.Open(driverName(q.f.pages), dsn(q.f.key))
+	f, err := newFile(q.f.key, strings.TrimPrefix(q.f.scope, "sqliteq:"), q.f.pages, q.f.hb)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &file{key: q.f.key, db: db, pages: q.f.pages, refs: 1, handles: map[string]*handle{}, recovered: map[string]bool{}}
-	f.b = &batcher{commit: f.commitRound}
-	q2, err := newQueue(f, q.name, q.priority, WithRemoveOnComplete(q.removeOnComplete))
+	t.Cleanup(func() { f.release() })
+	h, err := f.open(q.name, q.priority, []Option{WithRemoveOnComplete(q.removeOnComplete)})
 	if err != nil {
-		db.Close()
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		q2.Close()
-		db.Close()
-	})
-	return q2
+	return h.queue()
 }
 
 // job is a varmq-style envelope with Job ID id.

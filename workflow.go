@@ -162,7 +162,7 @@ func NewWorkflowStore(qs Queues, opts ...WorkflowOption) (*WorkflowStore, error)
 	if closed {
 		return nil, errors.New("sqliteq: queues are closed")
 	}
-	f, err := acquire(path, q.root, q.cfg.checkpointPages)
+	f, err := acquire(path, q.root, q.cfg.checkpointPages, q.cfg.heartbeat)
 	if err != nil {
 		return nil, err
 	}
